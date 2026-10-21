@@ -154,4 +154,3 @@ Write down what you'll eventually measure:
 - [ ] Behavior under sustained sampling
 
 **• Ownership map. Which partner owns which subsystems (Section 10.1). Ownership means first authorship and answerability at the defense, not exclusivity.**
-Lily (Heron-i) owns the: sunlight sensor, IPC/data pipeline, Hub/aggregator, storage, mechanism D, recovery/supervision, and pipeline evaluation
