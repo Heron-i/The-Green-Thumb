@@ -1,71 +1,89 @@
 3-5 pages and the most leveraged hours of the whole project. Because every hour of arguing here saves five of rewriting later. Required contents:
 
-
-
-**Architecture. A diagram in the spirit of Figure 1: processes, threads, kernel components, data flows, and rates on every arrow.**
- flowchart TB
-## Architecture
+## Green-Thumb Architecture Diagram
 
 ```mermaid
 flowchart TB
 
-    subgraph HW["Physical Hardware"]
-        LIGHT["BH1750 Light Sensor"]
-        SOIL["Capacitive Soil Sensor"]
+    subgraph HW["Physical hardware"]
+        LIGHT["BH1750 light sensor<br/>I2C addr 0x23"]
+        SOIL["Adafruit STEMMA soil sensor<br/>I2C addr 0x36 (seesaw)"]
+        SD[("microSD card<br/>ext4")]
     end
 
-    subgraph KERNEL["Kernel Space"]
-        I2C["I2C Subsystem"]
-        IPC["IPC Mechanism"]
-        SCHED["Process Scheduling"]
-        FS["Filesystem / Storage Interface"]
+    subgraph KERNEL["Kernel space"]
+        I2C["I2C subsystem<br/>i2c-bcm2835 · /dev/i2c-1"]
+        HUBSOCK["UDS · AF_UNIX<br/>/run/plantpi/hub.sock"]
+        STOSOCK["UDS · AF_UNIX<br/>/run/plantpi/storage.sock"]
+        SUPSOCK["UDS · AF_UNIX<br/>/run/plantpi/sup.sock"]
+        VFS["VFS / ext4<br/>write() · fsync()"]
+        SIG["Signals<br/>SIGCHLD → waitpid()"]
     end
 
-    subgraph USER["User Space"]
-        LIGHT_PROC["BH1750 Sensor Process"]
-        SOIL_PROC["Soil Sensor Process"]
-        HUB["Hub / Aggregator"]
-        STORAGE["Storage Layer (D)"]
-        ANALYSIS["Analysis Engine"]
-        UI["CLI / Dashboard"]
-        SUP["Supervisor / Watchdog (E)"]
+    subgraph USER["User space"]
+        SUP["Supervisor / watchdog (E)<br/>1 thread · poll() loop<br/>forks + restarts all children"]
+
+        subgraph LP["light_sensor process"]
+            LT["main thread<br/>read → send → heartbeat"]
+        end
+
+        subgraph SP["soil_sensor process"]
+            ST["main thread<br/>read → send → heartbeat"]
+        end
+
+        subgraph HUBP["hub process"]
+            HT["main thread · poll() loop<br/>receive · validate · stamp seq+time · forward<br/>per-sensor last-seen → sensor_timeout"]
+        end
+
+        subgraph STOP["storage process (D)"]
+            RX["rx thread<br/>append to batch"]
+            BUF[["in-memory batch<br/>≤ 64 × 24 B records"]]
+            FL["flush thread<br/>flush on N = 64 or T = 60 s"]
+            REC["startup recovery<br/>scan tail · truncate bad CRC"]
+        end
+
+        subgraph DOWN["Planned · later milestone"]
+            AN["Analysis engine"]
+            UI["CLI / dashboard"]
+        end
     end
 
-    LIGHT -->|"[sampling rate]"| I2C
-    SOIL -->|"[sampling rate]"| I2C
+    %% Data path
+    LIGHT -->|"1 Hz, 2 B/read"| I2C
+    SOIL -->|"1 per 60 s, 2 B/read"| I2C
+    I2C -->|"1 Hz, 2 B/read"| LT
+    I2C -->|"1 per 60 s, 2 B/read"| ST
+    LT -->|"1 msg/s, 16 B"| HUBSOCK
+    ST -->|"1 msg/60 s, 16 B"| HUBSOCK
+    HUBSOCK -->|"≈1.02 msg/s"| HT
+    HT -->|"≈1.02 records/s, ≈25 B/s"| STOSOCK
+    STOSOCK -->|"≈1.02 records/s, ≈25 B/s"| RX
+    RX -->|"≈1.02 records/s"| BUF
+    BUF -->|"1 batch per 60 s, ≈1.5 KB"| FL
+    FL -->|"1 batch + fsync per 60 s (or 64 records)"| VFS
+    VFS -->|"≈1.5 KB/batch, ≈2.1 MB/day"| SD
+    REC -.->|"once at startup, before accepting data"| VFS
 
-    I2C -->|"[sampling rate]"| LIGHT_PROC
-    I2C -->|"[sampling rate]"| SOIL_PROC
+    %% Downstream
+    VFS -->|"reads new records every 60 s"| AN
+    AN -->|"on request"| UI
 
-    LIGHT_PROC -->|"[light data rate]"| IPC
-    SOIL_PROC -->|"[soil data rate]"| IPC
+    %% Control path
+    LT -.->|"heartbeat 1 Hz"| SUPSOCK
+    ST -.->|"heartbeat 1 Hz"| SUPSOCK
+    HT -.->|"heartbeat 1 Hz"| SUPSOCK
+    FL -.->|"heartbeat 1 Hz"| SUPSOCK
+    SUPSOCK -.->|"heartbeat 1 Hz, timeout 5 s (4 msg/s total)"| SUP
+    SIG -.->|"event: SIGCHLD"| SUP
+    SUP -.->|"event: restart, backoff 1→2→4… max 30 s"| LP
+    SUP -.->|"event: restart, backoff"| SP
+    SUP -.->|"event: restart, backoff"| HUBP
+    SUP -.->|"event: restart, backoff"| STOP
+    SUP -.->|"event: restart, backoff"| DOWN
 
-    IPC -->|"[combined data rate]"| HUB
-
-    HUB -->|"[storage write rate]"| STORAGE
-
-    STORAGE -->|"[analysis data rate]"| ANALYSIS
-
-    ANALYSIS -->|"[request/event rate]"| UI
-
-    SUP -.->|"restart on failure"| LIGHT_PROC
-    SUP -.->|"restart on failure"| SOIL_PROC
-    SUP -.->|"restart on failure"| HUB
-    SUP -.->|"restart on failure"| STORAGE
-
-    SCHED -.->|"scheduling"| LIGHT_PROC
-    SCHED -.->|"scheduling"| SOIL_PROC
-    SCHED -.->|"scheduling"| HUB
-
-    FS -.->|"storage I/O"| STORAGE
+    style STOP fill:#e8f0fe,stroke:#3b6fd8
+    style SUP fill:#fde8e8,stroke:#c0392b
 ```
-My task:
-Draw the Sensor → IPC → Hub → Storage portion.
-[ ] Decide what processes are involved.
-[ ] Decide what the hub does.
-[ ] Decide what storage process/component does.
-[ ] Decide how the supervisor interacts with these processes.
-[ ] Put approximate data rates on the arrows.
 
 **• Mechanism mapping. For each chosen menu item: which component implements it, and a justification from the user’s requirements (“the vibration analysis is meaningless above 2 ms of sampling jitter, hence SCHED_FIFO”).**
 
