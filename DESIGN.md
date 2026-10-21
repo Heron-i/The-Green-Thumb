@@ -85,30 +85,24 @@ flowchart TB
     style SUP fill:#fde8e8,stroke:#c0392b
 ```
 
-**• Mechanism mapping. For each chosen menu item: which component implements it, and a justification from the user’s requirements (“the vibration analysis is meaningless above 2 ms of sampling jitter, hence SCHED_FIFO”).**
+## Mechanism mapping
 
-### Mechanism D — Custom Storage Layer
+**Mechanism D — Custom Storage Layer**
 
-| Requirement / Problem | Mechanism | Implementing Component | How It Works | How We Measure It |
+**Choice:** an append-only log of fixed-size, checksummed records, kept in one segment file per day on the microSD (ext4). We chose it over a ring buffer or FUSE because only the log's tail can ever be damaged, which makes the crash-consistency story the simplest to state and test. **Guarantee:** *a record is committed once fsync returns; a power cut loses at most one unsynced batch (≤ 60 s) and never leaves a corrupt record readable.*
+
+| Requirement (Green Thumb) | Mechanism | Implementing component | Justification | Measured by / target |
 |---|---|---|---|---|
-| Sensor data needs to remain available for later plant-care analysis | Custom storage layer | Storage subsystem | Stores sensor readings in a persistent custom data format | Verify all generated samples are recoverable from storage |
-| Green Thumb continuously produces sensor data | Custom storage layer | Storage subsystem | Collects sensor records and writes them to storage in controlled batches | Measure sustained write throughput and storage rate |
-| Frequent individual writes could add unnecessary overhead | Custom storage layer | Storage subsystem | Batches multiple sensor records before committing them to storage | Compare write behavior/latency with different batch sizes |
-| Sensor data should survive normal program termination | Custom storage layer | Storage subsystem | Explicitly flushes/commits buffered data to persistent storage | Restart system and verify previously stored records remain intact |
-| Mid-write power failure could leave incomplete/corrupt data | Custom storage layer | Storage/recovery component | Detects incomplete records when storage is reopened and recovers or discards them | Inject interrupted writes and measure successful recovery/data loss |
-| The system should detect storage failures rather than silently losing data | Custom storage layer | Storage subsystem | Checks write/flush errors and records failures in the system log | Inject storage/write failures and verify detection + logging |
-1. Mechanism D — make the decision
+| Plant care needs an unbroken multi-day history | Append-only log; daily segments; 30-day retention | storage process, flush thread | Soil moisture changes over hours and watering trends over days, so the value is in the history. About 2.1 MB/day means 30 days is about 63 MB, which fits easily | 72 h soak: records committed = records sent by the hub (0 sequence gaps) |
+| Keep write overhead and SD wear low | Batching: flush at N = 64 records or T = 60 s; single buffer copied out under the lock, no lock held during I/O | rx thread + flush thread | Fsyncing every record would mean about 88k fsyncs/day; batching cuts that to about 1,440/day. Soil changes slowly, so a 60 s commit delay costs nothing | Compare fsync count, write latency and CPU at (N,T) = (1, 1 s), (64, 10 s) and (64, 60 s) |
+| A precise, provable durability point | fsync per batch; directory fsync when a new segment is created | flush thread | Without fsync, "written" only means the data reached the page cache. The directory fsync stops a new day's file from vanishing | Every commit logged with count and duration; report fsync p50/p99 |
+| Survive being unplugged mid-write | 24 B records with CRC32; startup scan truncates at the first bad record before accepting data | storage startup recovery | A household Pi has no UPS and gets unplugged routinely. Fixed-size records make recovery a short arithmetic scan | 20 real power pulls mid-batch: 0 corrupt records accepted, loss ≤ 1 batch (60 s), recovery < 1 s |
+| No loss on a normal shutdown or restart | Flush and fsync on SIGTERM | flush thread | Supervisor restarts and user shutdowns shouldn't cost a batch | 20 SIGTERM restarts: 0 records lost |
+| Never fail silently | Check every write/fsync; keep the batch and retry; degraded after 3 consecutive failures | flush thread | A silent hole would undermine the history claim, which is D's selling point | Inject write/fsync errors: 100% logged as `storage_write_error`, 0 silent losses |
+| Preserve history through a storage outage | 1 MB queue (about 11 h); `storage_backlog` at 50/75/90%; when full, an explicit degraded state that refuses and counts new readings, then writes a gap record on recovery | storage process | Better a marked gap than a silent one. Storage keeps reading its socket, so the hub and sensors never block and E's heartbeats are unaffected | Outage longer than the queue (with a small test cap): 0 accepted readings lost, and the gap record's count equals the refused count |
+| Restarts must not corrupt the log (D meets E) | Recovery runs before `storage.sock` accepts data | storage startup recovery + supervisor | The supervisor can kill storage at any instant, so a kill is just a power cut without the reboot | 50 random `kill -9`s on storage: 0 corrupt records |
 
-My task:
-- [ ] Decide exactly what your custom storage layer is.
-- [ ] Decide what data structure/file format it uses.
-- [ ] Decide how writes happen.
-- [ ] Decide how batching works.
-- [ ] Decide when fsync() happens.
-- [ ] Decide what happens if power fails during a write.
-- [ ] Write why this mechanism is useful for Green Thumb, not just how it works.
-
-**• Failure-mode table. For each component: how it can fail, how the failure is detected, what the system does about it, and what the log will show. The soak test (Section 3.4) will grade this table’s honesty.**
+## Failure-mode table. For each component: how it can fail, how the failure is detected, what the system does about it, and what the log will show. The soak test (Section 3.4) will grade this table’s honesty.
 
 | Component | Failure | Detection | Response | Log |
 |---|---|---|---|---|
