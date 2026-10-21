@@ -123,7 +123,7 @@ Log format for every component: `timestamp level component event key=value`. Rul
 | Power | Power cut mid-write | No clean-shutdown marker at boot | Recovery scan before accepting data. A record is committed once fsync returns; a power cut loses at most one unsynced batch (≤ 60 s), plus any backlog held in memory during a storage outage, and never leaves a corrupt record readable | `unclean_shutdown`, `recovery_event` |
 | System clock | Wrong time after a reboot (no real-time clock) | NTP sync status from `adjtimex` | Store readings anyway (seq keeps their order) and log the unsynced period | `clock_unsynced`, `clock_synced` |
 
-**• Storage and data. What is stored, at what rate, in what format, with what retention, and what happens to it when the power dies mid-write.**
+## Storage and data. What is stored, at what rate, in what format, with what retention, and what happens to it when the power dies mid-write.
 What exactly is stored?
 [ ] Soil + light + timestamp?
 [ ] What is the sampling rate?
@@ -134,7 +134,7 @@ What exactly is stored?
 [ ] When is data flushed?
 [ ] How do you recover from a mid-write failure?
 
-**• Constraints and substitutions. What the ideal build would use, what you’re actually using, and what the gap costs: sensors downgraded, data synthesized or replayed, claims narrowed (Section 5). A design document with nothing to report here has usually not met its hardware yet.**
+## Constraints and substitutions. What the ideal build would use, what you’re actually using, and what the gap costs: sensors downgraded, data synthesized or replayed, claims narrowed (Section 5). A design document with nothing to report here has usually not met its hardware yet.
 Briefly document:
 - [ ] Raspberry Pi CPU/RAM limitations
 - [ ] SD/storage limitations
@@ -142,7 +142,7 @@ Briefly document:
 - [ ] Budget limitations
 - [ ] Power-loss considerations
 
-**• Evaluation plan. The measurements you will take (Section 9), each with its method and its target. Numbers you commit to now are twice as credible when you hit them later. And instructive either way.**
+## Evaluation plan. The measurements you will take (Section 9), each with its method and its target. Numbers you commit to now are twice as credible when you hit them later. And instructive either way.
 Write down what you'll eventually measure:
 - [ ] IPC latency
 - [ ] Sensor-to-storage latency
@@ -153,4 +153,4 @@ Write down what you'll eventually measure:
 - [ ] Recovery time after failure
 - [ ] Behavior under sustained sampling
 
-**• Ownership map. Which partner owns which subsystems (Section 10.1). Ownership means first authorship and answerability at the defense, not exclusivity.**
+## Ownership map. Which partner owns which subsystems (Section 10.1). Ownership means first authorship and answerability at the defense, not exclusivity.
