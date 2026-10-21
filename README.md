@@ -3,3 +3,4 @@ For Colorado State University's Operating Systems course, we were tasked with cr
 
 ## Our Project: The Plant Owner's Capable Assistant (in-progress)
 For our project, we are creating a mini houseplant assistant that enables a user to give their plants the best care possible by measuring soil-moisture and light exposure. We believe this project is not easily solved by an app, and that current similar products on the market, have shown common gaps in their capabilities. Thus, we want to create an effective solution that will help bridge the communication gap between plants and humans.
+
