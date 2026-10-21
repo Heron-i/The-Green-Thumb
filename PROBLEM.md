@@ -1,4 +1,4 @@
-# Problem memo -- <The Green Machine> (<Lily Heeren>, <Lucas Jenkins>)
+# Problem memo -- The Green Thumb (Lily Heeren, Lucas Jenkins)
 
 ## The user
 Our device can be used by any person who is a household plant owner and would like to monitor their plants for better care of them. When it comes to the place, our device can be used in any household that holds plants and would like to monitor them more deeply.
