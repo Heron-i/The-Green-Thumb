@@ -283,15 +283,88 @@ The main memory cost is process isolation itself. There are five processes, each
 | **Actual build** | Unix domain sockets (`hub.sock`, `storage.sock`, `sup.sock`), with 16 B messages over two hops (sensor → hub → storage), plus 1 Hz heartbeats from each child to the supervisor. |
 | **What the gap costs** | Each message costs a `send()` and a `recv()` system call and two kernel copies per hop. We estimate tens of µs per hop on a Pi 4, to be measured in the Evaluation plan. At ≈1.02 data messages/s plus 4 heartbeats/s, that is negligible. **What we gain:** the kernel buffers messages for us, a dead peer is reported immediately (`EPIPE` / `ECONNREFUSED`), and no process can corrupt another's memory. A shared-memory ring would give none of that, and Mechanism E depends on all of it. **Claims narrowed:** we make no high-throughput IPC claim. We claim only that IPC adds a negligible share of the sensor-to-storage latency, with a number committed in the Evaluation plan. |
 
-## Evaluation plan. The measurements you will take (Section 9), each with its method and its target. Numbers you commit to now are twice as credible when you hit them later. And instructive either way.
-Write down what you'll eventually measure:
-- [ ] IPC latency
-- [ ] Sensor-to-storage latency
-- [ ] Storage write throughput
-- [ ] CPU usage
-- [ ] Memory usage
-- [ ] Data loss/corruption
-- [ ] Recovery time after failure
-- [ ] Behavior under sustained sampling
+## Evaluation plan
+
+Each measurement below has a method and a target. Unless a row says otherwise, measurements use the real hardware at the real sampling rates (light 1 Hz, soil 1 per 60 s). Owners: **Lily** covers the sensor → IPC → hub → storage pipeline, and **Lucas** covers sensor processes, sampling and analysis. Rows marked **Joint** are measured together.
+
+**Test tooling**
+- **Load generator:** writes synthetic records into `storage.sock` at a set rate.
+- **Verifier:** reads the log offline and checks every record's CRC, that `seq` strictly increases, and that every missing `seq` is covered by a GAP record. It then compares the log against the hub's sent-sequence log.
+- **Timing:** latency is measured with `CLOCK_MONOTONIC` timestamps, logged at each stage and keyed by sensor counter and hub `seq`, then joined offline.
+
+### IPC latency *(Lily)*
+
+| Measurement | Method | Target |
+|---|---|---|
+| One-way latency per hop (sensor → hub, hub → storage) for a 16 B message | Standalone UDS ping-pong benchmark (100,000 round trips, latency = RTT / 2), confirmed by a short in-system run with per-stage timestamps | p50 < 50 µs, p99 < 1 ms per hop |
+
+### Sensor-to-storage latency *(Lily)*
+
+These are measured **under normal storage operation**. Storage outages and backlog are covered under *Data loss and corruption* and *Recovery time* instead.
+
+| Measurement | Method | Target |
+|---|---|---|
+| **Delivery latency:** I2C read completes → record is in the storage batch buffer | Per-stage timestamps joined by `seq` over the 72 h soak | p99 < 5 ms |
+| **Commit latency:** I2C read completes → `fsync()` returns for that record's batch | Same as above | max < 62 s (the T = 60 s batch window plus fsync) |
+
+### Storage write throughput *(Lily)*
+
+Each step runs for 10 minutes with the load generator, at N = 64 / T = 60 s. We record fsync count, fsync p50/p99, MB/s and backlog depth. Only Stress 2 is a committed target. Stress 3 reports the headroom and is not pass/fail.
+
+| Step | Rate | Target |
+|---|---|---|
+| Baseline | 1× (≈1 record/s) | No backlog; ≈1,440 fsyncs/day |
+| Stress 1 | 10× (≈10 records/s) | No backlog; fsync p99 within baseline range |
+| Stress 2 | 100× (≈100 records/s) | **No backlog growth over 10 min** |
+| Stress 3 | Ramp until the backlog grows | Report the ceiling; aim ≥ 1,000 records/s (informational) |
+
+We also compare fsync count, write latency and CPU at (N, T) = (1, 1 s), (64, 10 s) and (64, 60 s), as committed in *Mechanism D*.
+
+### CPU usage *(Lily)*
+
+| Measurement | Method | Target |
+|---|---|---|
+| CPU time per process (utime + stime) | Sample `/proc/<pid>/stat` every 10 s during the 72 h soak and during each stress step | < 2% of one core in total at the real load |
+| SoC temperature and throttling | `vcgencmd measure_temp` and `vcgencmd get_throttled` every 60 s during the soak | No throttling events (see *Constraints → Pi CPU / RAM*) |
+
+### Memory usage *(Lily)*
+
+The goal is to show the system stays stable over the 72 h soak, not to hit an absolute size.
+
+| Measurement | Method | Target |
+|---|---|---|
+| Leaks | Valgrind memcheck on short runs of each process | 0 bytes definitely or indirectly lost |
+| Growth | Sample `VmRSS` / `VmHWM` from `/proc/<pid>/status` every 60 s over 72 h | Flat after warm-up; no upward trend in any process |
+| Buffer bounds | Each buffer logs its high-water mark; a forced storage outage fills the storage queue | No buffer ever exceeds its cap (sensor ring 64, hub queue 1024, storage batch 64, storage queue 1 MB). On a full queue, storage refuses new readings and logs `storage_degraded` |
+
+### Data loss and corruption *(Lily)*
+
+**Lost readings** = seqs the hub sent − seqs committed − seqs covered by a GAP record. The verifier checks every test below.
+
+| Test | Target |
+|---|---|
+| 72 h soak at real rates | 0 lost readings; 0 unexplained `seq` gaps |
+| 20 real power pulls mid-batch | 0 corrupt records accepted; loss ≤ 1 batch (60 s) |
+| 50 random `kill -9`s on storage | 0 corrupt records |
+| 20 SIGTERM restarts | 0 records lost |
+| Injected `write()` / `fsync()` errors | 100% logged (`storage_write_error` / `fsync_error`, `storage_degraded`); 0 silent losses |
+| Storage outage longer than the queue (small test cap) | 0 accepted readings lost; GAP record count = refused count |
+
+### Recovery time after failure
+
+| Measurement | Owner | Method | Target |
+|---|---|---|---|
+| Storage startup and recovery scan: process start → scan complete | Lily | Timestamps in `recovery_event`, on a full-day segment with a truncated tail | < 1 s |
+| Time to accept new data: process start → `storage.sock` accepts its first record | Lily | Startup log vs. first `recv()` | < 1 s after the scan completes |
+| Power-loss recovery: boot → storage accepting data | Lily | 20 power pulls; timestamps from boot, `unclean_shutdown` and first accept; verifier run after each | Storage accepting data within the boot sequence; verifier passes every time |
+| End-to-end storage restart: `kill -9` → supervisor restart → recovery → hub reconnect → **first successful commit** | **Joint** (Lily + Lucas) | 50 kills; timestamps from `child_exit`, `recovery_event`, `storage_reconnected` and the first commit | ≤ supervisor backoff + 1 s |
+
+### Behavior under sustained sampling
+
+| Measurement | Owner | Method | Target |
+|---|---|---|---|
+| Long-run stability | Lily | 72 h soak at real rates; this run also supplies the latency, CPU, memory and loss data above | No trend in CPU, RSS, fsync p99 or backlog; backlog stays at 0; log grows ≈2.1 MB/day; 0 unexplained gaps |
+| Segment rollover and retention | Lily | Observe the midnight UTC rollover during the soak; test retention with the window shortened to minutes | New segment and directory fsync at each rollover; only segments older than the window are deleted |
+| Sampling jitter: each sample's deviation from its schedule (1 s light, 60 s soil) | Lucas | `CLOCK_MONOTONIC` at each I2C read over the soak | p99 < 10 ms (matches the ±10 ms timestamp claim in *Constraints*) |
 
 ## Ownership map. Which partner owns which subsystems (Section 10.1). Ownership means first authorship and answerability at the defense, not exclusivity.
