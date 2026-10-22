@@ -243,13 +243,45 @@ Records are fixed-size, so the scan is simple offset arithmetic. The target is u
 
 See *Mechanism D → "Survive being unplugged" and "Restarts must not corrupt the log"*, and *Failure-mode table → Storage (corrupt tail)* and *Power*.
 
-## Constraints and substitutions. What the ideal build would use, what you’re actually using, and what the gap costs: sensors downgraded, data synthesized or replayed, claims narrowed (Section 5). A design document with nothing to report here has usually not met its hardware yet.
-Briefly document:
-- [ ] Raspberry Pi CPU/RAM limitations
-- [ ] SD/storage limitations
-- [ ] IPC overhead
-- [ ] Budget limitations
-- [ ] Power-loss considerations
+## Constraints and substitutions
+This section covers compute, storage and IPC. The budget, environment (power, placement) and sensor/hardware constraints are covered by Lucas below.
+
+### Pi CPU / RAM
+
+| | |
+|---|---|
+| **Ideal build** | A real-time-capable platform: a `PREEMPT_RT` kernel with pinned, prioritized sampling threads, or a microcontroller doing the timed sampling, with the Pi handling storage. Active cooling. |
+| **Actual build** | Raspberry Pi 4 Model B (4× Cortex-A72 @ 1.5 GHz, 2 GB RAM), stock Raspberry Pi OS kernel (not real-time), passive heatsinks only, no fan. |
+| **What the gap costs** | **Timing claims are narrowed.** Sampling is scheduled by an ordinary Linux kernel, so sample times have millisecond-level jitter. Timestamps are stored in µs, but we claim only about ±10 ms accuracy (to be confirmed in the Evaluation plan). Soil and light change over minutes to hours, so this does not affect plant care. **Thermal headroom is limited.** Without a fan, the SoC throttles above about 80 °C. Our load is far below that, but we will log `vcgencmd measure_temp` and `get_throttled` during the soak test rather than assume it. |
+
+**Resource budget.** The workload is about 1 reading/s, so CPU is not a meaningful constraint (we expect well under 1% total). Memory is bounded by design:
+
+| Component | Bounded buffer | Size |
+|---|---|---|
+| Sensor ring (each) | 64 readings × 16 B | ≈1 KB |
+| Hub queue | 1024 records × 16 B | ≈16 KB |
+| Storage batch | 64 × 24 B | ≈1.5 KB |
+| Storage outage queue | 1 MB (≈11 h) | 1 MB |
+
+The main memory cost is process isolation itself. There are five processes, each with its own C runtime and stack (about 1–2 MB resident each, estimated). That is acceptable on any Pi 4 RAM size, and it buys Mechanism E's fault isolation.
+
+### SD / storage
+
+| | |
+|---|---|
+| **Ideal build** | Storage with power-loss protection (an industrial/high-endurance card or a USB SSD with PLP), separate from the OS disk, with a UPS so a power cut becomes a clean shutdown. |
+| **Actual build** | One Patriot LX Series 32 GB microSD card (a consumer-grade card, not a high-endurance model) holding both the OS and our log, formatted ext4, with no power-loss protection and no UPS. |
+| **What the gap costs** | **The durability claim is narrowed.** `fsync()` returning means the kernel has handed the data to the card. A consumer card's internal controller may still reorder or delay writes, and we cannot verify that from software. Our guarantee ("committed once fsync returns", see *Storage and data*) therefore assumes the card honours flush requests, and the real power-pull test in *Mechanism D* is our evidence that it does. **fsync latency is unpredictable.** It is typically tens of ms, but can spike to seconds. This is why the storage lock is never held during I/O. **Write amplification:** each ≈1.5 KB batch costs at least one 4 KB page plus ext4 journal metadata, so physical writes are an estimated 10–20× the 2.1 MB/day of data. That is still only tens of MB/day, far below the card's endurance. **Shared card:** OS writes (journal, package updates) compete with ours, which is one reason we report fsync p99 rather than only the average. |
+
+**Capacity:** 30 days of data is about 63 MB, well under 1% of the card. Disk-full handling (refuse, count, gap record, 64 KB reserve) exists for a card filled by something else, not by our log. See *Storage and data → With what retention*.
+
+### IPC overhead
+
+| | |
+|---|---|
+| **Ideal build** | A shared-memory ring between processes (zero-copy, as in Figure 1), or a single process with no IPC at all. |
+| **Actual build** | Unix domain sockets (`hub.sock`, `storage.sock`, `sup.sock`), with 16 B messages over two hops (sensor → hub → storage), plus 1 Hz heartbeats from each child to the supervisor. |
+| **What the gap costs** | Each message costs a `send()` and a `recv()` system call and two kernel copies per hop. We estimate tens of µs per hop on a Pi 4, to be measured in the Evaluation plan. At ≈1.02 data messages/s plus 4 heartbeats/s, that is negligible. **What we gain:** the kernel buffers messages for us, a dead peer is reported immediately (`EPIPE` / `ECONNREFUSED`), and no process can corrupt another's memory. A shared-memory ring would give none of that, and Mechanism E depends on all of it. **Claims narrowed:** we make no high-throughput IPC claim. We claim only that IPC adds a negligible share of the sensor-to-storage latency, with a number committed in the Evaluation plan. |
 
 ## Evaluation plan. The measurements you will take (Section 9), each with its method and its target. Numbers you commit to now are twice as credible when you hit them later. And instructive either way.
 Write down what you'll eventually measure:
