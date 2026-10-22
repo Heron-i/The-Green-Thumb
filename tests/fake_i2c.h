@@ -35,6 +35,9 @@ typedef struct {
     /* Failure injection: the next N calls of each kind return GT_ERR_IO. */
     int      fail_writes;
     int      fail_reads;
+    /* Fail only the Nth write call (1-based, counted since fake_i2c_bus);
+     * 0 = off. Lets a test pass the first commands and NACK a later one. */
+    int      fail_write_at;
 
     int      sleep_calls;
     uint32_t slept_ms_total;
@@ -58,6 +61,9 @@ static inline gt_status fake_i2c_write(void *ctx, const uint8_t *buf, size_t len
     }
     if (f->fail_writes > 0) {
         f->fail_writes--;
+        return GT_ERR_IO;
+    }
+    if (f->fail_write_at == f->write_calls) {
         return GT_ERR_IO;
     }
     return GT_OK;
