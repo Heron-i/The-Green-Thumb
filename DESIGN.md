@@ -98,7 +98,7 @@ flowchart TB
 | A precise, provable durability point | fsync per batch; directory fsync when a new segment is created | flush thread | Without fsync, "written" only means the data reached the page cache. The directory fsync stops a new day's file from vanishing | Every commit logged with count and duration; report fsync p50/p99 |
 | Survive being unplugged mid-write | 24 B records with CRC32; startup scan truncates at the first bad record before accepting data | storage startup recovery | A household Pi has no UPS and gets unplugged routinely. Fixed-size records make recovery a short arithmetic scan | 20 real power pulls mid-batch: 0 corrupt records accepted, loss ≤ 1 batch (60 s), recovery < 1 s |
 | No loss on a normal shutdown or restart | Flush and fsync on SIGTERM | flush thread | Supervisor restarts and user shutdowns shouldn't cost a batch | 20 SIGTERM restarts: 0 records lost |
-| Never fail silently | Check every write/fsync; keep the batch and retry; degraded after 3 consecutive failures | flush thread | A silent hole would undermine the history claim, which is D's selling point | Inject write/fsync errors: 100% logged as `storage_write_error`, 0 silent losses |
+| Never fail silently | Check every write/fsync; on any detected failure, keep the batch in memory and mark storage degraded; on the next cycle, truncate to the last committed offset, rewrite and fsync | flush thread | A silent hole would undermine the history claim, which is D's selling point | Inject write/fsync errors: 100% logged as `storage_write_error` / `fsync_error` + `storage_degraded`, 0 silent losses |
 | Preserve history through a storage outage | 1 MB queue (about 11 h); `storage_backlog` at 50/75/90%; when full, an explicit degraded state that refuses and counts new readings, then writes a gap record on recovery | storage process | Better a marked gap than a silent one. Storage keeps reading its socket, so the hub and sensors never block and E's heartbeats are unaffected | Outage longer than the queue (with a small test cap): 0 accepted readings lost, and the gap record's count equals the refused count |
 | Restarts must not corrupt the log (D meets E) | Recovery runs before `storage.sock` accepts data | storage startup recovery + supervisor | The supervisor can kill storage at any instant, so a kill is just a power cut without the reboot | 50 random `kill -9`s on storage: 0 corrupt records |
 
@@ -123,16 +123,125 @@ Log format for every component: `timestamp level component event key=value`. Rul
 | Power | Power cut mid-write | No clean-shutdown marker at boot | Recovery scan before accepting data. A record is committed once fsync returns; a power cut loses at most one unsynced batch (≤ 60 s), plus any backlog held in memory during a storage outage, and never leaves a corrupt record readable | `unclean_shutdown`, `recovery_event` |
 | System clock | Wrong time after a reboot (no real-time clock) | NTP sync status from `adjtimex` | Store readings anyway (seq keeps their order) and log the unsynced period | `clock_unsynced`, `clock_synced` |
 
-## Storage and data. What is stored, at what rate, in what format, with what retention, and what happens to it when the power dies mid-write.
-What exactly is stored?
-[ ] Soil + light + timestamp?
-[ ] What is the sampling rate?
-[ ] What is the storage format?
-[ ] How are records organized?
-[ ] How long are they retained?
-[ ] How are writes batched?
-[ ] When is data flushed?
-[ ] How do you recover from a mid-write failure?
+## Storage and data
+
+All sensor data is written by one component, the **storage process** (Mechanism D). No other process writes to the log. See the *Architecture Diagram* (storage subgraph) and *Mechanism mapping → Mechanism D*.
+
+### What is stored
+
+The log holds two kinds of fixed-size record:
+
+- **DATA record:** one accepted reading from one sensor. It holds the sensor ID, the hub-assigned sequence number, a timestamp and the sensor's **raw count**:
+  - Light (BH1750): raw 16-bit count. Lux = count / 1.2, converted when the data is read.
+  - Soil (STEMMA seesaw): raw capacitance count, roughly 200–2000.
+
+  Light and soil are stored as separate records, not combined into one row. Raw counts are stored rather than converted units, so calibration can change later without rewriting history.
+- **GAP record:** an explicit marker that readings were refused. It holds the affected sensor, the gap's start time and the number of refused readings. The component that refuses the readings writes the gap record (sensor ring, hub queue or storage queue). See the rule above the *Failure-mode table*.
+
+Readings that fail validation (out of range, or a malformed message) are rejected by the hub and are **not** stored. See the *Failure-mode table → Hub* rows.
+
+The timestamp is applied by the hub when it receives the reading. If the Pi booted without network time, the timestamps may be wrong until NTP syncs. Ordering always comes from `seq`. See the *Failure-mode table → System clock*.
+
+### At what rate
+
+| Stream | Rate | Records/day |
+|---|---|---|
+| Light | 1 per second | 86,400 |
+| Soil | 1 per 60 s | 1,440 |
+| **Total into storage** | **≈1.02 records/s (≈25 B/s)** | **87,840 ≈ 2.1 MB/day** |
+
+On the wire, each reading is a 16 B socket message (sensor → hub → storage). On disk, each reading is one 24 B record. Gap records only appear during failures and add negligible volume. See the *Architecture Diagram* data path labels.
+
+### In what format
+
+The log is an **append-only binary log** of fixed 24 B records, packed and little-endian.
+
+**Segment header** (16 B, written once at the start of each file):
+
+| Field | Size | Value |
+|---|---|---|
+| magic | 4 B | `"GTLG"` |
+| version | 2 B | 1 |
+| record_size | 2 B | 24 |
+| created_at | 8 B | µs since the Unix epoch |
+
+**Record** (24 B):
+
+| Field | Size | DATA record | GAP record |
+|---|---|---|---|
+| magic | 1 B | `0xA7` | `0xA7` |
+| record_type | 1 B | `0x01` | `0x02` |
+| version | 1 B | 1 | 1 |
+| sensor_id | 1 B | 1 = light, 2 = soil | affected sensor (0 = all) |
+| seq | 4 B | hub sequence number | see below |
+| timestamp | 8 B | hub receive time, µs since epoch | gap start, µs since epoch |
+| value | 4 B | raw sensor count (u32) | refused-reading count (u32) |
+| crc32 | 4 B | CRC-32 over bytes 0–19 | CRC-32 over bytes 0–19 |
+
+- A gap ends at the timestamp of the next DATA record for the same sensor, so it needs no separate end field.
+- Every record has a `seq`, and `seq` is strictly increasing across the log:
+  - Gaps created by a sensor or by the hub receive a hub-assigned `seq`.
+  - Gaps created by storage use the `seq` of the first refused reading.
+- Any record with an unknown `record_type` is treated as corrupt.
+
+### How records are organized
+
+- There is one segment file per UTC day: `/var/lib/plantpi/log-YYYYMMDD.bin`.
+- Records are appended in `seq` order. Only the current day's file is open for writing, so only its tail can ever need recovery.
+- When a new segment is created, storage fsyncs the directory as well, so the new file cannot disappear after a power cut.
+
+### With what retention
+
+- Segments are kept for **30 days**, about 63 MB. When a new day's segment is created, segments older than 30 days are deleted.
+- **Nothing inside the 30-day window is ever deleted to make room.** If the card fills before 30 days:
+  - Storage logs `storage_disk_full`.
+  - It refuses and counts new readings.
+  - It writes a GAP record once space is available again.
+- A 64 KB reserve (checked with `statvfs`) is always kept free, so a GAP record can always be written.
+
+This follows the project's policy: protect existing history, and make any unavoidable loss explicit. See *Failure-mode table → Storage (disk full)*.
+
+### How writes are batched and when data is flushed
+
+- The **rx thread** reads records from `storage.sock` and appends them to a single in-memory batch buffer (≤ 64 × 24 B) under a mutex.
+- The **flush thread** commits a batch when either of these comes first:
+  - **N = 64 records**, or
+  - **T = 60 s** since the last commit. At about 1.02 records/s, T is normally the trigger, which gives about 61 records (≈1.5 KB) per batch and about 1,440 fsyncs/day.
+- **Commit sequence:**
+  1. Lock the mutex, copy the batch out and clear the buffer.
+  2. Unlock. The lock is never held during I/O.
+  3. `write()` the batch.
+  4. `fsync()` the segment.
+  5. Record the new committed offset.
+- **On SIGTERM**, the flush thread commits whatever is buffered, then writes a clean-shutdown marker.
+- **A record is committed once `fsync()` returns.** Before then, it may be lost but is never reported as stored.
+- **If `write()` or `fsync()` fails:**
+  - The batch stays in memory and storage is marked degraded immediately.
+  - On the next cycle, storage truncates the file back to the last committed offset, then rewrites and fsyncs the batch, so no duplicate or partial records reach the log.
+  - While the disk is unavailable, records keep queueing, up to 1 MB (about 11 h). Storage logs `storage_backlog` at 50%, 75% and 90%.
+  - When the queue is full, storage refuses and counts new readings, and writes a GAP record on recovery.
+
+See *Mechanism D* (batching, durability point and outage rows) and *Failure-mode table → Storage*.
+
+### What happens when the power dies mid-write
+
+**Guarantee:** a power cut loses at most one unsynced batch (≤ 60 s), plus any backlog held in memory during a storage outage. It never leaves a corrupt record readable.
+
+On every start, **recovery runs before `storage.sock` accepts any data**. This is the same path after a power cut and after a supervisor restart or `kill -9`.
+
+1. If the clean-shutdown marker is missing, log `unclean_shutdown`, then remove the marker.
+2. Check the current segment's header. If it is invalid, rename the file to `.corrupt`, log `segment_corrupt`, and start a fresh segment.
+3. Scan the records from the start of the segment. Stop at the **first** record that has any of these problems:
+   - bad magic, unknown `record_type` or wrong version
+   - CRC mismatch
+   - `seq` that does not increase
+   - a partial (fewer than 24 B) trailing record
+4. `ftruncate()` the file at that offset, `fsync()` it, and log `recovery_event` with the bytes and records removed.
+5. Open `storage.sock` and resume normal operation.
+
+Records are fixed-size, so the scan is simple offset arithmetic. The target is under 1 s for a full day's segment.
+
+See *Mechanism D → "Survive being unplugged" and "Restarts must not corrupt the log"*, and *Failure-mode table → Storage (corrupt tail)* and *Power*.
 
 ## Constraints and substitutions. What the ideal build would use, what you’re actually using, and what the gap costs: sensors downgraded, data synthesized or replayed, claims narrowed (Section 5). A design document with nothing to report here has usually not met its hardware yet.
 Briefly document:
