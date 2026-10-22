@@ -1,4 +1,7 @@
-CC ?= gcc
+# make predefines CC=cc, so `?=` never fires; only replace make's default.
+ifeq ($(origin CC),default)
+CC := gcc
+endif
 BUILD ?= build
 BASE_CFLAGS := -std=c17 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Werror -g -O1 -Iinclude -Itests -pthread
 CFLAGS := $(BASE_CFLAGS) $(EXTRA_CFLAGS)
