@@ -388,4 +388,36 @@ The goal is to show the system stays stable over the 72 h soak, not to hit an ab
 | Segment rollover and retention | Lily | Observe the midnight UTC rollover during the soak; test retention with the window shortened to minutes | New segment and directory fsync at each rollover; only segments older than the window are deleted |
 | Sampling jitter: each sample's deviation from its schedule (1 s light, 60 s soil) | Lucas | `CLOCK_MONOTONIC` at each I2C read over the soak | p99 < 10 ms (matches the ±10 ms timestamp claim in *Constraints*) |
 
-## Ownership map. Which partner owns which subsystems (Section 10.1). Ownership means first authorship and answerability at the defense, not exclusivity.
+## Ownership map
+
+Ownership means first authorship and answerability at the defense, not exclusive work. Either partner may contribute to any area.
+
+### Lily
+
+- **Light sensor (driver and process):** the `light_sensor` process, the BH1750 I2C read code, and its read-failure handling.
+- **IPC (data path):** `hub.sock` and `storage.sock`, the 16 B message format, reconnect and backoff, and the sensor-side and hub queues.
+- **Hub / aggregation:** the hub process itself, which validates, stamps (seq + time) and forwards readings, plus per-sensor timeouts and gap records for refused readings.
+- **Storage:** the storage process, its rx and flush threads, batching (N = 64 / T = 60 s), the segment format and 30-day retention.
+- **Persistence and recovery:** the fsync discipline, the durability guarantee, the startup recovery scan, and the handling of write/fsync failures, disk full and storage outages.
+- **Mechanism D (custom storage layer):** the mechanism's design, its justification and its crash-consistency claims.
+- **Pipeline evaluation:** IPC latency, sensor-to-storage latency, write throughput, CPU, memory, data loss/corruption and storage recovery.
+
+### Lucas
+
+- **Soil sensor (driver and process):** the `soil_sensor` process, the STEMMA seesaw I2C code, and its read-failure handling.
+- **IPC (control path):** `sup.sock`, the heartbeat protocol, and SIGCHLD handling.
+- **Supervisor:** the process that forks and restarts every child, watches heartbeats, and applies restart backoff.
+- **Sampling (timing):** sampling schedules and timing for both sensors (1 Hz light, 1 per 60 s soil).
+- **Hub integration:** how the hub fits into the system: sensor clients connecting to it, its supervision and restart, and handing aggregated data to analysis.
+- **Sensor cooperation:** combining light and soil readings into a joint view of plant conditions.
+- **Plant-care intelligence:** the analysis engine and the guidance it produces (thresholds, alerts, recommendations).
+- **Mechanism E (multi-process isolation):** the mechanism's design, its justification and its fault-isolation claims.
+- **Sensor, sampling and analysis evaluation:** sampling jitter, I2C failure rates, sensor accuracy and alert correctness.
+
+### Joint (Lily and Lucas)
+
+- **Architecture integration:** keeping processes, interfaces and the diagram consistent where D and E meet (for example, storage restarts and recovery).
+- **System testing:** end-to-end tests of the full system on the real hardware.
+- **Fault injection:** killing processes, injecting I/O errors and pulling power to check the failure-mode table.
+- **Soak testing:** the 72 h run at real rates that checks long-run stability and the failure-mode table's honesty.
+- **Milestone integration:** merging both partners' work and preparing each milestone's final submission.
