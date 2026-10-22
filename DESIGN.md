@@ -421,3 +421,15 @@ Ownership means first authorship and answerability at the defense, not exclusive
 - **Fault injection:** killing processes, injecting I/O errors and pulling power to check the failure-mode table.
 - **Soak testing:** the 72 h run at real rates that checks long-run stability and the failure-mode table's honesty.
 - **Milestone integration:** merging both partners' work and preparing each milestone's final submission.
+
+## AI-usage Plan
+## AI-usage plan
+
+**What we will use Claude for**
+- **Planning before implementation:** for each issue, we use Claude to plan the implementation first. We then use it to help implement the code for that issue, working from the agreed plan.
+- **Next steps:** recommending what to work on next after each issue is completed.
+- **Code documentation:** planning the documentation the code itself should have (comments, function headers, module descriptions).
+
+**What we will not use Claude for**
+- **Process records:** Claude does not create the `PROMPTLOG`, `DEVLOG` or `CLAUDE.md` files. We write these ourselves.
+- **Unsupervised work:** Claude is never run in auto mode, and it does not implement anything without a specific instruction from one of us.
