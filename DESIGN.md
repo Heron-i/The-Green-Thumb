@@ -306,12 +306,14 @@ The main memory cost is process isolation itself. There are five processes, each
 
 ## Evaluation plan
 
-Each measurement below has a method and a target. Unless a row says otherwise, measurements use the real hardware at the real sampling rates (light 1 Hz, soil 1 per 60 s). Owners: **Lily** covers the sensor → IPC → hub → storage pipeline, and **Lucas** covers sensor processes, sampling and analysis. Rows marked **Joint** are measured together.
+Each measurement below has a method and a target. Unless a row says otherwise, measurements use the real hardware at the real sampling rates (light 1 Hz, soil 1 per 60 s). Owners: **Lily** covers the sensor → IPC → hub → storage pipeline (Mechanism D), and **Lucas** covers fault isolation and the supervisor (Mechanism E), sensor processes, sampling and analysis. Rows marked **Joint** are measured together.
 
 **Test tooling**
 - **Load generator:** writes synthetic records into `storage.sock` at a set rate.
 - **Verifier:** reads the log offline and checks every record's CRC, that `seq` strictly increases, and that every missing `seq` is covered by a GAP record. It then compares the log against the hub's sent-sequence log.
 - **Timing:** latency is measured with `CLOCK_MONOTONIC` timestamps, logged at each stage and keyed by sensor counter and hub `seq`, then joined offline.
+- **Fault injector:** a script that picks a target process and a random time, then sends `SIGKILL` (crash), `SIGSTOP` (hang) or closes its socket (disconnect). It logs each injection with a `CLOCK_MONOTONIC` timestamp so it can be joined with the supervisor's `child_exit`, `heartbeat_timeout` and restart events.
+- **Fake I2C bus:** `tests/fake_i2c.h` fails the Nth bus operation, so retry, skip and offline logic is tested on a dev machine without hardware (runs in CI under `make test`, `make asan` and `make memcheck`).
 
 ### IPC latency
 
@@ -387,6 +389,59 @@ The goal is to show the system stays stable over the 72 h soak, not to hit an ab
 | Long-run stability | 72 h soak at real rates; this run also supplies the latency, CPU, memory and loss data above | No trend in CPU, RSS, fsync p99 or backlog; backlog stays at 0; log grows ≈2.1 MB/day; 0 unexplained gaps |
 | Segment rollover and retention |Observe the midnight UTC rollover during the soak; test retention with the window shortened to minutes | New segment and directory fsync at each rollover; only segments older than the window are deleted |
 | Sampling jitter: each sample's deviation from its schedule (1 s light, 60 s soil) | `CLOCK_MONOTONIC` at each I2C read over the soak | p99 < 10 ms (matches the ±10 ms timestamp claim in *Constraints*) |
+
+### Fault isolation and restart (Mechanism E)
+
+These tests check the *Mechanism E* rows. They run against the processes that exist at each milestone (`light_sensor`, `soil_sensor`, `hub`, `storage`), and `care` and `monitor` are added to the target list when they land. Every run ends with the verifier, so a fault that "recovers" but loses or corrupts data still fails.
+
+| Measurement | Method | Target |
+|---|---|---|
+| **Containment:** a crash affects only its target | 50 `kill -9`s per process at random times during real-rate logging; check every other PID before and after | Only the targeted PID changes; 0 unrelated exits or restarts |
+| **Crash detection and restart time:** `SIGKILL` → `child_exit` → new child sends its first heartbeat | Fault-injector timestamp vs. supervisor log, over the same 50 kills per process | 100% detected; p99 < 2 s from kill to first heartbeat (first restart, before backoff grows) |
+| **Hang detection:** `SIGSTOP` → `heartbeat_timeout` → `SIGKILL` → restart | 20 injected hangs per process | 100% detected; detection ≤ 6 s (5 s heartbeat timeout + 1 s heartbeat period); healthy again < 2 s after detection |
+| **Peer reconnect:** restarted socket owner → clients send again | Kill the hub 50 times and storage 50 times; measure the time from the new socket appearing to each client's first successful `send()` (`ipc_reconnect`, `storage_reconnected`) | 100% reconnect with no manual action; ≤ 2 s (the client backoff cap) |
+| **Readings survive a hub restart** | During the 50 hub kills, compare each sensor's counter against the committed log | 0 lost light or soil readings, because the sensor ring (64 readings ≈ 64 s of light) outlasts a < 2 s restart |
+| **Sensor collection continues while a peer is down** | Kill or `SIGSTOP` storage (and later `care` / `monitor`) for 60 s | Hub keeps receiving at 1 Hz light with no `sensor_timeout`; sensors never block on `send()` |
+| **No restart storm** | Point one child at a binary that exits at once; run for 10 min | Restart gaps follow 1 → 2 → 4 … capped at 30 s (≤ 25 restarts in 10 min); healthy processes keep their heartbeats and the sampling-jitter target |
+| **Cold start after power loss** | The same 20 power pulls as *Data loss*; timestamp supervisor start and each child's first heartbeat | All children heartbeating within 10 s of supervisor start, in dependency order (storage → hub → sensors), on every pull |
+| **Protocol robustness** | Unit tests plus a fuzz run of 10,000 random, truncated, wrong-sensor-ID and out-of-range 16 B messages into `hub.sock` | 100% rejected and logged as `ipc_bad_message` or `reading_invalid`; 0 hub crashes; 0 rejected messages stored |
+| **Failures are visible** | Every injection above is matched against the event log | 100% of injections produce a process-specific `child_exit`, `heartbeat_timeout`, `ipc_disconnect` or degraded event; 0 silent failures |
+
+### Sensor reliability
+
+This covers the *Failure-mode table → Sensor (I2C)* and *Hub (sensor goes quiet)* rows.
+
+| Measurement | Method | Target |
+|---|---|---|
+| I2C read failure rate | Count `i2c_read_error` and skipped samples per sensor over the 72 h soak | Report the first-attempt failure rate; < 0.1% of samples skipped after 3 retries |
+| Retry, skip and offline logic | Fake I2C bus fails the Nth operation: a single failure, 3 failures in a row, 10 in a row, then recovery | Single failures are recovered by retry with no skipped sample; skip after 3 retries; `sensor_offline` after 10 consecutive failures; `sensor_online` on the first good read |
+| Unplug and replug on the real Pi | Pull each sensor's STEMMA cable for 60 s, 10 times per sensor | Hub logs `sensor_timeout` within its timeout + 1 s (3 s light, 180 s soil); other sensor unaffected; `sensor_online` ≤ 6 s after replug (5 s retry period); 0 process crashes |
+| Bring-up check | `light_probe` (and a soil probe when the driver lands) on each fresh install | All checklist steps PASS |
+
+### Sensor accuracy
+
+These measurements show the raw counts mean something before the analysis engine relies on them. The method and spread are reported along with pass/fail, because the reference instruments are cheap.
+
+| Measurement | Method | Target |
+|---|---|---|
+| Light accuracy | BH1750 next to a reference lux meter at 5 levels (dark room, indoor lamp, shaded window, bright window, direct sun); 60 readings per level | Within ±20% of the reference at every level (BH1750 datasheet tolerance) |
+| Light repeatability | 60 readings at 1 Hz under constant lamp light | Coefficient of variation < 2% |
+| Soil calibration points | Raw count in open air, in dry potting mix and in fully watered potting mix; 30 readings each | The three ranges don't overlap; dry < watered; recorded as the calibration constants |
+| Soil repeatability | 30 readings at 1 per 60 s in an undisturbed pot | Coefficient of variation < 5% |
+| Watering response | Water a dry pot during logging | Reading moves at least halfway from the dry range to the watered range within 2 soil samples (≤ 2 min) |
+| Drift | Sealed, unwatered pot logged over the 72 h soak | Report the trend; no step changes that aren't explained by the environment |
+
+### Plant-care alert correctness (planned, later milestone)
+
+The analysis engine is on the diagram as a later milestone, so these targets are committed now and measured when it lands. Every test replays recorded or synthetic logs through the engine on a dev machine, so no hardware is needed, and the same input always gives the same output.
+
+| Measurement | Method | Target |
+|---|---|---|
+| True alerts | Scripted logs for each condition: soil drying past the threshold, overwatered (stays wet for more than 48 h), low light (daily light total below the threshold), sensor offline | 100% of scripted conditions raise the matching alert |
+| False alerts | Replay the 72 h soak log from a healthy, correctly watered plant | 0 alerts |
+| Alert latency | Scripted threshold crossings | Alert raised within 1 sample period of the crossing being confirmed (60 s for soil) |
+| No flapping | A reading that hovers around a threshold for 1 h | At most 1 alert per crossing (hysteresis holds) |
+| Gaps are not data | Logs with GAP records and `sensor_offline` periods | No dry or low-light alert raised from missing data; a `sensor_offline` alert is raised instead |
 
 ## Ownership map
 
