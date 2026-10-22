@@ -313,13 +313,13 @@ Each measurement below has a method and a target. Unless a row says otherwise, m
 - **Verifier:** reads the log offline and checks every record's CRC, that `seq` strictly increases, and that every missing `seq` is covered by a GAP record. It then compares the log against the hub's sent-sequence log.
 - **Timing:** latency is measured with `CLOCK_MONOTONIC` timestamps, logged at each stage and keyed by sensor counter and hub `seq`, then joined offline.
 
-### IPC latency *(Lily)*
+### IPC latency
 
 | Measurement | Method | Target |
 |---|---|---|
 | One-way latency per hop (sensor → hub, hub → storage) for a 16 B message | Standalone UDS ping-pong benchmark (100,000 round trips, latency = RTT / 2), confirmed by a short in-system run with per-stage timestamps | p50 < 50 µs, p99 < 1 ms per hop |
 
-### Sensor-to-storage latency *(Lily)*
+### Sensor-to-storage latency 
 
 These are measured **under normal storage operation**. Storage outages and backlog are covered under *Data loss and corruption* and *Recovery time* instead.
 
@@ -328,7 +328,7 @@ These are measured **under normal storage operation**. Storage outages and backl
 | **Delivery latency:** I2C read completes → record is in the storage batch buffer | Per-stage timestamps joined by `seq` over the 72 h soak | p99 < 5 ms |
 | **Commit latency:** I2C read completes → `fsync()` returns for that record's batch | Same as above | max < 62 s (the T = 60 s batch window plus fsync) |
 
-### Storage write throughput *(Lily)*
+### Storage write throughput 
 
 Each step runs for 10 minutes with the load generator, at N = 64 / T = 60 s. We record fsync count, fsync p50/p99, MB/s and backlog depth. Only Stress 2 is a committed target. Stress 3 reports the headroom and is not pass/fail.
 
@@ -341,14 +341,14 @@ Each step runs for 10 minutes with the load generator, at N = 64 / T = 60 s. We 
 
 We also compare fsync count, write latency and CPU at (N, T) = (1, 1 s), (64, 10 s) and (64, 60 s), as committed in *Mechanism D*.
 
-### CPU usage *(Lily)*
+### CPU usage
 
 | Measurement | Method | Target |
 |---|---|---|
 | CPU time per process (utime + stime) | Sample `/proc/<pid>/stat` every 10 s during the 72 h soak and during each stress step | < 2% of one core in total at the real load |
 | SoC temperature and throttling | `vcgencmd measure_temp` and `vcgencmd get_throttled` every 60 s during the soak | No throttling events (see *Constraints → Pi CPU / RAM*) |
 
-### Memory usage *(Lily)*
+### Memory usage 
 
 The goal is to show the system stays stable over the 72 h soak, not to hit an absolute size.
 
@@ -358,7 +358,7 @@ The goal is to show the system stays stable over the 72 h soak, not to hit an ab
 | Growth | Sample `VmRSS` / `VmHWM` from `/proc/<pid>/status` every 60 s over 72 h | Flat after warm-up; no upward trend in any process |
 | Buffer bounds | Each buffer logs its high-water mark; a forced storage outage fills the storage queue | No buffer ever exceeds its cap (sensor ring 64, hub queue 1024, storage batch 64, storage queue 1 MB). On a full queue, storage refuses new readings and logs `storage_degraded` |
 
-### Data loss and corruption *(Lily)*
+### Data loss and corruption 
 
 **Lost readings** = seqs the hub sent − seqs committed − seqs covered by a GAP record. The verifier checks every test below.
 
@@ -373,20 +373,20 @@ The goal is to show the system stays stable over the 72 h soak, not to hit an ab
 
 ### Recovery time after failure
 
-| Measurement | Owner | Method | Target |
-|---|---|---|---|
-| Storage startup and recovery scan: process start → scan complete | Lily | Timestamps in `recovery_event`, on a full-day segment with a truncated tail | < 1 s |
-| Time to accept new data: process start → `storage.sock` accepts its first record | Lily | Startup log vs. first `recv()` | < 1 s after the scan completes |
-| Power-loss recovery: boot → storage accepting data | Lily | 20 power pulls; timestamps from boot, `unclean_shutdown` and first accept; verifier run after each | Storage accepting data within the boot sequence; verifier passes every time |
-| End-to-end storage restart: `kill -9` → supervisor restart → recovery → hub reconnect → **first successful commit** | **Joint** (Lily + Lucas) | 50 kills; timestamps from `child_exit`, `recovery_event`, `storage_reconnected` and the first commit | ≤ supervisor backoff + 1 s |
+| Measurement |  Method | Target |
+|---|---|---|
+| Storage startup and recovery scan: process start → scan complete |Timestamps in `recovery_event`, on a full-day segment with a truncated tail | < 1 s |
+| Time to accept new data: process start → `storage.sock` accepts its first record |Startup log vs. first `recv()` | < 1 s after the scan completes |
+| Power-loss recovery: boot → storage accepting data |20 power pulls; timestamps from boot, `unclean_shutdown` and first accept; verifier run after each | Storage accepting data within the boot sequence; verifier passes every time |
+| End-to-end storage restart: `kill -9` → supervisor restart → recovery → hub reconnect → **first successful commit** | 50 kills; timestamps from `child_exit`, `recovery_event`, `storage_reconnected` and the first commit | ≤ supervisor backoff + 1 s |
 
 ### Behavior under sustained sampling
 
-| Measurement | Owner | Method | Target |
-|---|---|---|---|
-| Long-run stability | Lily | 72 h soak at real rates; this run also supplies the latency, CPU, memory and loss data above | No trend in CPU, RSS, fsync p99 or backlog; backlog stays at 0; log grows ≈2.1 MB/day; 0 unexplained gaps |
-| Segment rollover and retention | Lily | Observe the midnight UTC rollover during the soak; test retention with the window shortened to minutes | New segment and directory fsync at each rollover; only segments older than the window are deleted |
-| Sampling jitter: each sample's deviation from its schedule (1 s light, 60 s soil) | Lucas | `CLOCK_MONOTONIC` at each I2C read over the soak | p99 < 10 ms (matches the ±10 ms timestamp claim in *Constraints*) |
+| Measurement | Method | Target |
+|---|---|---|
+| Long-run stability | 72 h soak at real rates; this run also supplies the latency, CPU, memory and loss data above | No trend in CPU, RSS, fsync p99 or backlog; backlog stays at 0; log grows ≈2.1 MB/day; 0 unexplained gaps |
+| Segment rollover and retention |Observe the midnight UTC rollover during the soak; test retention with the window shortened to minutes | New segment and directory fsync at each rollover; only segments older than the window are deleted |
+| Sampling jitter: each sample's deviation from its schedule (1 s light, 60 s soil) | `CLOCK_MONOTONIC` at each I2C read over the soak | p99 < 10 ms (matches the ±10 ms timestamp claim in *Constraints*) |
 
 ## Ownership map
 
