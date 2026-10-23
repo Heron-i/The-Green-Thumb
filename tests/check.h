@@ -33,12 +33,6 @@ static int check_failures;
         }                                                               \
     } while (0)
 
-/* Print a summary and give main() its exit status. */
-#define CHECK_RESULT()                                                  \
-    (check_failures == 0                                                \
-         ? (printf("all checks passed\n"), 0)                           \
-         : (fprintf(stderr, "%d check(s) failed\n", check_failures), 1))
-
 /* One case: an ID like "LSO-03", a short name, and a void test body. */
 typedef struct {
     const char *id;
