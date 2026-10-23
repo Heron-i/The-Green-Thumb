@@ -32,8 +32,11 @@ $(BUILD)/light_probe: src/light_probe_main.c $(LIB_SRC) $(HEADERS)
 
 light_probe: $(BUILD)/light_probe
 
+# Every test binary runs even if an earlier one fails; failures are listed
+# at the end and the target still exits nonzero for CI.
 test: $(TEST_BINS)
-	@for b in $(TEST_BINS); do echo "== $$b"; ./$$b || exit 1; done
+	@failed=""; for b in $(TEST_BINS); do echo "== $$b"; ./$$b || failed="$$failed $$b"; done; \
+	if [ -n "$$failed" ]; then echo "FAILED:$$failed"; exit 1; fi
 
 # Sanitizers get their own build dirs so they never reuse plain objects.
 asan:
@@ -46,7 +49,8 @@ ubsan:
 
 # valgrind and ASan don't mix, so memcheck runs the plain build.
 memcheck: $(TEST_BINS)
-	@for b in $(TEST_BINS); do echo "== valgrind $$b"; $(VALGRIND) ./$$b || exit 1; done
+	@failed=""; for b in $(TEST_BINS); do echo "== valgrind $$b"; $(VALGRIND) ./$$b || failed="$$failed $$b"; done; \
+	if [ -n "$$failed" ]; then echo "FAILED:$$failed"; exit 1; fi
 
 clean:
 	rm -rf build
