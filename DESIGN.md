@@ -542,7 +542,6 @@ Ownership means first authorship and answerability at the defense, not exclusive
 - **Milestone integration:** merging both partners' work and preparing each milestone's final submission.
 
 ## AI-usage Plan
-## AI-usage plan
 
 **What we will use Claude for**
 - **Planning before implementation:** for each issue, we use Claude to plan the implementation first. We then use it to help implement the code for that issue, working from the agreed plan.
