@@ -125,7 +125,7 @@ flowchart TB
 
 ## Failure-mode table
 
-Log format for every component: `timestamp level component event key=value`. Rule: whichever component refuses a reading records the gap (start, end, count), so no reading is ever lost silently.
+Log format for every component: `timestamp level component event key=value`. `timestamp` is µs since the Unix epoch, written as an integer (the same unit as the on-disk record, so log lines and records can be joined), and `level` is one of `DEBUG`, `INFO`, `WARN` or `ERROR`. Every component builds its lines with the shared `gt_log_format` (`src/gt_log.c`). Rule: whichever component refuses a reading records the gap (start, end, count), so no reading is ever lost silently.
 
 | Component | Failure | Detection | Response | Log |
 |---|---|---|---|---|
@@ -205,7 +205,7 @@ The timestamp is applied by the hub when it receives the reading. If the Pi boot
 | Soil | 1 per 60 s | 1,440 |
 | **Total into storage** | **≈1.02 records/s (≈25 B/s)** | **87,840 ≈ 2.1 MB/day** |
 
-On the wire, each reading is a 16 B socket message (sensor → hub → storage). On disk, each reading is one 24 B record. Gap records only appear during failures and add negligible volume. See the *Architecture Diagram* data path labels.
+On the wire, each reading travels sensor → hub as a 16 B socket message (layout under *In what format*). The hub → storage message is not decided yet: once the hub stamps a µs timestamp, the reading no longer fits in 16 B, so that hop will carry either the 24 B record or a 16 B message that storage timestamps. On disk, each reading is one 24 B record. Gap records only appear during failures and add negligible volume. See the *Architecture Diagram* data path labels.
 
 ### In what format
 
@@ -238,6 +238,21 @@ The log is an **append-only binary log** of fixed 24 B records, packed and littl
   - Gaps created by a sensor or by the hub receive a hub-assigned `seq`.
   - Gaps created by storage use the `seq` of the first refused reading.
 - Any record with an unknown `record_type` is treated as corrupt.
+
+**Sensor → hub message** (16 B, packed and little-endian, defined in `include/ipc.h`):
+
+| Offset | Size | Field | Value |
+|---|---|---|---|
+| 0 | 1 B | magic | `0xA6` (distinct from the record's `0xA7`) |
+| 1 | 1 B | version | 1 |
+| 2 | 1 B | type | `0x01` DATA, `0x02` GAP (same values as `record_type`) |
+| 3 | 1 B | sensor_id | 1 = light, 2 = soil (0 is not valid from a sensor) |
+| 4 | 4 B | counter | sensor-side counter; GAP: first refused reading |
+| 8 | 4 B | seq | 0 from the sensor; the hub stamps it |
+| 12 | 4 B | value | DATA: raw count; GAP: refused-reading count |
+
+- The hub rejects a message with a bad magic, version, type or sensor_id (`ipc_bad_message`). A message shorter than 16 B is rejected at `recv()`.
+- **Open:** the hub → storage format is undecided. A hub-stamped µs timestamp (8 B) does not fit in 16 B alongside the type, sensor, seq and value. The options are to send the 24 B record on that hop, or to have storage stamp the time.
 
 ### How records are organized
 

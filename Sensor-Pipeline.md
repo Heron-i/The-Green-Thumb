@@ -1,6 +1,6 @@
-# BH1750 Light Sensor: plan and status
+# Sensor Pipeline: plan and status
 
-The official plan for the BH1750 light-sensor path in Green Thumb, from the I2C seam up to the 16 B message the light process will send to the hub. A new session should be able to read this file, plus `CLAUDE.md` and `DESIGN.md`, and pick up where work stopped without re-explanation. **Update the Status section only at the end of the day, when asked.**
+The official plan for Green Thumb's sensor-side pipeline, from the I2C seam up to the 16 B message a sensor process sends to the hub. That covers the BH1750 light-sensor driver and the shared pieces it relies on: sensor health tracking, the log line formatter and the sensor→hub message. A new session should be able to read this file, plus `CLAUDE.md` and `DESIGN.md`, and pick up where work stopped without re-explanation. **Update the Status section only at the end of the day, when asked.**
 
 ## Context
 - **Owner:** Lily (DESIGN.md → Ownership map: "Light sensor (driver and process)" and "IPC (data path)").
