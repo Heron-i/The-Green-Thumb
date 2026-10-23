@@ -72,3 +72,14 @@ gt_health_event gt_health_record(gt_health *health, gt_status read_result, uint6
     }
     return GT_HEALTH_EV_NONE;
 }
+
+/* Map a transition to its DESIGN.md log event name. NONE and any stray
+ * value give NULL, so the caller logs only real transitions. */
+const char *gt_health_event_name(gt_health_event event)
+{
+    switch (event) {
+    case GT_HEALTH_EV_OFFLINE: return "sensor_offline";
+    case GT_HEALTH_EV_ONLINE:  return "sensor_online";
+    default:                   return NULL;
+    }
+}
