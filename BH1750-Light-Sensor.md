@@ -1,6 +1,6 @@
 # BH1750 Light Sensor: plan and status
 
-The official plan for the BH1750 light-sensor path in Green Thumb, from the I2C seam up to the 16 B message the light process will send to the hub. A new session should be able to read this file, plus `CLAUDE.md` and `DESIGN.md`, and pick up where work stopped without re-explanation. **Update the Status section at the end of every step.**
+The official plan for the BH1750 light-sensor path in Green Thumb, from the I2C seam up to the 16 B message the light process will send to the hub. A new session should be able to read this file, plus `CLAUDE.md` and `DESIGN.md`, and pick up where work stopped without re-explanation. **Update the Status section only at the end of the day, when asked.**
 
 ## Context
 - **Owner:** Lily (DESIGN.md → Ownership map: "Light sensor (driver and process)" and "IPC (data path)").
@@ -160,12 +160,12 @@ wsl -e bash -lc 'cd /mnt/c/Users/lheer/OneDrive/Desktop/cs370/CS370_TermProject/
 - If anything else fails, stop and report. Fix `src/`, never the tests.
 
 ## Status
-_Update at the end of every step: the date, what landed, test counts, and anything surprising._
+_Update at the end of the day, when asked: tick the step table, and add one Log entry with the date, what landed, test counts, and anything surprising._
 
 | Step | What | State |
 |---|---|---|
 | 0 | Seam, driver, 18 tests, light_probe | ✅ Done (branch `adapt_test_structure`, through `a74ca65`) |
-| 1 | Health header + SHR/SHS tests (red) | ☐ Not started |
+| 1 | Health header + SHR/SHS tests (red) | ✅ Done, red confirmed (2026-10-23) |
 | 2 | `src/sensor_health.c` (green) | ☐ Not started |
 | 3 | `ipc.h` layout + MSE/MSD tests (red) | ☐ Not started |
 | 4 | `src/ipc_msg.c` (green) | ☐ Not started |
