@@ -19,18 +19,38 @@ typedef enum {
     GT_ERR_FULL    = -5
 } gt_status;
 
-/* 16 B sensor -> hub -> storage message over AF_UNIX sockets in /run/plantpi. */
-#define GT_MSG_SIZE 16
+/* 16 B sensor -> hub message over AF_UNIX sockets in /run/plantpi.
+ * (The hub -> storage format is still undecided: see BH1750-Light-Sensor.md.)
+ *
+ * Wire layout, little-endian, written byte by byte (never by struct copy,
+ * so compiler padding can't leak onto the wire):
+ *   off 0  magic      GT_MSG_MAGIC
+ *   off 1  version    GT_MSG_VERSION
+ *   off 2  type       GT_MSG_DATA / GT_MSG_GAP
+ *   off 3  sensor_id  GT_SENSOR_LIGHT / GT_SENSOR_SOIL (ALL is not valid here)
+ *   off 4  counter    u32
+ *   off 8  seq        u32
+ *   off 12 value      u32
+ * Magic and version are written by encode and checked by decode, so they
+ * are not struct fields. */
+#define GT_MSG_SIZE    16
+#define GT_MSG_MAGIC   0xA6   /* distinct from the on-disk record's 0xA7 */
+#define GT_MSG_VERSION 1
+
+/* Same values as gt_rec_type in log_record.h. */
+#define GT_MSG_DATA 0x01
+#define GT_MSG_GAP  0x02
 
 typedef struct {
+    uint8_t  type;        /* GT_MSG_DATA or GT_MSG_GAP */
     uint8_t  sensor_id;   /* gt_sensor_id */
-    uint32_t counter;     /* sensor-side counter, used to detect gaps */
+    uint32_t counter;     /* sensor-side counter; GAP: first refused counter */
     uint32_t seq;         /* hub-assigned; 0 before the hub stamps it */
-    uint32_t value;       /* raw count */
+    uint32_t value;       /* DATA: raw count; GAP: refused-reading count */
 } gt_msg;
 
-gt_status gt_msg_encode(const gt_msg *m, uint8_t out[GT_MSG_SIZE]);
-gt_status gt_msg_decode(const uint8_t in[GT_MSG_SIZE], gt_msg *m);
+gt_status gt_msg_encode(const gt_msg *message, uint8_t out[GT_MSG_SIZE]);
+gt_status gt_msg_decode(const uint8_t in[GT_MSG_SIZE], gt_msg *message);
 
 /* Client side: reconnect with 100 ms -> 2 s backoff; bounded send queue. */
 typedef struct gt_ipc_client gt_ipc_client;
