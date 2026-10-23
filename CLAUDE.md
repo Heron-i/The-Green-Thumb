@@ -2,9 +2,22 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Project status
+## Build and test
 
-This repository is at an early stage: it currently contains only `README.md`. There is no source code, build system, dependency manifest, linter config, or test suite yet, so there are no build/lint/test commands to document. Update this file once code is added.
+Run `make` from WSL:
+
+- `make test`: build and run every `tests/test_*.c`
+- `make asan` / `make ubsan`: the same under sanitizers (separate build dirs)
+- `make memcheck`: the plain build under Valgrind
+- `make light_probe`: on-Pi BH1750 bring-up tool; needs real I2C, so `make test` doesn't run it
+
+## Tests
+
+- **One file per driver operation**, each its own binary: e.g. `tests/test_light_open.c`, `test_light_read.c`, `test_light_close.c`. The Makefile picks up any new `tests/test_*.c` automatically.
+- **Case IDs** are `<prefix>-NN`, where the prefix names the driver and operation: `LSO` = Light Sensor Open, `LSR` = Read, `LSC` = Close. Follow the same pattern for new drivers (e.g. `SSO`/`SSR` for the soil sensor). Name each test function after its ID (`test_lso03_...`), list the IDs in the file's header comment, and head each case with a `/* ---- LSO-03: ... ---- */` comment.
+- **Test bodies** are `void` and use `CHECK` / `CHECK_EQ` from `tests/check.h`. Each file ends with a `test_case_t` table and `int main(void) { return RUN_TESTS(tests); }`. Each case prints `[ID] name PASS/FAIL` and the file prints `N/M tests passed`. Keep names under 45 characters so the PASS/FAIL column lines up.
+- **`make test` runs every binary** even after a failure, then prints `FAILED: <binaries>` and exits nonzero.
+- **Hardware is faked** with `tests/fake_i2c.h`, which scripts read data and injects write/read failures.
 
 ## Project overview (from README)
 
