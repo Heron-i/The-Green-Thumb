@@ -23,7 +23,7 @@ Each rung can only be checked once the rung below it passes. `light_probe` print
 | 2 | A BH1750 ACKs at 0x23 (wiring, ADDR pin, power) | `light_probe` check 2; LSO-03/04 | First write (POWER_ON) is NACKed |
 | 3 | One measurement reads and decodes | `light_probe` check 3; LSR-01..03 | 2-byte read, high byte first |
 | 4 | Sampling holds 1 Hz with p99 jitter < 10 ms | `light_probe` check 4 | `CLOCK_MONOTONIC` deviation from an absolute schedule |
-| 5 | A sensor that keeps failing is marked offline, probed every 5 s, and announced when it comes back | **Steps 1–2 (health tracker)** | 10 consecutive failed reads |
+| 5 | A sensor that keeps failing is marked offline, probed every 5 s, and announced when it comes back | **Steps 1–3 (health tracker + log line)** | 10 consecutive failed reads |
 
 ### Open: what each failure point has acquired, and what must be unwound
 `gt_light_open_bus` takes ownership of the bus, so the caller never cleans up:
@@ -43,7 +43,10 @@ In the worst case a read makes 1 try + 3 retries with 3 × 10 ms gaps, so it wai
 - **Health input:** any non-`GT_OK` result from `gt_light_read` counts as one failure. The driver's 3 retries are already inside a single failed read.
 - **Health output:** `gt_health_record` returns a transition event (`NONE` / `OFFLINE` / `ONLINE`) and the caller logs it. The tracker does no I/O.
 - **Time is passed in** as `now_ms`, matching `gt_sampler_tick`, so tests need no clock.
-- **Test ID prefixes:** `SHR` (sensor health record), `SHS` (sensor health should-read), `MSE` (message encode), `MSD` (message decode).
+- **Test ID prefixes:** `SHR` (sensor health record), `SHS` (sensor health should-read), `SHE` (sensor health event name), `LGF` (log format), `MSE` (message encode), `MSD` (message decode).
+- **Log ownership:** the light sensor's events (`i2c_read_error`, `sensor_offline`, `sensor_online`) are Lily's, as the light process's read-failure handling. The shared formatter (`gt_log_format`) has no owner in the Ownership map because every component uses it, so it counts as **Joint → Architecture integration**. Lily writes it first, as its first caller; give Lucas a heads-up so his components reuse it.
+- **Log line:** `<timestamp_us> <LEVEL> <component> <event>[ key=value ...]`. The timestamp is µs since the Unix epoch, as a plain integer, the same unit as the on-disk record, so logs and records can be joined. The levels are `DEBUG` / `INFO` / `WARN` / `ERROR`. The light process logs `sensor_offline` as WARN and `sensor_online` as INFO.
+- **Log sink deferred:** the formatter only fills a caller-provided buffer. Where lines go (stderr, a file or the monitor process) and reading the wall clock are decided with the light process. DESIGN.md doesn't specify either.
 - **Today we define only the sensor→hub message (hop 1).** The hub→storage format (hop 2) is **undecided**: DESIGN.md says 16 B on both hops, but a hub-stamped µs timestamp needs at least 20 B. The options are sending the 24 B on-disk record on hop 2, or having storage stamp the time.
 - **Message magic is `0xA6`** (proposed), distinct from the on-disk record's `0xA7`, so a record can never be misread as a message.
 - **Truncated messages are rejected at `recv()`,** which must return exactly `GT_MSG_SIZE`, not in decode. Decode keeps its fixed 16 B array.
@@ -111,7 +114,30 @@ Magic and version are written by encode and checked by decode. They are not `gt_
 - **New `src/sensor_health.c`:** about 40 lines, no system calls. The header comment cites the DESIGN.md failure-mode row. The Makefile's `LIB_SRC` wildcard picks it up automatically.
 - **Done when:** all three targets pass, SHR 7/7 and SHS 5/5.
 
-### Step 3: message layout and tests (red)
+### Step 3: event-to-log path (3a red, 3b green)
+This completes rung 5 end to end: the driver detects the failure, the tracker turns it into a transition, and the formatter turns that into a visible line. It depends on nothing from the IPC steps, and they depend on nothing here.
+- **3a, new `include/gt_log.h`:** `gt_log_level` (`DEBUG`/`INFO`/`WARN`/`ERROR`), `GT_LOG_LINE_MAX 256`, and `gt_status gt_log_format(char *line_out, size_t line_size, uint64_t timestamp_us, gt_log_level level, const char *component, const char *event, const char *fields);`.
+  - The output is always NUL-terminated.
+  - `fields` is a caller-built `"key=value ..."` string, or NULL/"" for none.
+  - It returns `GT_ERR_INVAL` for a NULL `line_out`/`component`/`event`, an unknown level, or a space inside `component`/`event`, and `GT_ERR_FULL` when the line doesn't fit.
+- **3a, add to `include/sensor_health.h`:** `const char *gt_health_event_name(gt_health_event event);`, which returns `"sensor_offline"` or `"sensor_online"`, and NULL for NONE or an unknown value.
+- **3a, new `tests/test_log_format.c`:**
+  - LGF-01 a full line (`1700000000000000 WARN light_sensor sensor_offline fails=10`)
+  - LGF-02 NULL or "" fields → no trailing space
+  - LGF-03 each level prints its name
+  - LGF-04 timestamps 0 and `UINT64_MAX` print in full
+  - LGF-05 a buffer that is too small → `GT_ERR_FULL`, still NUL-terminated
+  - LGF-06 NULL arguments → `GT_ERR_INVAL`
+  - LGF-07 a space inside `component`/`event` → `GT_ERR_INVAL`
+  - LGF-08 an unknown level → `GT_ERR_INVAL`
+- **3a, add to `include/sensor_health.h`:** `#define GT_HEALTH_I2C_READ_ERROR "i2c_read_error"`. The process logs this name on every failed read. It is not a tracker event, so `gt_health_record` and the SHR/SHS tests are unchanged.
+- **3a, new `tests/test_health_event_name.c`:** SHE-01 OFFLINE → `"sensor_offline"` · SHE-02 ONLINE → `"sensor_online"` · SHE-03 NONE → NULL · SHE-04 an out-of-range value → NULL · SHE-05 `GT_HEALTH_I2C_READ_ERROR` is `"i2c_read_error"`.
+- **3a, expected red state:** the two new binaries fail only on undefined references. Everything else stays green.
+- **3b, new `src/gt_log.c`:** one `snprintf` plus a level → name table, with no system calls. A result `>= line_size` means the line didn't fit.
+- **3b, edit `src/sensor_health.c`:** add `gt_health_event_name`.
+- **Done when:** all three targets pass, LGF 8/8 and SHE 5/5.
+
+### Step 4: message layout and tests (red)
 - **Edit `include/ipc.h`:** add `GT_MSG_MAGIC`, `GT_MSG_VERSION`, `GT_MSG_DATA` and `GT_MSG_GAP`, add a `uint8_t type` field to `gt_msg`, and add the layout comment from the table above. The `gt_msg_encode/decode` signatures stay as they are.
 - **New `tests/test_msg_encode.c`:**
   - MSE-01 `GT_MSG_SIZE == 16`
@@ -131,32 +157,32 @@ Magic and version are written by encode and checked by decode. They are not `gt_
   - MSD-07 NULL args → `GT_ERR_INVAL`
 - **Expected red state:** the two new binaries fail to link. Everything else stays green.
 
-### Step 4: message implementation (green)
+### Step 5: message implementation (green)
 - **New `src/ipc_msg.c`:** `gt_msg_encode` / `gt_msg_decode` with byte-wise little-endian put/get helpers. The socket client goes in a separate `src/ipc_client.c` later. The `gt_ipc_client_*` declarations stay unimplemented, which is safe because nothing calls them yet.
 - **Done when:** all three targets pass, MSE 7/7 and MSD 7/7.
 
-### Step 5: docs
-- **DESIGN.md:** add the 16 B sensor→hub layout table, and one line recording that the hop-2 format is still undecided, and why.
-- **Notes-with-Claude.md:** add one 2–4 sentence blurb for the health tracker and one for the message layout.
+### Step 6: docs
+- **DESIGN.md:** add the 16 B sensor→hub layout table, and one line recording that the hop-2 format is still undecided, and why. Next to the log format (line 128), add one line recording the timestamp unit (µs since epoch, integer) and the level names.
+- **Notes-with-Claude.md:** add one 2–4 sentence blurb each for the health tracker, the log line and the message layout.
 - **This file:** update Status.
 
 ### Later (not scheduled)
 - **Hardware check:** run `make light_probe` on the Pi and record the rung 1–4 results and jitter numbers under Status.
 - **Hop-2 decision,** then the IPC client (`gt_ipc_client_*`, with reconnect at 100 ms → 2 s backoff and a 64-reading ring).
-- **`src/light_sensor_main.c`:** sampler at 1000 ms + health tracker + IPC client, plus a heartbeat to `sup.sock`.
+- **`src/light_sensor_main.c`:** sampler at 1000 ms + health tracker + IPC client, plus a heartbeat to `sup.sock`. Also the log sink (stderr, a file or the monitor process) and wall-clock timestamps for log lines.
 
 ## Files
 - **Done (Step 0):** `include/i2c_bus.h`, `src/i2c_bus.c`, `include/light_sensor.h`, `src/light_sensor.c`, `src/light_probe_main.c`, `tests/check.h`, `tests/fake_i2c.h`, `tests/test_light_{open,read,close}.c`
-- **New (Steps 1–4):** `include/sensor_health.h`, `src/sensor_health.c`, `src/ipc_msg.c`, `tests/test_health_record.c`, `tests/test_health_should_read.c`, `tests/test_msg_encode.c`, `tests/test_msg_decode.c`
-- **Modified:** `include/ipc.h` (Step 3), `DESIGN.md` and `Notes-with-Claude.md` (Step 5)
+- **New (Steps 1–5):** `include/sensor_health.h`, `src/sensor_health.c`, `include/gt_log.h`, `src/gt_log.c`, `src/ipc_msg.c`, `tests/test_health_record.c`, `tests/test_health_should_read.c`, `tests/test_health_event_name.c`, `tests/test_log_format.c`, `tests/test_msg_encode.c`, `tests/test_msg_decode.c`
+- **Modified:** `include/sensor_health.h` and `src/sensor_health.c` (Step 3), `include/ipc.h` (Step 4), `DESIGN.md` and `Notes-with-Claude.md` (Step 6)
 - **Untouched:** `Makefile` (the wildcards cover the new files), the driver and the seam
 
 ## Verification
 ```
 wsl -e bash -lc 'cd /mnt/c/Users/lheer/OneDrive/Desktop/cs370/CS370_TermProject/The-Green-Thumb && make test && make asan && make memcheck'
 ```
-- **After Steps 1 and 3 (red):** only the new binaries fail, and only because they don't link.
-- **After Steps 2 and 4 (green):** every binary prints `N/N tests passed`, `-Wall -Wextra -Werror` stays clean, and Valgrind reports 0 errors and 0 bytes in use.
+- **After Steps 1, 3a and 4 (red):** only the new binaries fail, and only because they don't link.
+- **After Steps 2, 3b and 5 (green):** every binary prints `N/N tests passed`, `-Wall -Wextra -Werror` stays clean, and Valgrind reports 0 errors and 0 bytes in use.
 - If anything else fails, stop and report. Fix `src/`, never the tests.
 
 ## Status
@@ -167,9 +193,10 @@ _Update at the end of the day, when asked: tick the step table, and add one Log 
 | 0 | Seam, driver, 18 tests, light_probe | ✅ Done (branch `adapt_test_structure`, through `a74ca65`) |
 | 1 | Health header + SHR/SHS tests (red) | ✅ Done, red confirmed (2026-10-23) |
 | 2 | `src/sensor_health.c` (green) | ☐ Not started |
-| 3 | `ipc.h` layout + MSE/MSD tests (red) | ☐ Not started |
-| 4 | `src/ipc_msg.c` (green) | ☐ Not started |
-| 5 | DESIGN.md, notes, this file | ☐ Not started |
+| 3 | Log formatter + event names (3a red, 3b green) | ☐ Not started |
+| 4 | `ipc.h` layout + MSE/MSD tests (red) | ☐ Not started |
+| 5 | `src/ipc_msg.c` (green) | ☐ Not started |
+| 6 | DESIGN.md, notes, this file | ☐ Not started |
 | — | On-Pi `light_probe` run | ☐ Not recorded |
 | — | Hop-2 (hub→storage) format | ☐ Undecided |
 

@@ -33,4 +33,11 @@ int             gt_health_should_read(const gt_health *health, uint64_t now_ms);
  * already includes the driver's retries). NULL -> GT_HEALTH_EV_NONE. */
 gt_health_event gt_health_record(gt_health *health, gt_status read_result, uint64_t now_ms);
 
+/* Log event names (DESIGN.md failure-mode table, Sensor (I2C) row).
+ * i2c_read_error is logged on every failed read, not only on a transition. */
+#define GT_HEALTH_I2C_READ_ERROR "i2c_read_error"
+/* "sensor_offline" / "sensor_online"; NULL for GT_HEALTH_EV_NONE or an
+ * unknown value (nothing to log). */
+const char     *gt_health_event_name(gt_health_event event);
+
 #endif
