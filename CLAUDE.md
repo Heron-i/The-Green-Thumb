@@ -24,6 +24,7 @@ Run `make` from WSL:
 ## Hard Constraints 
 - NEVER weaken, skip, or delete a test to make the suite pass. If a test looks wrong, stop and explain why instead.
 - Do not modify or implement code without explicit approval.
+- Do not write single-letter or overly generic variable names  
 
 ## Style
 - -Wall -Wextra -Werror must stay clean. No VLAs.
@@ -34,5 +35,7 @@ Run `make` from WSL:
 - For any multi-file or algorithmic change: propose a plan and wait for approval before editing.
 - build tests first always, then implementation.
 - hardware-specific code (GPIO/sensor access) can only be exercised on the Raspberry Pi itself, so keep sensor I/O separable from logic that can be tested on a dev machine once code exists.
+- Users are new to C, when writing variables it helps to explain C types that have not yet been seen / implemented in the codebase.
+- Comments above method headers and an overall short class description are helpful for deriving meaning in the codebase.
 
 
