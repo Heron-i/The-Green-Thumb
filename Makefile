@@ -18,7 +18,7 @@ TEST_BINS := $(patsubst tests/%.c,$(BUILD)/%,$(TEST_SRC))
 
 VALGRIND := valgrind --leak-check=full --show-leak-kinds=all --error-exitcode=1
 
-all: $(TEST_BINS) $(BUILD)/light_probe
+all: $(TEST_BINS) $(BUILD)/light_probe $(BUILD)/hub_listen
 
 $(BUILD)/%: tests/%.c $(LIB_SRC) $(HEADERS)
 	@mkdir -p $(BUILD)
@@ -31,6 +31,14 @@ $(BUILD)/light_probe: src/light_probe_main.c $(LIB_SRC) $(HEADERS)
 	$(CC) $(CFLAGS) $(LIB_SRC) $< -o $@
 
 light_probe: $(BUILD)/light_probe
+
+# On-Pi stand-in for the hub on hub.sock (see src/hub_listen_main.c). Not
+# run by `make test`: it serves until killed.
+$(BUILD)/hub_listen: src/hub_listen_main.c $(LIB_SRC) $(HEADERS)
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) $(LIB_SRC) $< -o $@
+
+hub_listen: $(BUILD)/hub_listen
 
 # Every test binary runs even if an earlier one fails; failures are listed
 # at the end and the target still exits nonzero for CI.
@@ -55,4 +63,4 @@ memcheck: $(TEST_BINS)
 clean:
 	rm -rf build
 
-.PHONY: all test asan ubsan memcheck clean light_probe
+.PHONY: all test asan ubsan memcheck clean light_probe hub_listen

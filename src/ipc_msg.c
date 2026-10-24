@@ -86,3 +86,26 @@ gt_status gt_msg_decode(const uint8_t in[GT_MSG_SIZE], gt_msg *message)
     message->value = get_u32_le(&in[12]);
     return GT_OK;
 }
+
+/* Check one recv() result, then decode it. The order matters:
+ *   1. NULL args first (a caller bug, GT_ERR_INVAL), whatever `len` says.
+ *   2. len <= 0: recv() failed (-1) or the sensor closed its end (0). The
+ *      connection is gone, not sending bad bytes, so GT_ERR_IO.
+ *   3. Any other length but exactly GT_MSG_SIZE: GT_ERR_CORRUPT. The hub
+ *      reads into a GT_MSG_SIZE + 1 buffer, so an oversized message arrives
+ *      as 17 and fails here instead of being cut to a valid-looking 16.
+ *   4. The header checks in gt_msg_decode, which leaves `message` untouched
+ *      on failure. */
+gt_status gt_ipc_frame_decode(const uint8_t *buf, long len, gt_msg *message)
+{
+    if (buf == NULL || message == NULL) {
+        return GT_ERR_INVAL;
+    }
+    if (len <= 0) {
+        return GT_ERR_IO;
+    }
+    if (len != GT_MSG_SIZE) {
+        return GT_ERR_CORRUPT;
+    }
+    return gt_msg_decode(buf, message);
+}
