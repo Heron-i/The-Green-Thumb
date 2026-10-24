@@ -119,6 +119,7 @@ In the worst case a read makes 1 try + 3 retries with 3 × 10 ms gaps, so it wai
 - **`send` drains, pushes, then drains again** (Step 18). Draining before the push sends older frames first, which can free the slot the new reading needs, so a reading isn't refused when the hub could already have taken the backlog.
 - **Any send result other than OK or FULL counts as the hub gone** (Step 19): disconnect, report `GT_IPC_EV_DISCONNECT` and retry after the wait. Both failure paths (a failed connect and a lost hub) share `schedule_retry`, so the wait doubles the same way for each.
 - **Order moved to fit the link** (decided 2026-10-24). Every test binary links every file in `src/`, so nothing in `src/` may call a function that doesn't exist yet. `gt_ipc_client_open` calls `gt_ipc_sock_linux`, so it moved from Step 16 to Step 22, and its tests ICO-03/04 moved from Step 15 to Step 21. ICC-03 needs `send` to leave a frame in the ring, so it moved from Step 17 to Step 18.
+- **One listener per socket, enforced by a lock** (decided 2026-10-24). A process that listens on a socket (`hub_listen` now; the hub and storage later) first takes an `fcntl` write lock on `<socket>.lock` and holds it for its whole life. Only the lock holder may remove a leftover socket file and bind a new one; a second copy prints `already running` and exits without touching anything. The kernel drops the lock when the holder dies, `kill -9` included, so a crash never leaves a stale lock. This is safer than probing with `connect()`, which leaves a gap: two copies started together could both see the file as stale, and the second would take the first one's address. Closing *any* fd the process holds on the lock file releases the lock, so the file is opened in one place only. When the hub is written, this moves into a shared `src/` helper; testing it needs `fork()`, because a process never blocks on its own `fcntl` lock.
 
 ## Wire format: sensor → hub message (16 B, little-endian, encoded byte by byte)
 | Off | Size | Field | Value |
@@ -451,7 +452,7 @@ This completes rung 5 end to end: the driver detects the failure, the tracker tu
 - **Done when:** all three targets pass, IPL 5/5 and ICO 4/4.
 
 ### Step 23: `hub_listen` on-Pi tool
-- **New `src/hub_listen_main.c`:** `bind_listener`, `serve_one`, then `main`. It prints `sensor counter value` for each message and flags counter gaps.
+- **New `src/hub_listen_main.c`:** `bind_listener`, `serve_one`, then `main`, plus `take_instance_lock` (see *Decisions*: one listener per socket). It prints `sensor counter value` for each message and flags counter gaps.
 - **Edit `Makefile`:** a `hub_listen` target modelled on `light_probe`. The `*_main.c` naming keeps it out of the test link.
 - **Done when:** all three targets pass, and `make hub_listen` builds.
 

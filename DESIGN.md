@@ -314,7 +314,7 @@ The main memory cost is process isolation itself. There are five processes, each
 | | |
 |---|---|
 | **Ideal build** | A shared-memory ring between processes (zero-copy, as in Figure 1), or a single process with no IPC at all. |
-| **Actual build** | Unix domain sockets (`hub.sock`, `storage.sock`, `sup.sock`), with 16 B messages sensor → hub and 24 B records hub → storage, plus 1 Hz heartbeats from each child to the supervisor. |
+| **Actual build** | Unix domain sockets (`hub.sock`, `storage.sock`, `sup.sock`), with 16 B messages sensor → hub and 24 B records hub → storage, plus 1 Hz heartbeats from each child to the supervisor. `hub.sock` is `SOCK_SEQPACKET`, so the kernel keeps message boundaries: each `send()` is one whole 16 B message and each `recv()` returns exactly one, with no reassembly code in the hub. |
 | **What the gap costs** | Each message costs a `send()` and a `recv()` system call and two kernel copies per hop. We estimate tens of µs per hop on a Pi 4, to be measured in the Evaluation plan. At ≈1.02 data messages/s plus 4 heartbeats/s, that is negligible. **What we gain:** the kernel buffers messages for us, a dead peer is reported immediately (`EPIPE` / `ECONNREFUSED`), and no process can corrupt another's memory. A shared-memory ring would give none of that, and Mechanism E depends on all of it. **Claims narrowed:** we make no high-throughput IPC claim. We claim only that IPC adds a negligible share of the sensor-to-storage latency, with a number committed in the Evaluation plan. |
 
 ## Evaluation plan

@@ -18,10 +18,15 @@
  * exactly one message. One thread serves every sensor with poll(), which
  * sleeps until the listener or any connection has something to read.
  * Nothing is stored and no seq or time is stamped: that's gt_hub_accept's
- * job in the real hub.
+ * job in the real hub. Only one hub_listen can run per socket path: it
+ * holds an fcntl lock on "<path>.lock" for its whole life, and only the
+ * lock holder may remove and re-create the socket file (see
+ * Sensor-Pipeline.md, Decisions). A second copy exits with
+ * "already running" and touches nothing.
  *
  * Usage: hub_listen /run/plantpi/hub.sock    (Ctrl-C to stop) */
 #include <errno.h>
+#include <fcntl.h>
 #include <poll.h>
 #include <stdio.h>
 #include <string.h>
@@ -43,14 +48,59 @@ typedef struct {
     uint32_t expected_counter;
 } counter_track;
 
+/* Make sure this is the only hub_listen on `sock_path`, by holding an
+ * exclusive lock on "<sock_path>.lock" for as long as the process runs.
+ * `struct flock` describes the lock: F_WRLCK is an exclusive (write)
+ * lock, and l_start = l_len = 0 covers the whole file. F_SETLK fails at
+ * once (EACCES or EAGAIN) instead of waiting if another process holds it.
+ * The kernel drops the lock when the holder exits for any reason,
+ * kill -9 included, so a lock is never left stale; the lock file itself
+ * stays and is reused. Holding the lock is what makes it safe for
+ * bind_listener to remove an old socket file. One fcntl rule to know:
+ * closing *any* fd this process has on the lock file releases the lock,
+ * so the file is opened only here. Returns the fd that holds the lock
+ * (keep it open), or -1 after printing why. */
+static int take_instance_lock(const char *sock_path)
+{
+    char lock_path[128];   /* a valid socket path (< 108) + ".lock" fits */
+    int needed = snprintf(lock_path, sizeof lock_path, "%s.lock", sock_path);
+    if (needed < 0 || (size_t)needed >= sizeof lock_path) {
+        fprintf(stderr, "hub_listen: socket path too long\n");
+        return -1;
+    }
+    int lock_fd = open(lock_path, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    if (lock_fd < 0) {
+        fprintf(stderr, "hub_listen: %s: %s\n", lock_path, strerror(errno));
+        return -1;
+    }
+
+    struct flock lock;
+    memset(&lock, 0, sizeof lock);
+    lock.l_type = F_WRLCK;
+    lock.l_whence = SEEK_SET;
+    lock.l_start = 0;
+    lock.l_len = 0;
+    if (fcntl(lock_fd, F_SETLK, &lock) != 0) {
+        if (errno == EACCES || errno == EAGAIN) {
+            fprintf(stderr, "hub_listen: already running on %s (%s is locked)\n",
+                    sock_path, lock_path);
+        } else {
+            fprintf(stderr, "hub_listen: lock %s: %s\n", lock_path, strerror(errno));
+        }
+        close(lock_fd);
+        return -1;
+    }
+    return lock_fd;
+}
+
 /* Create the listening socket at `path`. A hub_listen killed with kill -9
  * leaves its socket file behind, and bind() refuses a path that exists
  * (EADDRINUSE), so an old socket file is removed first. lstat() describes
  * the path itself without following links, and S_ISSOCK checks that it
  * really is a socket: any other kind of file is left alone and reported.
- * (Removing the file of a hub_listen that is still running would steal
- * its address, so run only one.) Returns the listening fd, or -1 after
- * printing why. */
+ * Call only while holding take_instance_lock: the lock proves no other
+ * hub_listen is alive, so the old file can't belong to a running one.
+ * Returns the listening fd, or -1 after printing why. */
 static int bind_listener(const char *path)
 {
     struct sockaddr_un addr;
@@ -145,8 +195,13 @@ int main(int argc, char **argv)
         fprintf(stderr, "usage: %s /run/plantpi/hub.sock\n", argv[0]);
         return 2;
     }
+    int lock_fd = take_instance_lock(argv[1]);
+    if (lock_fd < 0) {
+        return 1;
+    }
     int listen_fd = bind_listener(argv[1]);
     if (listen_fd < 0) {
+        close(lock_fd);
         return 1;
     }
     printf("hub_listen: listening on %s\n", argv[1]);
@@ -204,5 +259,6 @@ int main(int argc, char **argv)
     }
     close(listen_fd);
     unlink(argv[1]);
+    close(lock_fd);   /* last: the socket file is removed while still locked */
     return 1;
 }
