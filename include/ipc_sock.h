@@ -46,9 +46,11 @@ gt_status gt_ipc_sock_linux(const char *path, const gt_sock_ops **ops_out, void 
 
 /* A client over any socket ops: gt_ipc_client_open uses the Linux ops, and
  * tests pass tests/fake_sock.h (like gt_light_open_bus for the I2C seam).
- * Does not connect yet. The client calls ops->destroy(ctx) exactly once,
- * from gt_ipc_client_close, or straight away if this fails. NULL for NULL
- * ops or no memory. Declared here, not in ipc.h, because ipc.h can't see
+ * Does not connect yet. Once ops is non-NULL the client owns ctx and calls
+ * ops->destroy(ctx) exactly once: from gt_ipc_client_close, or straight
+ * away if the client can't be allocated (returns NULL). NULL ops also
+ * return NULL, but the ctx is left alone: there's no destroy to call, so
+ * the caller still owns it. Declared here, not in ipc.h, because ipc.h can't see
  * gt_sock_ops without the two headers including each other. */
 gt_ipc_client *gt_ipc_client_open_ops(const gt_sock_ops *ops, void *ctx);
 
