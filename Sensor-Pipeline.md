@@ -242,13 +242,23 @@ _Update at the end of the day, when asked: tick the step table, and add one Log 
 |---|---|---|
 | 0 | Seam, driver, 18 tests, light_probe | ✅ Done (branch `adapt_test_structure`, through `a74ca65`) |
 | 1 | Health header + SHR/SHS tests (red) | ✅ Done, red confirmed (2026-10-23) |
-| 2 | `src/sensor_health.c` (green) | ☐ Not started |
-| 3 | Log formatter + event names (3a red, 3b green) | ☐ Not started |
-| 4 | `ipc.h` layout + MSE/MSD tests (red) | ☐ Not started |
-| 5 | `src/ipc_msg.c` (green) | ☐ Not started |
-| 6 | DESIGN.md, notes, this file | ☐ Not started |
+| 2 | `src/sensor_health.c` (green) | ✅ Done (2026-10-23): SHR 7/7, SHS 5/5 |
+| 3 | Log formatter + event names (3a red, 3b green) | ✅ Done (2026-10-23): LGF 8/8, SHE 5/5 |
+| 4 | `ipc.h` layout + MSE/MSD tests (red) | ✅ Done, red confirmed (2026-10-23) |
+| 5 | `src/ipc_msg.c` (green) | ✅ Done (2026-10-23): MSE 7/7, MSD 7/7 |
+| 6 | DESIGN.md, notes, this file | ✅ Done (2026-10-23) |
+| 7 | Hop-2 docs and headers (`ipc.h`, `hub.h`, `log_record.h`) | ✅ Done (2026-10-23): 57 tests unchanged |
+| 8 | CRC/RCE/RCD tests (red) | ✅ Done, red confirmed (2026-10-23): failed only on undefined references |
+| 9 | `src/log_record.c` (green) | ✅ Done (2026-10-23): CRC 3/3, RCE 8/8, RCD 8/8; 76 tests across 12 binaries, 0 Valgrind errors |
 | — | On-Pi `light_probe` run | ☐ Not recorded |
 | — | Hop-2 (hub→storage) format | ✅ Decided 2026-10-23: the 24 B record (see Decisions) |
+
+### Not done yet
+These are what's left before a reading can travel from the light sensor to storage:
+- **IPC client** (`src/ipc_client.c`, not started): implements the `gt_ipc_client_open` / `_send` / `_close` functions declared in `ipc.h`. It reconnects with 100 ms → 2 s backoff, buffers up to 64 readings in a ring, sends a GAP message after an overflow, and logs `ipc_disconnect`, `ipc_reconnect` and `ipc_overflow`. Its `recv()` side must reject anything shorter than `GT_MSG_SIZE`. Hop 1 is done, so nothing blocks this.
+- **`gt_hub_accept`** (no `src/hub.c` yet): its signature was updated in Step 7 to output a `gt_record`, but it isn't implemented. It has to validate the message (including the `reading_invalid` range check), stamp `seq` and the µs receive time, and build the record that `gt_record_encode` turns into bytes for `storage.sock`.
+- **`src/light_sensor_main.c`** (not started): the 1000 ms sampler, the health tracker and the IPC client, plus a heartbeat to `sup.sock`. This is also where the log sink (stderr, a file or the monitor process) and wall-clock timestamps for log lines get decided. It depends on the IPC client.
+- **On-Pi `light_probe` run** (not recorded): `make light_probe` on the Pi with the BH1750 attached. Record the rung 1–4 PASS/FAIL results and the jitter numbers in the table above. It needs real I2C, so it can't run in WSL or CI.
 
 ### Log
 - **2026-10-23:** Plan written. Step 0 is complete as committed. The last commit says the test structure was verified; this session did not re-run the suite. Next: Step 1.
