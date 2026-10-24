@@ -144,6 +144,52 @@ static void drain(gt_ipc_client *client, uint64_t now_ms, unsigned *events)
     }
 }
 
+/* Queue the GAP message for the run of refused readings, and end the run.
+ * Only called with at least 2 free slots, so the push can't fail and the
+ * reading that follows it fits too. The encode can't fail either: the
+ * sensor_id came from a reading that already encoded. */
+static void push_gap(gt_ipc_client *client)
+{
+    gt_msg gap = {
+        .type = GT_MSG_GAP, .sensor_id = client->gap_sensor_id,
+        .counter = client->gap_first_counter, .seq = 0, .value = client->gap_count,
+    };
+    uint8_t frame[GT_MSG_SIZE];
+    if (gt_msg_encode(&gap, frame) == GT_OK) {
+        ring_push(client, frame);
+    }
+    client->gap_pending = 0;
+}
+
+/* Put one reading's frame in the ring, or refuse it into the current gap.
+ * A reading is refused when the ring is full, and also while a gap is
+ * pending but fewer than 2 slots are free: the GAP must go in just before
+ * the next accepted reading, so the hub sees old data, then the GAP, then
+ * new data. The first refusal of a run starts the gap (its sensor, its
+ * counter) and reports GT_IPC_EV_OVERFLOW; later ones only add to the
+ * count. Every refusal is counted in stats.refused. */
+static gt_status enqueue_reading(gt_ipc_client *client, const gt_msg *message,
+                                 const uint8_t frame[GT_MSG_SIZE], unsigned *events)
+{
+    if (client->gap_pending && GT_IPC_RING_SLOTS - client->count >= 2) {
+        push_gap(client);
+    }
+    /* With no gap pending, try the push; with one still pending, refuse. */
+    if (!client->gap_pending && ring_push(client, frame) == GT_OK) {
+        return GT_OK;
+    }
+    if (!client->gap_pending) {
+        client->gap_pending = 1;
+        client->gap_sensor_id = message->sensor_id;
+        client->gap_first_counter = message->counter;
+        client->gap_count = 0;
+        *events |= GT_IPC_EV_OVERFLOW;
+    }
+    client->gap_count++;
+    client->stats.refused++;
+    return GT_ERR_FULL;
+}
+
 /* Set up a client over any socket ops; no connect yet (the first send or
  * pump tries straight away, because next_attempt_ms starts at 0).
  * calloc is malloc that also zeroes the memory, so every counter, flag and
@@ -199,7 +245,7 @@ gt_status gt_ipc_client_send(gt_ipc_client *client, const gt_msg *message,
     }
     unsigned events = 0;
     drain(client, now_ms, &events);
-    gt_status pushed = ring_push(client, frame);
+    gt_status pushed = enqueue_reading(client, message, frame, &events);
     drain(client, now_ms, &events);
     if (events_out != NULL) {
         *events_out = events;
@@ -223,5 +269,17 @@ gt_status gt_ipc_client_pump(gt_ipc_client *client, uint64_t now_ms, unsigned *e
     if (events_out != NULL) {
         *events_out = events;
     }
+    return GT_OK;
+}
+
+/* Copy the counters out. `*stats_out = client->stats` is a struct
+ * assignment: C copies every field of the struct in one statement, so the
+ * caller gets a snapshot it can't use to change the client. */
+gt_status gt_ipc_client_stats(const gt_ipc_client *client, gt_ipc_stats *stats_out)
+{
+    if (client == NULL || stats_out == NULL) {
+        return GT_ERR_INVAL;
+    }
+    *stats_out = client->stats;
     return GT_OK;
 }
