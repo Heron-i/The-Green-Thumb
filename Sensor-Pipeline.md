@@ -27,12 +27,12 @@ flowchart LR
         BUS["i2c_bus.c ✅<br/>/dev/i2c-1"]
         HLT["sensor_health.c ✅<br/>gt_health_record"]
         LOG["gt_log.c ✅<br/>gt_log_format"]
-        CLI["ipc_client.c 🔶<br/>send · pump · ring · backoff · GAP"]
+        CLI["ipc_client.c 🔶<br/>send · pump · ring · backoff ✅<br/>overflow · GAP · stats 🔶"]
         ENC["ipc_msg.c ✅<br/>gt_msg_encode"]
         SCK["ipc_sock.c 🔶<br/>socket · connect · send"]
     end
     subgraph HUB["hub process · hub_listen_main.c 🔶 now, hub_main.c ☐ later"]
-        FRM["ipc_msg.c 🔶<br/>gt_ipc_frame_decode"]
+        FRM["ipc_msg.c ✅<br/>gt_ipc_frame_decode"]
         DEC["ipc_msg.c ✅<br/>gt_msg_decode"]
         ACC["hub.c ☐<br/>gt_hub_accept: validate · stamp seq + µs"]
         RENC["log_record.c ✅<br/>gt_record_encode + CRC"]
@@ -114,6 +114,11 @@ In the worst case a read makes 1 try + 3 retries with 3 × 10 ms gaps, so it wai
 - **GAP needs 2 free slots:** after an overflow, a new reading is accepted only when the ring can hold both the GAP and the reading. This keeps the order: old data, then the GAP, then new data. Otherwise the reading is refused and counted into the same gap.
 - **Close drops the buffer:** `gt_ipc_client_close` sends nothing more. Readings still in the ring are lost, and that's documented, not silent.
 - **Limitation (no app-level ack):** a message the kernel accepted but the hub never `recv()`d before dying is lost. The hub sees the jump in the counter as a `sensor_seq_gap`.
+- **`gt_ipc_client_open_ops` is declared in `ipc_sock.h`, not `ipc.h`** (Step 11). `ipc_sock.h` includes `ipc.h`, so putting it in `ipc.h` would make the two headers include each other. `gt_light_open_bus` sits next to its seam in `light_sensor.h` for the same reason.
+- **Ownership of the ctx:** once `ops` is non-NULL, the client owns the ctx and calls `destroy` exactly once, from `close` or straight away if the client can't be allocated. With NULL ops there's no `destroy` to call, so the caller keeps the ctx.
+- **`send` drains, pushes, then drains again** (Step 18). Draining before the push sends older frames first, which can free the slot the new reading needs, so a reading isn't refused when the hub could already have taken the backlog.
+- **Any send result other than OK or FULL counts as the hub gone** (Step 19): disconnect, report `GT_IPC_EV_DISCONNECT` and retry after the wait. Both failure paths (a failed connect and a lost hub) share `schedule_retry`, so the wait doubles the same way for each.
+- **Order moved to fit the link** (decided 2026-10-24). Every test binary links every file in `src/`, so nothing in `src/` may call a function that doesn't exist yet. `gt_ipc_client_open` calls `gt_ipc_sock_linux`, so it moved from Step 16 to Step 22, and its tests ICO-03/04 moved from Step 15 to Step 21. ICC-03 needs `send` to leave a frame in the ring, so it moved from Step 17 to Step 18.
 
 ## Wire format: sensor → hub message (16 B, little-endian, encoded byte by byte)
 | Off | Size | Field | Value |
@@ -320,14 +325,15 @@ This completes rung 5 end to end: the driver detects the failure, the tracker tu
   - otherwise it calls `gt_msg_decode`
   - The hub `recv()`s into a 17 B buffer, so an oversized packet is caught instead of being silently truncated.
 - **11b:** the client API, with comments explaining `unsigned` bit flags:
+  - `GT_IPC_RING_SLOTS` (64), `GT_IPC_BACKOFF_MIN_MS` (100) and `GT_IPC_BACKOFF_MAX_MS` (2000)
   - `GT_IPC_EV_DISCONNECT` / `_RECONNECT` / `_OVERFLOW`
   - a `gt_ipc_stats` struct (queued, sent, refused, reconnects)
-  - `gt_ipc_client_open_ops(ops, ctx)`
-  - `gt_ipc_client_send(client, msg, now_ms, &events)`
+  - `gt_ipc_client_send(client, message, now_ms, &events)`
   - `gt_ipc_client_pump(client, now_ms, &events)`
   - `gt_ipc_client_stats(client, &stats)`
+  - `gt_ipc_client_open_ops(ops, ctx)`, which goes in `include/ipc_sock.h` (see *Decisions*)
 
-  `gt_ipc_client_open(path)` and `_close` keep their names.
+  `gt_ipc_client_open(path)` and `_close` keep their names. The one-letter parameters `c` and `m` became `client` and `message` (CLAUDE.md naming rule).
 - **Done when:** the build is still green (nothing calls these functions yet).
 
 ### Step 12: fake socket
@@ -336,7 +342,9 @@ This completes rung 5 end to end: the driver detects the failure, the tracker tu
   - A per-call queue of send results.
   - A record of every frame sent.
   - Counters for connect, disconnect and destroy calls.
-  - `fake_sock_ops()` returns the ops table.
+  - Counters for client bugs the fake can see: `connect_while_connected`, `send_while_disconnected` and `wrong_len_sends`. A correct client leaves all three at 0.
+  - A `GT_ERR_IO` send result doesn't disconnect the fake by itself, so a client that forgets to call `disconnect()` shows up as `send_while_disconnected`.
+  - `fake_sock_ops()` resets the fake and returns the ops table.
 - **Done when:** the build is still green.
 
 ### Step 13: frame decode tests (red)
@@ -355,21 +363,25 @@ This completes rung 5 end to end: the driver detects the failure, the tracker tu
 
 ### Step 15: client open tests (red)
 - **New `tests/test_ipc_open.c`:**
-  - ICO-01 `open_ops` returns a handle and makes no connect call
-  - ICO-02 NULL ops → NULL
-  - ICO-03 `open(path)` with NULL, `""` or a 108 B path (the `sun_path` limit) → NULL
-  - ICO-04 `open(path)` on a socket that doesn't exist still returns a handle
-- **Expected red state:** undefined references only.
+  - ICO-01 `open_ops` returns a handle and makes no connect, send or destroy call
+  - ICO-02 NULL ops → NULL, and the ctx is never touched
+- **Moved to Step 21:** ICO-03/04 open by path, which goes through `gt_ipc_sock_linux` (Step 22). They stay in this file.
+- **Expected red state:** undefined references to `gt_ipc_client_open_ops` and `gt_ipc_client_close` only.
 
 ### Step 16: client skeleton (green)
-- **New `src/ipc_client.c`:** the file header, the client struct (fixed `uint8_t ring[64][16]`, no malloc beyond the struct, no VLA), `gt_ipc_client_open_ops`, `gt_ipc_client_close` and `gt_ipc_client_open`.
-- **Done when:** all three targets pass, ICO 4/4.
+- **New `src/ipc_client.c`:**
+  - the file header
+  - the client struct: a fixed `uint8_t ring[64][16]` circular queue (`head` + `count`), connection and backoff state (`connected`, `had_trouble`, `next_attempt_ms`, `backoff_ms`), the GAP being built, and `gt_ipc_stats`. No malloc beyond the struct, no VLA.
+  - `gt_ipc_client_open_ops`, which uses `calloc` so everything starts at 0
+  - `gt_ipc_client_close`
+- **Moved to Step 22:** `gt_ipc_client_open`. It calls `gt_ipc_sock_linux`, and every test binary links all of `src/`, so writing it now would break every binary's link.
+- **Done when:** all three targets pass, ICO 2/2.
 
 ### Step 17: client close tests
 - **New `tests/test_ipc_close.c`:**
   - ICC-01 `destroy` is called exactly once
   - ICC-02 `close(NULL)` is safe
-  - ICC-03 closing with frames buffered sends nothing, Valgrind clean
+- **Moved to Step 18:** ICC-03, because only `send` can put a frame in the ring.
 - **Expected state:** green straight away, since close already exists. This step checks it.
 
 ### Step 18: send, connected path (red → green)
@@ -380,8 +392,14 @@ This completes rung 5 end to end: the driver detects the failure, the tracker tu
   - ICS-04 NULL client or msg → `GT_ERR_INVAL`
   - ICS-05 `EAGAIN` keeps the frame, stays connected, no event
   - ICS-06 the next send flushes the held frame, then the new one
-- **Edit `src/ipc_client.c`:** the static `ring_push`, the static `drain`, then `gt_ipc_client_send`.
-- **Done when:** all three targets pass, ICS 6/6.
+- **Add to `tests/test_ipc_close.c`:** ICC-03, closing with a frame buffered (left by one `EAGAIN`) sends nothing, Valgrind clean.
+- **Edit `src/ipc_client.c`:**
+  - the static `ring_push`
+  - the static `drain`, connected path only
+  - `gt_ipc_client_send`, which drains, pushes, then drains again
+
+  Two temporary pieces stood in until Step 19: a single connect attempt with no backoff, and `(void)now_ms;` to keep `-Werror` quiet about the unused parameter.
+- **Done when:** all three targets pass, ICS 6/6 and ICC 3/3.
 
 ### Step 19: reconnect and backoff (red → green)
 - **New `tests/test_ipc_reconnect.c`:**
@@ -393,7 +411,12 @@ This completes rung 5 end to end: the driver detects the failure, the tracker tu
   - ICR-06 reconnect → RECONNECT, ring drains oldest first
   - ICR-07 the first clean connect → no RECONNECT
   - ICR-08 `pump` reconnects and drains with no new message
-- **Edit `src/ipc_client.c`:** the static `try_connect` (backoff), disconnect handling in `drain`, then `gt_ipc_client_pump`.
+- **Edit `src/ipc_client.c`:**
+  - the static `schedule_retry`: the next attempt is now + the wait, the wait doubles up to 2000 ms, and the trouble is marked
+  - the static `try_connect`: no attempt before the retry is due; on success the wait resets to 100 ms, and `RECONNECT` is reported only after trouble
+  - `drain` uses `try_connect`; a send result of `GT_ERR_IO` disconnects, reports `DISCONNECT` and schedules a retry
+  - `gt_ipc_client_send` collects events in a local and writes them out once (this removed the Step 18 temporaries)
+  - `gt_ipc_client_pump`
 - **Done when:** all three targets pass, ICR 8/8.
 
 ### Step 20: overflow and GAP (red → green)
@@ -413,7 +436,10 @@ This completes rung 5 end to end: the driver detects the failure, the tracker tu
   - IPL-03 the listener closes mid-stream → DISCONNECT, no SIGPIPE crash
   - IPL-04 light and soil clients share one listener, each stream in counter order
   - IPL-05 a raw 15 B packet arrives as 15 B and is rejected (proves SEQPACKET keeps message boundaries)
-- **Expected red state:** an undefined reference to `gt_ipc_sock_linux` only.
+- **Add to `tests/test_ipc_open.c`** (moved from Step 15):
+  - ICO-03 `open(path)` with NULL, `""` or a 108 B path (the `sun_path` limit) → NULL
+  - ICO-04 `open(path)` on a socket that doesn't exist still returns a handle
+- **Expected red state:** undefined references to `gt_ipc_sock_linux` and `gt_ipc_client_open` only.
 
 ### Step 22: Linux socket implementation (green)
 - **New `src/ipc_sock.c`:** the only file with socket system calls.
@@ -421,7 +447,8 @@ This completes rung 5 end to end: the driver detects the failure, the tracker tu
   - `sock_send`: `send(..., MSG_NOSIGNAL)`, mapping errno to a `gt_status`
   - `sock_disconnect` / `sock_destroy`
   - `gt_ipc_sock_linux`
-- **Done when:** all three targets pass, IPL 5/5.
+- **Add to `src/ipc_client.c`** (moved from Step 16): `gt_ipc_client_open`, which is `gt_ipc_sock_linux` + `gt_ipc_client_open_ops`.
+- **Done when:** all three targets pass, IPL 5/5 and ICO 4/4.
 
 ### Step 23: `hub_listen` on-Pi tool
 - **New `src/hub_listen_main.c`:** `bind_listener`, `serve_one`, then `main`. It prints `sensor counter value` for each message and flags counter gaps.
@@ -446,8 +473,9 @@ This completes rung 5 end to end: the driver detects the failure, the tracker tu
 - **Steps 10–24:**
   - **New headers:** `include/ipc_sock.h` (Step 10), `tests/fake_sock.h` (Step 12).
   - **New tests:** `tests/test_ipc_{frame,open,close,send,reconnect,overflow,loopback}.c` (Steps 13–21).
-  - **New sources:** `src/ipc_client.c` (Steps 16–20), `src/ipc_sock.c` (Step 22), `src/hub_listen_main.c` (Step 23).
-  - **Modified:** `include/ipc.h` (Step 11), `src/ipc_msg.c` (Step 14), `Makefile` (Step 23, the `hub_listen` target only), `DESIGN.md` (Step 24).
+  - **New sources:** `src/ipc_client.c` (Steps 16–20, plus `gt_ipc_client_open` in Step 22), `src/ipc_sock.c` (Step 22), `src/hub_listen_main.c` (Step 23).
+  - **Modified:** `include/ipc.h` (Step 11), `include/ipc_sock.h` (Step 11, `gt_ipc_client_open_ops`), `src/ipc_msg.c` (Step 14), `tests/test_ipc_close.c` (Step 18, ICC-03), `tests/test_ipc_open.c` (Step 21, ICO-03/04), `Makefile` (Step 23, the `hub_listen` target only), `DESIGN.md` (Step 24).
+  - **Done so far (Steps 10–19):** `include/ipc_sock.h`, `include/ipc.h`, `tests/fake_sock.h`, `tests/test_ipc_{frame,open,close,send,reconnect}.c`, `src/ipc_msg.c`, `src/ipc_client.c` (all but the overflow path, `push_gap`, `gt_ipc_client_stats` and `gt_ipc_client_open`).
 - **Untouched:** the driver and the I2C seam. Through Step 9, the `Makefile` was untouched too, since its wildcards cover new files.
 
 ## Verification
@@ -458,8 +486,10 @@ wsl -e bash -lc 'cd /mnt/c/Users/lheer/OneDrive/Desktop/cs370/CS370_TermProject/
 - **After Step 7 (docs and headers):** the 57 existing tests still pass, unchanged.
 - **After Steps 2, 3b, 5 and 9 (green):** every binary prints `N/N tests passed`, `-Wall -Wextra -Werror` stays clean, and Valgrind reports 0 errors and 0 bytes in use.
 - If anything else fails, stop and report. Fix `src/`, never the tests.
-- **After Steps 13, 15, 18–21 (red):** only the new binary fails, and only on undefined references. The existing binaries are built and run separately to confirm they stay green. In Steps 18–20 the new tests fail until their methods land.
-- **After Steps 10–12, 14, 16, 17 and 22 (green):** every binary prints `N/N tests passed`, `-Wall -Wextra -Werror` stays clean, and Valgrind reports 0 errors.
+- **After Steps 13, 15 and 21 (red), and the test half of Steps 18–20:** only the new binary (or binaries) fails, and only on undefined references. The existing binaries are built and run separately to confirm they stay green. Steps 18–20 go green once their methods land.
+- **After Steps 10–12, 14, 16, 17 and 22 (green), and Steps 18–20 once complete:** every binary prints `N/N tests passed`, `-Wall -Wextra -Werror` stays clean, and Valgrind reports 0 errors and 0 bytes in use.
+- **A header that nothing includes yet** (Step 10): compile it on its own with `-fsyntax-only` and the project flags, because `make test` won't compile it.
+- **Before any test uses `tests/fake_sock.h`** (Step 12): a throwaway smoke program in the scratchpad exercised every op and counter.
 
 ### Light (+ Soil) → IPC → Hub ladder
 Like the "electrically alive" ladder: each rung can only be checked once the rung below it passes.
@@ -488,12 +518,34 @@ _Update at the end of the day, when asked: tick the step table, and add one Log 
 | 7 | Hop-2 docs and headers (`ipc.h`, `hub.h`, `log_record.h`) | ✅ Done (2026-10-23): 57 tests unchanged |
 | 8 | CRC/RCE/RCD tests (red) | ✅ Done, red confirmed (2026-10-23): failed only on undefined references |
 | 9 | `src/log_record.c` (green) | ✅ Done (2026-10-23): CRC 3/3, RCE 8/8, RCD 8/8; 76 tests across 12 binaries, 0 Valgrind errors |
+| 10 | `include/ipc_sock.h` (socket seam) | ✅ Done (2026-10-24): checked on its own with `-fsyntax-only` |
+| 11 | `ipc.h` client API + `gt_ipc_frame_decode` | ✅ Done (2026-10-24): 76 tests unchanged |
+| 12 | `tests/fake_sock.h` | ✅ Done (2026-10-24): scratchpad smoke test passed |
+| 13 | IFD tests (red) | ✅ Done, red confirmed (2026-10-24) |
+| 14 | `gt_ipc_frame_decode` (green) | ✅ Done (2026-10-24): IFD 6/6 |
+| 15 | ICO-01/02 (red) | ✅ Done, red confirmed (2026-10-24); ICO-03/04 moved to Step 21 |
+| 16 | `src/ipc_client.c` skeleton: `open_ops`, `close` (green) | ✅ Done (2026-10-24): ICO 2/2; `gt_ipc_client_open` moved to Step 22 |
+| 17 | ICC-01/02 | ✅ Done (2026-10-24): ICC 2/2; ICC-03 moved to Step 18 |
+| 18 | Send, connected path + ICC-03 | ✅ Done (2026-10-24): ICS 6/6, ICC 3/3 |
+| 19 | Reconnect and backoff, `pump` | ✅ Done (2026-10-24): ICR 8/8; 101 tests across 17 binaries, 0 Valgrind errors |
+| 20 | Overflow, GAP, `stats` | ☐ Next |
+| 21 | IPL loopback tests + ICO-03/04 (red) | ☐ |
+| 22 | `src/ipc_sock.c` + `gt_ipc_client_open` (green) | ☐ |
+| 23 | `hub_listen` on-Pi tool | ☐ |
+| 24 | Docs (DESIGN.md, this file) | ☐ |
 | — | On-Pi `light_probe` run | ☐ Not recorded |
 | — | Hop-2 (hub→storage) format | ✅ Decided 2026-10-23: the 24 B record (see Decisions) |
 
 ### Not done yet
 These are what's left before a reading can travel from the light sensor to storage:
-- **IPC client** (`src/ipc_client.c`, not started): implements the `gt_ipc_client_open` / `_send` / `_close` functions declared in `ipc.h`. It reconnects with 100 ms → 2 s backoff, buffers up to 64 readings in a ring, sends a GAP message after an overflow, and logs `ipc_disconnect`, `ipc_reconnect` and `ipc_overflow`. Its `recv()` side must reject anything shorter than `GT_MSG_SIZE`. Hop 1 is done, so nothing blocks this.
+- **IPC client** (Steps 10–24, in progress through Step 19):
+  - **Done:** `open_ops`, `close`, `send`, `pump`, the 64-slot ring, the reconnect backoff and the `DISCONNECT` / `RECONNECT` events. Also the receive-side length check (`gt_ipc_frame_decode`).
+  - **Left:**
+    - overflow, the GAP message and `gt_ipc_client_stats` (Step 20)
+    - the loopback tests over a real socket (Step 21)
+    - `src/ipc_sock.c` and `gt_ipc_client_open` (Step 22)
+    - `hub_listen` (Step 23)
+    - the docs (Step 24)
 - **`gt_hub_accept`** (no `src/hub.c` yet): its signature was updated in Step 7 to output a `gt_record`, but it isn't implemented. It has to validate the message (including the `reading_invalid` range check), stamp `seq` and the µs receive time, and build the record that `gt_record_encode` turns into bytes for `storage.sock`.
 - **`src/light_sensor_main.c`** (not started): the 1000 ms sampler, the health tracker and the IPC client, plus a heartbeat to `sup.sock`. This is also where the log sink (stderr, a file or the monitor process) and wall-clock timestamps for log lines get decided. It depends on the IPC client.
 - **On-Pi `light_probe` run** (not recorded): `make light_probe` on the Pi with the BH1750 attached. Record the rung 1–4 PASS/FAIL results and the jitter numbers in the table above. It needs real I2C, so it can't run in WSL or CI.
@@ -514,3 +566,19 @@ These are what's left before a reading can travel from the light sensor to stora
   - In a red step, plain `make test` stops at the first link failure, so the existing binaries were built and run separately to confirm they stayed green.
 
   Next: the IPC client (see *Not done yet*).
+- **2026-10-24:** Planned the IPC phase (Steps 10–24) into this file: the Code map, the connection and ring rules, and the Light → IPC → Hub ladder. Decided on `SOCK_SEQPACKET` for `hub.sock` and a `hub_listen` stand-in on the Pi. Steps 10–19 landed:
+  - The socket seam (`ipc_sock.h`) and the fake socket.
+  - The client API in `ipc.h`.
+  - The receive-side length check (IFD 6/6).
+  - Client open and close (ICO 2/2, ICC 3/3).
+  - Send to a reachable hub (ICS 6/6).
+  - Reconnect with backoff, and `pump` (ICR 8/8).
+
+  `make test`, `make asan` and `make memcheck` all pass: 101 tests across 17 binaries, 0 Valgrind errors, 0 bytes in use.
+
+  Surprises:
+  - Every test binary links all of `src/`, so a function in `src/` can't call one that doesn't exist yet without breaking every binary. That moved `gt_ipc_client_open` to Step 22 and ICO-03/04 to Step 21. ICC-03 moved to Step 18 because only `send` can fill the ring. See *Decisions*.
+  - `gt_ipc_client_open_ops` had to go in `ipc_sock.h`, because declaring it in `ipc.h` would make the two headers include each other.
+  - The running totals reported in chat after Steps 18 and 19 were wrong (95 and 103). Recounting from `make test` output gives 93 and 101.
+
+  Next: Step 20, overflow and the GAP message.
