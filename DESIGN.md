@@ -1,5 +1,3 @@
-3-5 pages and the most leveraged hours of the whole project. Because every hour of arguing here saves five of rewriting later. Required contents:
-
 ## Green-Thumb Architecture Diagram
 
 ```mermaid
@@ -133,7 +131,7 @@ Log format for every component: `timestamp level component event key=value`. `ti
 | Sensor → hub | Hub down or restarting; local ring overflows | `send`/`connect` returns EPIPE, ECONNREFUSED or ENOENT; ring full | Buffer up to 64 readings, reconnect with 100 ms → 2 s backoff, then resend; on overflow, refuse and count, then send a gap record on reconnect | `ipc_disconnect`, `ipc_reconnect`, `ipc_overflow` |
 | Hub | Malformed, lost or out-of-order message | Length/magic/version check; gap in the sensor-side counter | Discard a malformed message and close the connection so the sensor resyncs; report counter gaps | `ipc_bad_message`, `sensor_seq_gap` |
 | Hub | Sensor goes quiet | Last-seen timer: 3 s for light, 180 s for soil | Mark the sensor stale and keep running on the other sensor | `sensor_timeout`, `sensor_resumed` |
-| Hub | Out-of-range reading | Range check (light 0–65535 lux; soil within the seesaw's raw range) | Reject and count; invalid data is not stored | `reading_invalid` |
+| Hub | Out-of-range reading | Range check (light raw count 0–65535; soil within the seesaw's raw range) | Reject and count; invalid data is not stored | `reading_invalid` |
 | Hub | Process crashes or hangs | SIGCHLD, or no heartbeat for 5 s | Supervisor restarts it with backoff (SIGKILL first if hung); sensor rings cover the downtime | `child_exit` / `heartbeat_timeout`, `hub_start` |
 | Hub → storage | Storage restarting, recovering or slow | `send` returns EPIPE, ECONNREFUSED or EAGAIN | Hold up to 1024 records (about 17 min), reconnect, and drain in order | `storage_unreachable`, `storage_reconnected` |
 | Hub → storage | Hub queue full | Queue depth | Refuse and count new readings; send one gap record to storage before draining | `hub_queue_full` |
@@ -410,7 +408,7 @@ Ownership means first authorship and answerability at the defense, not exclusive
 ### Lily
 
 - **Light sensor (driver and process):** the `light_sensor` process, the BH1750 I2C read code, and its read-failure handling.
-- **IPC (data path):** `hub.sock` and `storage.sock`, the 16 B message format, reconnect and backoff, and the sensor-side and hub queues.
+- **IPC (data path):** `hub.sock` and `storage.sock`, the 16 B message format (sensor → hub) and the 24 B record on `storage.sock` (hub → storage), reconnect and backoff, and the sensor-side and hub queues.
 - **Hub / aggregation:** the hub process itself, which validates, stamps (seq + time) and forwards readings, plus per-sensor timeouts and gap records for refused readings.
 - **Storage:** the storage process, its rx and flush threads, batching (N = 64 / T = 60 s), the segment format and 30-day retention.
 - **Persistence and recovery:** the fsync discipline, the durability guarantee, the startup recovery scan, and the handling of write/fsync failures, disk full and storage outages.
@@ -437,7 +435,6 @@ Ownership means first authorship and answerability at the defense, not exclusive
 - **Soak testing:** the 72 h run at real rates that checks long-run stability and the failure-mode table's honesty.
 - **Milestone integration:** merging both partners' work and preparing each milestone's final submission.
 
-## AI-usage Plan
 ## AI-usage plan
 
 **What we will use Claude for**

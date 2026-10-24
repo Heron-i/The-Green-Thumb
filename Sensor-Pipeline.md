@@ -165,17 +165,19 @@ This completes rung 5 end to end: the driver detects the failure, the tracker tu
 - **Done when:** all three targets pass, MSE 7/7 and MSD 7/7.
 
 ### Step 6: docs
-- **DESIGN.md:** add the 16 B sensor→hub layout table, and one line recording that the hop-2 format is still undecided, and why. Next to the log format (line 128), add one line recording the timestamp unit (µs since epoch, integer) and the level names.
+- **DESIGN.md:** add the 16 B sensor→hub layout table, and one line recording that the hop-2 format is still undecided, and why. Next to the log format (above the *Failure-mode table*), add one line recording the timestamp unit (µs since epoch, integer) and the level names.
 - **Notes-with-Claude.md:** add one 2–4 sentence blurb each for the health tracker, the log line and the message layout.
 - **This file:** update Status.
 
 ### Step 7: hop-2 docs and headers
 - **DESIGN.md:**
-  - line 174: hop 2 carries the 24 B record; the hub stamps `seq` and the time; storage checks it.
-  - line 221: "Open:" becomes "Decided:", with the reason.
-  - line 298: hub queue `1024 records × 24 B | ≈24 KB`.
-  - line 319: "16 B messages sensor → hub and 24 B records hub → storage".
-  - line 335: "a 16 B message (sensor → hub) and a 24 B record (hub → storage)".
+  - *Storage and data → At what rate* ("On the wire"): hop 2 carries the 24 B record; the hub stamps `seq` and the time; storage checks it.
+  - *In what format*, under the sensor → hub message table: "Open:" becomes "Decided:", with the reason.
+  - *Constraints → Resource budget*: hub queue `1024 records × 24 B | ≈24 KB`.
+  - *Constraints → IPC overhead*: "16 B messages sensor → hub and 24 B records hub → storage".
+  - *Evaluation plan → IPC latency*: "a 16 B message (sensor → hub) and a 24 B record (hub → storage)".
+  - *Ownership map → IPC (data path)*: adds "the 24 B record on `storage.sock`".
+  - Consistency fixes found along the way: the Hub range check reads "light raw count 0–65535" (not lux), the stray assignment-prompt line at the top is removed, and the duplicated AI-usage heading is merged.
 - **`include/ipc.h:23`:** replace the "still undecided" comment with "Hub → storage sends the 24 B record (log_record.h)."
 - **`include/hub.h:11`:** `gt_hub_accept(..., gt_record *out)`, include `log_record.h`, and update the comment. Nothing calls it yet, so the build stays green.
 - **`include/log_record.h`:** add a layout comment like the one in `ipc.h` (offsets 0–23, CRC over bytes 0–19, written byte by byte), plus short comments on each function.
@@ -246,7 +248,7 @@ _Update at the end of the day, when asked: tick the step table, and add one Log 
 | 5 | `src/ipc_msg.c` (green) | ☐ Not started |
 | 6 | DESIGN.md, notes, this file | ☐ Not started |
 | — | On-Pi `light_probe` run | ☐ Not recorded |
-| — | Hop-2 (hub→storage) format | ☐ Undecided |
+| — | Hop-2 (hub→storage) format | ✅ Decided 2026-10-23: the 24 B record (see Decisions) |
 
 ### Log
 - **2026-10-23:** Plan written. Step 0 is complete as committed. The last commit says the test structure was verified; this session did not re-run the suite. Next: Step 1.
