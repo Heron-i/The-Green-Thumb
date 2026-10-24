@@ -212,6 +212,20 @@ gt_ipc_client *gt_ipc_client_open_ops(const gt_sock_ops *ops, void *ctx)
     return client;
 }
 
+/* The real client: the Linux socket ops for `sock_path` (ipc_sock.c) under
+ * gt_ipc_client_open_ops. Neither step connects. A bad path fails in
+ * gt_ipc_sock_linux before any ctx exists, so there is nothing to free;
+ * after that, open_ops owns the ctx and destroys it itself if it fails. */
+gt_ipc_client *gt_ipc_client_open(const char *sock_path)
+{
+    const gt_sock_ops *ops = NULL;
+    void *ctx = NULL;
+    if (gt_ipc_sock_linux(sock_path, &ops, &ctx) != GT_OK) {
+        return NULL;
+    }
+    return gt_ipc_client_open_ops(ops, ctx);
+}
+
 /* Hand the ctx back to the socket layer exactly once (destroy also closes
  * any open connection), then free the client. Nothing more is sent, so
  * frames still in the ring are dropped. NULL is a no-op, like free(NULL). */
