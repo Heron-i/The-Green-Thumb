@@ -6,9 +6,8 @@
  * on NULL, and sends nothing more, so buffered frames are dropped rather
  * than half-sent. Runs against tests/fake_sock.h. Run under make test /
  * asan / memcheck; Valgrind is what proves the client's own memory is
- * freed. Implements ICC-01 through ICC-03. ICC-03 needs a frame in the
- * ring, which only gt_ipc_client_send can put there, so it arrives with
- * Step 18. Opening is in test_ipc_open.c.
+ * freed. Implements ICC-01 through ICC-03. ICC-03 uses gt_ipc_client_send
+ * to leave a frame in the ring. Opening is in test_ipc_open.c.
  *
  * What these tests cannot prove: that the Linux destroy really closes the
  * file descriptor. That's src/ipc_sock.c, checked by test_ipc_loopback.c. */
@@ -42,9 +41,34 @@ static void test_icc02_close_null_is_safe(void)
     CHECK(1);
 }
 
+/* ---- ICC-03: close with frames buffered sends nothing ----
+ * One EAGAIN leaves a frame in the ring. close must not try to send it
+ * (a send while shutting down could block or half-send); the frame is
+ * dropped, the ctx is destroyed once, and Valgrind sees nothing leaked. */
+static void test_icc03_close_with_buffered_sends_nothing(void)
+{
+    fake_sock fake;
+    gt_ipc_client *client = gt_ipc_client_open_ops(fake_sock_ops(&fake), &fake);
+    fake_sock_push_send_result(&fake, GT_ERR_FULL);
+    gt_msg reading = {
+        .type = GT_MSG_DATA, .sensor_id = GT_SENSOR_LIGHT,
+        .counter = 1, .seq = 0, .value = 100,
+    };
+
+    CHECK_EQ(gt_ipc_client_send(client, &reading, 0, NULL), GT_OK);
+    CHECK_EQ(fake.n_sent, 0);
+    int sends_before_close = fake.send_calls;
+
+    gt_ipc_client_close(client);
+    CHECK_EQ(fake.send_calls, sends_before_close);
+    CHECK_EQ(fake.n_sent, 0);
+    CHECK_EQ(fake.destroy_calls, 1);
+}
+
 static const test_case_t tests[] = {
     {"ICC-01", "destroy is called exactly once", test_icc01_destroy_called_once},
     {"ICC-02", "close(NULL) is safe", test_icc02_close_null_is_safe},
+    {"ICC-03", "close with frames buffered sends nothing", test_icc03_close_with_buffered_sends_nothing},
 };
 
 int main(void)

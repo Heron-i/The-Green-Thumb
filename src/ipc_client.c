@@ -17,6 +17,7 @@
 #include "ipc_sock.h"
 
 #include <stdlib.h>
+#include <string.h>
 
 /* The ring is a circular queue: `head` is the slot of the oldest frame and
  * `count` is how many frames follow it, wrapping from the last slot back to
@@ -53,6 +54,48 @@ struct gt_ipc_client {
     gt_ipc_stats stats;
 };
 
+/* Copy one encoded frame into the slot just after the newest one.
+ * (head + count) % GT_IPC_RING_SLOTS is that slot: `%` (remainder) wraps
+ * an index that runs past the last slot back round to slot 0. GT_ERR_FULL
+ * if all slots are taken; the ring is unchanged then. */
+static gt_status ring_push(gt_ipc_client *client, const uint8_t frame[GT_MSG_SIZE])
+{
+    if (client->count == GT_IPC_RING_SLOTS) {
+        return GT_ERR_FULL;
+    }
+    size_t tail = (client->head + client->count) % GT_IPC_RING_SLOTS;
+    memcpy(client->ring[tail], frame, GT_MSG_SIZE);
+    client->count++;
+    client->stats.queued = (uint32_t)client->count;
+    return GT_OK;
+}
+
+/* Connect if needed, then hand frames to the socket oldest first until the
+ * ring is empty or the socket says stop. A frame leaves the ring only once
+ * send returns GT_OK, i.e. the kernel has taken it. Any other result keeps
+ * that frame at the head for the next drain: GT_ERR_FULL (EAGAIN) means
+ * the hub is alive but its buffer is full, so we just wait. */
+static void drain(gt_ipc_client *client)
+{
+    if (!client->connected) {
+        if (client->ops->connect(client->ctx) != GT_OK) {
+            return;
+        }
+        client->connected = 1;
+    }
+    /* Invariant: ring[head] is the oldest frame the kernel hasn't taken. */
+    while (client->count > 0) {
+        gt_status result = client->ops->send(client->ctx, client->ring[client->head], GT_MSG_SIZE);
+        if (result != GT_OK) {
+            return;
+        }
+        client->head = (client->head + 1) % GT_IPC_RING_SLOTS;
+        client->count--;
+        client->stats.queued = (uint32_t)client->count;
+        client->stats.sent++;
+    }
+}
+
 /* Set up a client over any socket ops; no connect yet (the first send or
  * pump tries straight away, because next_attempt_ms starts at 0).
  * calloc is malloc that also zeroes the memory, so every counter, flag and
@@ -85,4 +128,30 @@ void gt_ipc_client_close(gt_ipc_client *client)
     }
     client->ops->destroy(client->ctx);
     free(client);
+}
+
+/* Encode `message`, queue it behind anything already waiting, and send
+ * what the socket will take. The message is encoded first, so a bad one is
+ * refused (GT_ERR_INVAL) before it takes a slot or causes a connect. The
+ * ring is drained before the push as well as after: getting older frames
+ * out first can free the slot this reading needs. */
+gt_status gt_ipc_client_send(gt_ipc_client *client, const gt_msg *message,
+                             uint64_t now_ms, unsigned *events_out)
+{
+    if (events_out != NULL) {
+        *events_out = 0;
+    }
+    if (client == NULL || message == NULL) {
+        return GT_ERR_INVAL;
+    }
+    (void)now_ms;   /* not used yet: the reconnect backoff needs it */
+
+    uint8_t frame[GT_MSG_SIZE];
+    if (gt_msg_encode(message, frame) != GT_OK) {
+        return GT_ERR_INVAL;
+    }
+    drain(client);
+    gt_status pushed = ring_push(client, frame);
+    drain(client);
+    return pushed;
 }
