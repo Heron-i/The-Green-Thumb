@@ -70,23 +70,71 @@ static gt_status ring_push(gt_ipc_client *client, const uint8_t frame[GT_MSG_SIZ
     return GT_OK;
 }
 
+/* After a failed connect or a lost hub: no attempt before now + the
+ * current wait, and double the wait for next time, up to the cap. Marks
+ * the trouble so the next successful connect reports GT_IPC_EV_RECONNECT.
+ * The waits run 100, 200, 400, 800, 1600, then 2000 ms each. */
+static void schedule_retry(gt_ipc_client *client, uint64_t now_ms)
+{
+    client->had_trouble = 1;
+    client->next_attempt_ms = now_ms + client->backoff_ms;
+    client->backoff_ms *= 2;
+    if (client->backoff_ms > GT_IPC_BACKOFF_MAX_MS) {
+        client->backoff_ms = GT_IPC_BACKOFF_MAX_MS;
+    }
+}
+
+/* Make sure there's a connection, trying at most once per retry window.
+ * Returns 1 if connected (already, or just now), 0 if not: either the
+ * retry isn't due yet (no attempt at all) or the attempt failed. On
+ * success the wait goes back to 100 ms, and if a loss or failed attempt
+ * came before, GT_IPC_EV_RECONNECT is added to *events. */
+static int try_connect(gt_ipc_client *client, uint64_t now_ms, unsigned *events)
+{
+    if (client->connected) {
+        return 1;
+    }
+    if (now_ms < client->next_attempt_ms) {
+        return 0;
+    }
+    if (client->ops->connect(client->ctx) != GT_OK) {
+        schedule_retry(client, now_ms);
+        return 0;
+    }
+    client->connected = 1;
+    client->backoff_ms = GT_IPC_BACKOFF_MIN_MS;
+    if (client->had_trouble) {
+        client->had_trouble = 0;
+        client->stats.reconnects++;
+        *events |= GT_IPC_EV_RECONNECT;
+    }
+    return 1;
+}
+
 /* Connect if needed, then hand frames to the socket oldest first until the
  * ring is empty or the socket says stop. A frame leaves the ring only once
  * send returns GT_OK, i.e. the kernel has taken it. Any other result keeps
- * that frame at the head for the next drain: GT_ERR_FULL (EAGAIN) means
- * the hub is alive but its buffer is full, so we just wait. */
-static void drain(gt_ipc_client *client)
+ * that frame at the head for the next drain:
+ *   GT_ERR_FULL (EAGAIN): the hub is alive but its buffer is full; stay
+ *                         connected and just wait.
+ *   GT_ERR_IO (EPIPE / ECONNRESET): the hub is gone; disconnect, report
+ *                         GT_IPC_EV_DISCONNECT, and retry after the wait. */
+static void drain(gt_ipc_client *client, uint64_t now_ms, unsigned *events)
 {
-    if (!client->connected) {
-        if (client->ops->connect(client->ctx) != GT_OK) {
-            return;
-        }
-        client->connected = 1;
+    if (!try_connect(client, now_ms, events)) {
+        return;
     }
     /* Invariant: ring[head] is the oldest frame the kernel hasn't taken. */
     while (client->count > 0) {
         gt_status result = client->ops->send(client->ctx, client->ring[client->head], GT_MSG_SIZE);
+        if (result == GT_ERR_FULL) {
+            return;
+        }
         if (result != GT_OK) {
+            client->ops->disconnect(client->ctx);
+            client->connected = 0;
+            *events |= GT_IPC_EV_DISCONNECT;
+            schedule_retry(client, now_ms);
             return;
         }
         client->head = (client->head + 1) % GT_IPC_RING_SLOTS;
@@ -144,14 +192,36 @@ gt_status gt_ipc_client_send(gt_ipc_client *client, const gt_msg *message,
     if (client == NULL || message == NULL) {
         return GT_ERR_INVAL;
     }
-    (void)now_ms;   /* not used yet: the reconnect backoff needs it */
 
     uint8_t frame[GT_MSG_SIZE];
     if (gt_msg_encode(message, frame) != GT_OK) {
         return GT_ERR_INVAL;
     }
-    drain(client);
+    unsigned events = 0;
+    drain(client, now_ms, &events);
     gt_status pushed = ring_push(client, frame);
-    drain(client);
+    drain(client, now_ms, &events);
+    if (events_out != NULL) {
+        *events_out = events;
+    }
     return pushed;
+}
+
+/* The connect-and-drain half of send, with no new message: the sensor
+ * loop calls this every tick, so a ring filled while the hub was down
+ * still empties even when the sensor is offline and sends nothing. */
+gt_status gt_ipc_client_pump(gt_ipc_client *client, uint64_t now_ms, unsigned *events_out)
+{
+    if (events_out != NULL) {
+        *events_out = 0;
+    }
+    if (client == NULL) {
+        return GT_ERR_INVAL;
+    }
+    unsigned events = 0;
+    drain(client, now_ms, &events);
+    if (events_out != NULL) {
+        *events_out = events;
+    }
+    return GT_OK;
 }
