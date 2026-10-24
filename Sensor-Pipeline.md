@@ -262,3 +262,17 @@ These are what's left before a reading can travel from the light sensor to stora
 
 ### Log
 - **2026-10-23:** Plan written. Step 0 is complete as committed. The last commit says the test structure was verified; this session did not re-run the suite. Next: Step 1.
+- **2026-10-23 (end of day):** Steps 1–9 landed:
+  - The health tracker (SHR 7/7, SHS 5/5).
+  - The log formatter and event names (LGF 8/8, SHE 5/5).
+  - The 16 B sensor→hub message (MSE 7/7, MSD 7/7).
+  - The 24 B record codec with CRC-32 (CRC 3/3, RCE 8/8, RCD 8/8).
+
+  `make test`, `make asan` and `make memcheck` all pass: 76 tests across 12 binaries, 0 Valgrind errors, 0 bytes in use. Hop 2 was decided as the 24 B record, because the hub owns the timestamp and records can wait up to about 17 min in its queue during a storage outage.
+
+  Surprises:
+  - DESIGN.md had drifted in four places: 16 B was assumed on both hops, the range check said lux instead of raw count, a stray prompt line sat at the top, and the AI-usage heading appeared twice. All four are fixed.
+  - The RCD tests have to recompute the CRC after breaking a header byte. Otherwise the CRC check alone rejects every case, and the magic/version/type/sensor checks never run.
+  - In a red step, plain `make test` stops at the first link failure, so the existing binaries were built and run separately to confirm they stayed green.
+
+  Next: the IPC client (see *Not done yet*).
