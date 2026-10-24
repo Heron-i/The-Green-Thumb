@@ -1,5 +1,3 @@
-3-5 pages and the most leveraged hours of the whole project. Because every hour of arguing here saves five of rewriting later. Required contents:
-
 ## Green-Thumb Architecture Diagram
 
 ```mermaid
@@ -205,7 +203,7 @@ The timestamp is applied by the hub when it receives the reading. If the Pi boot
 | Soil | 1 per 60 s | 1,440 |
 | **Total into storage** | **≈1.02 records/s (≈25 B/s)** | **87,840 ≈ 2.1 MB/day** |
 
-On the wire, each reading travels sensor → hub as a 16 B socket message (layout under *In what format*). The hub → storage message is not decided yet: once the hub stamps a µs timestamp, the reading no longer fits in 16 B, so that hop will carry either the 24 B record or a 16 B message that storage timestamps. On disk, each reading is one 24 B record. Gap records only appear during failures and add negligible volume. See the *Architecture Diagram* data path labels.
+On the wire, each reading travels sensor → hub as a 16 B socket message (layout under *In what format*). Hub → storage carries the 24 B record itself, laid out exactly as on disk with the CRC included: the hub stamps `seq` and the timestamp, and storage checks the magic, version, type, sensor and CRC before appending it. On disk, each reading is one 24 B record. Gap records only appear during failures and add negligible volume. See the *Architecture Diagram* data path labels.
 
 ### In what format
 
@@ -252,7 +250,7 @@ The log is an **append-only binary log** of fixed 24 B records, packed and littl
 | 12 | 4 B | value | DATA: raw count; GAP: refused-reading count |
 
 - The hub rejects a message with a bad magic, version, type or sensor_id (`ipc_bad_message`). A message shorter than 16 B is rejected at `recv()`.
-- **Open:** the hub → storage format is undecided. A hub-stamped µs timestamp (8 B) does not fit in 16 B alongside the type, sensor, seq and value. The options are to send the 24 B record on that hop, or to have storage stamp the time.
+- **Decided:** hub → storage sends the 24 B record (see *Record* above), not this message. The hub stamps the µs timestamp (8 B), which does not fit in 16 B alongside the type, sensor, seq and value. Stamping in the hub also keeps a record's receive time correct while it waits in the hub queue during a storage outage.
 
 ### How records are organized
 
@@ -329,7 +327,7 @@ This section covers compute, storage and IPC. The budget, environment (power, pl
 | Component | Bounded buffer | Size |
 |---|---|---|
 | Sensor ring (each) | 64 readings × 16 B | ≈1 KB |
-| Hub queue | 1024 records × 16 B | ≈16 KB |
+| Hub queue | 1024 records × 24 B | ≈24 KB |
 | Storage batch | 64 × 24 B | ≈1.5 KB |
 | Storage outage queue | 1 MB (≈11 h) | 1 MB |
 
@@ -350,7 +348,7 @@ The main memory cost is process isolation itself. There are five processes, each
 | | |
 |---|---|
 | **Ideal build** | A shared-memory ring between processes (zero-copy, as in Figure 1), or a single process with no IPC at all. |
-| **Actual build** | Unix domain sockets (`hub.sock`, `storage.sock`, `sup.sock`), with 16 B messages over two hops (sensor → hub → storage), plus 1 Hz heartbeats from each child to the supervisor. |
+| **Actual build** | Unix domain sockets (`hub.sock`, `storage.sock`, `sup.sock`), with 16 B messages sensor → hub and 24 B records hub → storage, plus 1 Hz heartbeats from each child to the supervisor. |
 | **What the gap costs** | Each message costs a `send()` and a `recv()` system call and two kernel copies per hop. We estimate tens of µs per hop on a Pi 4, to be measured in the Evaluation plan. At ≈1.02 data messages/s plus 4 heartbeats/s, that is negligible. **What we gain:** the kernel buffers messages for us, a dead peer is reported immediately (`EPIPE` / `ECONNREFUSED`), and no process can corrupt another's memory. A shared-memory ring would give none of that, and Mechanism E depends on all of it. **Claims narrowed:** we make no high-throughput IPC claim. We claim only that IPC adds a negligible share of the sensor-to-storage latency, with a number committed in the Evaluation plan. |
 
 ### Operating and test conditions
@@ -398,7 +396,7 @@ Each measurement below has a method and a target. Unless a row says otherwise, m
 
 | Measurement | Method | Target |
 |---|---|---|
-| One-way latency per hop (sensor → hub, hub → storage) for a 16 B message | Standalone UDS ping-pong benchmark (100,000 round trips, latency = RTT / 2), confirmed by a short in-system run with per-stage timestamps | p50 < 50 µs, p99 < 1 ms per hop |
+| One-way latency per hop for a 16 B message (sensor → hub) and a 24 B record (hub → storage) | Standalone UDS ping-pong benchmark (100,000 round trips, latency = RTT / 2), confirmed by a short in-system run with per-stage timestamps | p50 < 50 µs, p99 < 1 ms per hop |
 
 ### Sensor-to-storage latency 
 
@@ -529,7 +527,7 @@ Ownership means first authorship and answerability at the defense, not exclusive
 ### Lily
 
 - **Light sensor (driver and process):** the `light_sensor` process, the BH1750 I2C read code, and its read-failure handling.
-- **IPC (data path):** `hub.sock` and `storage.sock`, the 16 B message format, reconnect and backoff, and the sensor-side and hub queues.
+- **IPC (data path):** `hub.sock` and `storage.sock`, the 16 B message format (sensor → hub) and the 24 B record on `storage.sock` (hub → storage), reconnect and backoff, and the sensor-side and hub queues.
 - **Hub / aggregation:** the hub process itself, which validates, stamps (seq + time) and forwards readings, plus per-sensor timeouts and gap records for refused readings.
 - **Storage:** the storage process, its rx and flush threads, batching (N = 64 / T = 60 s), the segment format and 30-day retention.
 - **Persistence and recovery:** the fsync discipline, the durability guarantee, the startup recovery scan, and the handling of write/fsync failures, disk full and storage outages.

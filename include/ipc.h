@@ -20,7 +20,7 @@ typedef enum {
 } gt_status;
 
 /* 16 B sensor -> hub message over AF_UNIX sockets in /run/plantpi.
- * (The hub -> storage format is still undecided: see Sensor-Pipeline.md.)
+ * (Hub -> storage sends the 24 B record instead: see log_record.h.)
  *
  * Wire layout, little-endian, written byte by byte (never by struct copy,
  * so compiler padding can't leak onto the wire):
