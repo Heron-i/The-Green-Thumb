@@ -128,10 +128,22 @@ Log format for every component: `timestamp level component event key=value`. `ti
 | Component | Failure | Detection | Response | Log |
 |---|---|---|---|---|
 | Sensor (I2C) | Read fails (NACK, EIO, unplugged) | `read`/`ioctl` returns -1 | Retry 3× at 10 ms, then skip the sample; after 10 consecutive failures, mark offline and retry every 5 s | `i2c_read_error`, `sensor_offline`, `sensor_online` |
+| Sensor (I2C) | Bus or device unavailable at startup (I2C disabled, no permission, no ACK) | `open()` returns ENOENT/EACCES; `gt_light_open()` returns NULL (power-on write NACKs) | Don't exit, which would cause a restart storm; start offline and retry every 5 s | `i2c_open_error`, `sensor_offline` |
+| Sensor (I2C) | Sensor replugged or browned out, so the chip loses its mode and reads return 0 or stale data | First good read after being offline | Re-run init (power-on, reset, mode select, wait 180 ms) before marking online | `sensor_reinit`, `sensor_online` |
+| Sensor (I2C) | Whole-bus fault (SDA held low; both sensors fail together) | Both sensor processes report `i2c_read_error` in the same window (the hub correlates them) | Each sensor closes and reopens `/dev/i2c-1`; the hub logs a bus-level event | `i2c_bus_fault` |
+| Sensor (light) | Saturation in direct sun | Raw count = 0xFFFF | Store it (it is real data), but flag it as clipped for analysis | `light_saturated` |
+| Sensor (soil) | Probe pulled out of the soil, or seesaw returns an invalid value | Raw count in the open-air calibration range; seesaw returns 0xFFFF | Store open-air readings and flag them; treat 0xFFFF as a failed read (retry path) | `soil_not_in_soil`, `i2c_read_error` |
+| Sensor | Sample overrun (retries or a slow bus push a read past its slot) | Sampler sees `now` past the next due time | Skip the missed slots instead of reading in a burst; keep the schedule anchored | `sample_overrun` |
+| Sensor | Process crashes or hangs | SIGCHLD, or no heartbeat for 5 s | Supervisor restarts it. Its 64-reading ring dies with it, so the hub records the gap from last-seen to the first new reading and accepts a counter reset to 0 from the new connection | `child_exit` / `heartbeat_timeout`, `sensor_restart` |
 | Sensor → hub | Hub down or restarting; local ring overflows | `send`/`connect` returns EPIPE, ECONNREFUSED or ENOENT; ring full | Buffer up to 64 readings, reconnect with 100 ms → 2 s backoff, then resend; on overflow, refuse and count, then send a gap record on reconnect | `ipc_disconnect`, `ipc_reconnect`, `ipc_overflow` |
+| IPC (all sockets) | Stale socket file left after a crash | `bind()` returns EADDRINUSE | The socket's owner unlinks the path, then binds again | `socket_stale_removed` |
+| IPC (all sockets) | `/run/plantpi` missing at boot (tmpfs) | `bind()` / `connect()` returns ENOENT | Supervisor creates the directory with fixed permissions before starting any child | `rundir_created` |
 | Hub | Malformed, lost or out-of-order message | Length/magic/version check; gap in the sensor-side counter | Discard a malformed message and close the connection so the sensor resyncs; report counter gaps | `ipc_bad_message`, `sensor_seq_gap` |
 | Hub | Sensor goes quiet | Last-seen timer: 3 s for light, 180 s for soil | Mark the sensor stale and keep running on the other sensor | `sensor_timeout`, `sensor_resumed` |
-| Hub | Out-of-range reading | Range check (light raw count 0–65535; soil within the seesaw's raw range) | Reject and count; invalid data is not stored | `reading_invalid` |
+| Hub | Out-of-range reading | Range check (light 0–65535 lux; soil within the seesaw's raw range) | Reject and count; invalid data is not stored | `reading_invalid` |
+| Hub | Duplicate reading after a sensor resends | Sensor counter ≤ the last counter seen on this connection | Drop the duplicate | `ipc_duplicate` |
+| Hub | Two clients claim the same sensor ID (an old instance not yet reaped) | A second connection for a sensor ID that is already connected | Keep the newest connection and close the old one | `sensor_duplicate_client` |
+| Hub | Hub restarts and its `seq` starts over, so storage recovery would see "`seq` does not increase" and truncate good data | On startup, the hub has no last `seq` | On connect, storage replies with its last committed `seq` (known from its recovery scan) and the hub continues from the next value; as a safety net, storage rejects any `seq` ≤ last committed | `seq_resume`, `seq_rejected` |
 | Hub | Process crashes or hangs | SIGCHLD, or no heartbeat for 5 s | Supervisor restarts it with backoff (SIGKILL first if hung); sensor rings cover the downtime | `child_exit` / `heartbeat_timeout`, `hub_start` |
 | Hub → storage | Storage restarting, recovering or slow | `send` returns EPIPE, ECONNREFUSED or EAGAIN | Hold up to 1024 records (about 17 min), reconnect, and drain in order | `storage_unreachable`, `storage_reconnected` |
 | Hub → storage | Hub queue full | Queue depth | Refuse and count new readings; send one gap record to storage before draining | `hub_queue_full` |
@@ -139,8 +151,30 @@ Log format for every component: `timestamp level component event key=value`. `ti
 | Storage | Disk full, or backlog fills during an outage | ENOSPC / `statvfs`; queue depth (1 MB, about 11 h) | Log the backlog at 50/75/90%; never delete history early; when full, refuse and count new readings and write a gap record on recovery | `storage_disk_full`, `storage_backlog`, `storage_degraded`, `storage_recovered` |
 | Storage | Corrupt tail or bad segment header after a crash | Startup scan: bad magic, CRC or header, backwards seq, partial record | Truncate at the first bad record (or rename a bad segment to `.corrupt`) and fsync, then accept data | `recovery_event`, `segment_corrupt` |
 | Storage | Process crashes or hangs | SIGCHLD, or no heartbeat for 5 s | Supervisor restarts it; recovery runs before the socket accepts data | `child_exit` / `heartbeat_timeout`, `recovery_event` |
+| Storage | Killed (`kill -9` or OOM) with an unsynced batch, losing up to 60 s with no GAP record | After restart, the first incoming `seq` is greater than last committed + 1 | Loss is limited to the unsynced batch (≤ 60 s, the same bound as a power cut) and made explicit: storage writes one GAP record covering the missing range (count = the difference). Relies on the `seq` hand-off in the hub-restart row | `recovery_gap` |
+| Storage | Malformed message on `storage.sock` | `gt_msg_decode()` fails | Discard it and close the connection; the hub reconnects | `ipc_bad_message` |
+| Storage | Filesystem remounted read-only (ext4 after SD errors) | `open()` / `write()` returns EROFS | Mark degraded and queue in memory (1 MB); this needs a reboot or fsck, so log it as an error | `storage_readonly`, `storage_degraded` |
+| Storage | `fsync()` stalls for seconds (consumer SD) | fsync duration measured on every commit | Log any fsync over 1 s. Storage's heartbeat is sent by the rx thread, which never blocks on disk, and carries "flush in progress since t" plus the committed-record count. The supervisor allows up to 30 s while a flush is in progress, and still kills storage if the committed count stops advancing past that | `fsync_slow` |
+| Storage | New day's segment cannot be created, or the directory fsync fails | Return value of `open(O_CREAT)` / `fsync()` on the directory | Keep the batch queued and retry every cycle | `segment_create_error` |
+| Storage | Retention deletes good data because the clock is wrong (boot without an RTC gives 1970 or an old date) | `clock_unsynced`, or a timestamp earlier than the build date | Skip retention deletion and day rollover while the clock is unsynced; keep appending to the current segment | `retention_skipped` |
+| Storage | Retention delete fails | `unlink()` returns -1 | Log it and keep going; history is never at risk | `retention_error` |
+| Supervisor | Child fails to start (binary missing, `exec` error, exits at once) | `waitpid()` status 127, or exit within 1 s of fork | Restart with backoff 1 → 2 → 4 … max 30 s | `child_start_failed` |
+| Supervisor | Restart storm: a child keeps crashing | Restart count over a sliding window | Backoff 1 → 2 → 4 … capped at 30 s; the failure count resets once a child stays healthy for 60 s. After 10 consecutive failed starts, mark the child persistently degraded (shown in the CLI) and keep retrying once every 5 min, so no manual step is ever needed | `child_backoff`, `child_degraded` |
+| Supervisor | Several children exit at once (SIGCHLD signals merge) | SIGCHLD delivered via a self-pipe or `signalfd` into the `poll()` loop | Reap with `waitpid(-1, WNOHANG)` in a loop until none are left | `child_exit` (one per child) |
+| Supervisor | Hung child does not die after SIGKILL (stuck in uninterruptible I/O, e.g. a stalled SD) | Not reaped within 5 s of SIGKILL | Never start a replacement until the old PID is reaped, so two storage processes can never write the log at once; keep waiting and logging | `child_unkillable` |
+| Supervisor | Child ignores SIGTERM on shutdown or restart | Still alive after a 5 s grace period | SIGKILL | `child_kill_forced` |
+| Supervisor | Supervisor itself crashes or hangs | systemd sees the process exit, or a missed `WatchdogSec` ping (the supervisor pings `sd_notify` from its `poll()` loop) | systemd runs the supervisor (started at boot, `Restart=always`). The default `KillMode=control-group` sends every child SIGTERM (so storage flushes), then SIGKILL, before the restart, so no orphan can hold the sockets or the log; each child also sets `PR_SET_PDEATHSIG` as a backup | `sup_start` (plus systemd's journal entry) |
+| Supervisor | Heartbeat channel lost (`sup.sock` recreated after a supervisor restart) | Child `send()` returns EPIPE / ECONNREFUSED | Children reconnect with 100 ms → 2 s backoff; the supervisor allows one heartbeat timeout (5 s) of grace after its own start | `heartbeat_reconnect` |
+| Supervisor | Process sends heartbeats but does no work (heartbeat path alive, worker deadlocked) | The heartbeat's progress counter (readings sent / records committed) stops advancing | Treat it as a hang: SIGKILL and restart | `heartbeat_stalled` |
+| Supervisor | OOM killer kills a child | `waitpid()` shows a SIGKILL the supervisor did not send | Restart as for a crash; give storage a low `oom_score_adj` | `child_exit` (`signal=9 cause=external`) |
 | Power | Power cut mid-write | No clean-shutdown marker at boot | Recovery scan before accepting data. A record is committed once fsync returns; a power cut loses at most one unsynced batch (≤ 60 s), plus any backlog held in memory during a storage outage, and never leaves a corrupt record readable | `unclean_shutdown`, `recovery_event` |
+| Power | Undervoltage or brownout (a weak supply causes I2C errors and SD corruption) | `vcgencmd get_throttled` bits 0 / 16, polled every 60 s | Log it and correlate it with I2C errors; suggest a better supply in the CLI | `undervoltage` |
+| SoC | Thermal throttling | `get_throttled` bits 2 / 18; `measure_temp` above 80 °C | Log it; jitter results are reported with throttled periods marked | `thermal_throttled` |
 | System clock | Wrong time after a reboot (no real-time clock) | NTP sync status from `adjtimex` | Store readings anyway (seq keeps their order) and log the unsynced period | `clock_unsynced`, `clock_synced` |
+| System clock | Clock jumps while running (NTP step) | `CLOCK_REALTIME` delta disagrees with the `CLOCK_MONOTONIC` delta | Keep stamping (`seq` keeps the order) and log the jump size | `clock_jump` |
+| Analysis (planned) | Reads the live segment mid-write (partial tail) | Trailing bytes < 24, or a CRC failure on the last record | Read only whole records with a good CRC; retry on the next cycle | `analysis_partial_tail` |
+| Analysis (planned) | Not enough data in the window (gaps, sensor offline) | Fraction of the window covered by GAP records or offline periods | Report "insufficient data" instead of a dry or low-light alert | `analysis_insufficient_data` |
+| Analysis (planned) | Process crashes or hangs | SIGCHLD, or no heartbeat for 5 s | Supervisor restarts it; sensors and storage are unaffected | `child_exit` / `heartbeat_timeout` |
 
 ## Storage and data
 
@@ -317,14 +351,46 @@ The main memory cost is process isolation itself. There are five processes, each
 | **Actual build** | Unix domain sockets (`hub.sock`, `storage.sock`, `sup.sock`), with 16 B messages sensor → hub and 24 B records hub → storage, plus 1 Hz heartbeats from each child to the supervisor. |
 | **What the gap costs** | Each message costs a `send()` and a `recv()` system call and two kernel copies per hop. We estimate tens of µs per hop on a Pi 4, to be measured in the Evaluation plan. At ≈1.02 data messages/s plus 4 heartbeats/s, that is negligible. **What we gain:** the kernel buffers messages for us, a dead peer is reported immediately (`EPIPE` / `ECONNREFUSED`), and no process can corrupt another's memory. A shared-memory ring would give none of that, and Mechanism E depends on all of it. **Claims narrowed:** we make no high-throughput IPC claim. We claim only that IPC adds a negligible share of the sensor-to-storage latency, with a number committed in the Evaluation plan. |
 
+### Operating and test conditions
+
+**Setting.** Green Thumb is built and tested by two students on a budget under $100, over one semester, in an apartment rather than a lab. Any ordinary houseplant can be used, so nothing is tuned to one species. Each gap below narrows a claim rather than hiding it.
+
+| Area | Ideal build | Actual build | What the gap costs |
+|---|---|---|---|
+| **Test environment** | Controlled grow chamber or greenhouse bench: fixed temperature and humidity, a repeatable light schedule, several plants of known species | One houseplant in an apartment, where lights get switched on, curtains opened and the heating runs | Accuracy and alert tests aren't lab-repeatable. **Claim narrowed:** results hold for *this device in this apartment*, and each result is reported with its conditions (time of day, window, weather) |
+| **Reference instruments** | Lab-calibrated PAR meter; soil moisture measured by oven-drying soil samples | A handheld lux meter (not lab-calibrated); soil checked by weighing the pot on a kitchen scale | The ±20% light target (*Evaluation plan → Sensor accuracy*) shows agreement with the meter, not traceable accuracy. Weighing the pot is a simple version of the standard weight-based method, so the soil calibration is the stronger of the two |
+| **Plant outcomes** | A months-long study with control plants, showing that following the advice keeps plants healthier | One semester, one plant, no control group | **Claim narrowed:** we don't claim the device makes plants live longer (the *PROBLEM.md* goal). We claim only that the device measures reliably and that its alerts are correct against our thresholds |
+| **Test duration** | Soak tests across seasons, since daylight hours change by several hours over a year | One 72 h soak; 30-day retention tested with a shortened window | Seasonal light changes are never observed, so daily-light thresholds are tuned on a few days of data. Long-term SD wear and sensor drift are estimated, not measured |
+| **Data synthesized or replayed** | Every scenario happens for real, on a real plant | Load generator for throughput; fake I2C bus (`tests/fake_i2c.h`) for driver faults; scripted and replayed logs for alerts | We can't repeatedly drown or dry out a real plant, so overwatered, drought and low-light alerts are tested on **synthetic logs**. Throughput above 1× (Stress 1–3) is synthetic load. Both are labelled as such in the results |
+| **Power-fault injection** | A programmable relay that cuts power at an exact moment, e.g. during `fsync()` | Pulling the USB-C cable by hand | Pull timing is random, so "mid-batch" isn't guaranteed. We log each pull's time relative to the last commit and report how many really landed mid-write |
+| **Power supply** | Official supply plus a UPS, so an outage becomes a clean shutdown | Official Raspberry Pi USB-C supply from a wall outlet, no UPS | The official supply makes undervoltage unlikely, but every outage is still a hard power cut (see *SD / storage*). We still log `get_throttled` to confirm that |
+| **Network / time** | Wired network plus a battery-backed time source | Apartment Wi-Fi and NTP; no RTC on the Pi | Timestamps can be wrong after a boot until NTP syncs; ordering relies on `seq` (*Failure-mode table → System clock*) |
+
+### Hardware and budget
+
+**Budget.** Everything was bought within a total budget under $100: the Raspberry Pi 4 (2 GB), the official power supply, a 32 GB microSD card, a BH1750 light sensor and an Adafruit STEMMA soil sensor. Each sensor is a low-cost hobby part, and the part the ideal build would use is listed next to it so the downgrade is explicit.
+
+| Area | Ideal build | Actual build | What the gap costs |
+|---|---|---|---|
+| **Light sensor** | PAR (quantum) sensor, which measures the light plants actually use, in µmol/m²/s | BH1750: measures lux (brightness as the human eye sees it), 1 lx per count, tops out at about 54,600 lux | **Sensor downgraded.** Lux isn't PAR, so "low light" is an approximation. Direct sun (up to about 100,000 lux) **saturates** the sensor; those readings are flagged as clipped (`light_saturated`) |
+| **Soil sensor** | Calibrated probe that reports % water by volume | Adafruit STEMMA capacitive sensor: an uncalibrated raw count of about 200–2000 | **Claim narrowed:** we report *relative* moisture from our 3-point calibration (air / dry / watered), not % water. The calibration only holds for the potting mix it was made in, and one probe measures one spot in the pot |
+| **Number of plants** | Several pots, each with its own light and soil sensor, on an I2C multiplexer | One plant, one light sensor, one soil sensor | No multi-plant claim; several sensors sharing one bus are never tested |
+| **Extra sensors** | Air temperature and humidity, which also affect how fast soil dries | Light and soil only | Care advice ignores temperature and humidity. *PROBLEM.md* listed temperature as a possible extra; it was cut to stay within budget and scope |
+| **Real-time clock** | Battery-backed RTC module | None | Same as *Network / time* above: timestamps are unreliable until NTP syncs after a boot |
+| **Wiring and enclosure** | Soldered connections, a sealed enclosure, a waterproofed probe top | STEMMA QT / jumper cables, an open board near a plant that gets watered | Loose connections cause I2C errors, so the measured I2C failure rate reflects **our wiring** as much as the sensor. Water near an open board is a real risk, so the Pi sits on a shelf away from the pot |
+| **Spares for destructive tests** | Spare SD cards and sensors, so power-pull and fault tests can be repeated freely | One of each | Power pulls are capped at 20, and the SD card is imaged before testing so a damaged card can be restored |
+| **Actuation** | Automatic watering (pump and relay) and a grow light | Monitoring and advice only | **Claim narrowed:** the device *advises*; it doesn't *act*. The user still waters the plant and moves it into better light |
+
 ## Evaluation plan
 
-Each measurement below has a method and a target. Unless a row says otherwise, measurements use the real hardware at the real sampling rates (light 1 Hz, soil 1 per 60 s). Owners: **Lily** covers the sensor → IPC → hub → storage pipeline, and **Lucas** covers sensor processes, sampling and analysis. Rows marked **Joint** are measured together.
+Each measurement below has a method and a target. Unless a row says otherwise, measurements use the real hardware at the real sampling rates (light 1 Hz, soil 1 per 60 s). Owners: **Lily** covers the sensor → IPC → hub → storage pipeline (Mechanism D), and **Lucas** covers fault isolation and the supervisor (Mechanism E), sensor processes, sampling and analysis. Rows marked **Joint** are measured together.
 
 **Test tooling**
 - **Load generator:** writes synthetic records into `storage.sock` at a set rate.
 - **Verifier:** reads the log offline and checks every record's CRC, that `seq` strictly increases, and that every missing `seq` is covered by a GAP record. It then compares the log against the hub's sent-sequence log.
 - **Timing:** latency is measured with `CLOCK_MONOTONIC` timestamps, logged at each stage and keyed by sensor counter and hub `seq`, then joined offline.
+- **Fault injector:** a script that picks a target process and a random time, then sends `SIGKILL` (crash), `SIGSTOP` (hang) or closes its socket (disconnect). It logs each injection with a `CLOCK_MONOTONIC` timestamp so it can be joined with the supervisor's `child_exit`, `heartbeat_timeout` and restart events.
+- **Fake I2C bus:** `tests/fake_i2c.h` fails the Nth bus operation, so retry, skip and offline logic is tested on a dev machine without hardware (runs in CI under `make test`, `make asan` and `make memcheck`).
 
 ### IPC latency
 
@@ -401,6 +467,59 @@ The goal is to show the system stays stable over the 72 h soak, not to hit an ab
 | Segment rollover and retention |Observe the midnight UTC rollover during the soak; test retention with the window shortened to minutes | New segment and directory fsync at each rollover; only segments older than the window are deleted |
 | Sampling jitter: each sample's deviation from its schedule (1 s light, 60 s soil) | `CLOCK_MONOTONIC` at each I2C read over the soak | p99 < 10 ms (matches the ±10 ms timestamp claim in *Constraints*) |
 
+### Fault isolation and restart (Mechanism E)
+
+These tests check the *Mechanism E* rows. They run against the processes that exist at each milestone (`light_sensor`, `soil_sensor`, `hub`, `storage`), and `care` and `monitor` are added to the target list when they land. Every run ends with the verifier, so a fault that "recovers" but loses or corrupts data still fails.
+
+| Measurement | Method | Target |
+|---|---|---|
+| **Containment:** a crash affects only its target | 50 `kill -9`s per process at random times during real-rate logging; check every other PID before and after | Only the targeted PID changes; 0 unrelated exits or restarts |
+| **Crash detection and restart time:** `SIGKILL` → `child_exit` → new child sends its first heartbeat | Fault-injector timestamp vs. supervisor log, over the same 50 kills per process | 100% detected; p99 < 2 s from kill to first heartbeat (first restart, before backoff grows) |
+| **Hang detection:** `SIGSTOP` → `heartbeat_timeout` → `SIGKILL` → restart | 20 injected hangs per process | 100% detected; detection ≤ 6 s (5 s heartbeat timeout + 1 s heartbeat period); healthy again < 2 s after detection |
+| **Peer reconnect:** restarted socket owner → clients send again | Kill the hub 50 times and storage 50 times; measure the time from the new socket appearing to each client's first successful `send()` (`ipc_reconnect`, `storage_reconnected`) | 100% reconnect with no manual action; ≤ 2 s (the client backoff cap) |
+| **Readings survive a hub restart** | During the 50 hub kills, compare each sensor's counter against the committed log | 0 lost light or soil readings, because the sensor ring (64 readings ≈ 64 s of light) outlasts a < 2 s restart |
+| **Sensor collection continues while a peer is down** | Kill or `SIGSTOP` storage (and later `care` / `monitor`) for 60 s | Hub keeps receiving at 1 Hz light with no `sensor_timeout`; sensors never block on `send()` |
+| **No restart storm** | Point one child at a binary that exits at once; run for 10 min | Restart gaps follow 1 → 2 → 4 … capped at 30 s (≤ 25 restarts in 10 min); healthy processes keep their heartbeats and the sampling-jitter target |
+| **Cold start after power loss** | The same 20 power pulls as *Data loss*; timestamp supervisor start and each child's first heartbeat | All children heartbeating within 10 s of supervisor start, in dependency order (storage → hub → sensors), on every pull |
+| **Protocol robustness** | Unit tests plus a fuzz run of 10,000 random, truncated, wrong-sensor-ID and out-of-range 16 B messages into `hub.sock` | 100% rejected and logged as `ipc_bad_message` or `reading_invalid`; 0 hub crashes; 0 rejected messages stored |
+| **Failures are visible** | Every injection above is matched against the event log | 100% of injections produce a process-specific `child_exit`, `heartbeat_timeout`, `ipc_disconnect` or degraded event; 0 silent failures |
+
+### Sensor reliability
+
+This covers the *Failure-mode table → Sensor (I2C)* and *Hub (sensor goes quiet)* rows.
+
+| Measurement | Method | Target |
+|---|---|---|
+| I2C read failure rate | Count `i2c_read_error` and skipped samples per sensor over the 72 h soak | Report the first-attempt failure rate; < 0.1% of samples skipped after 3 retries |
+| Retry, skip and offline logic | Fake I2C bus fails the Nth operation: a single failure, 3 failures in a row, 10 in a row, then recovery | Single failures are recovered by retry with no skipped sample; skip after 3 retries; `sensor_offline` after 10 consecutive failures; `sensor_online` on the first good read |
+| Unplug and replug on the real Pi | Pull each sensor's STEMMA cable for 60 s, 10 times per sensor | Hub logs `sensor_timeout` within its timeout + 1 s (3 s light, 180 s soil); other sensor unaffected; `sensor_online` ≤ 6 s after replug (5 s retry period); 0 process crashes |
+| Bring-up check | `light_probe` (and a soil probe when the driver lands) on each fresh install | All checklist steps PASS |
+
+### Sensor accuracy
+
+These measurements show the raw counts mean something before the analysis engine relies on them. The method and spread are reported along with pass/fail, because the reference instruments are cheap.
+
+| Measurement | Method | Target |
+|---|---|---|
+| Light accuracy | BH1750 next to a reference lux meter at 5 levels (dark room, indoor lamp, shaded window, bright window, direct sun); 60 readings per level | Within ±20% of the reference at every level (BH1750 datasheet tolerance) |
+| Light repeatability | 60 readings at 1 Hz under constant lamp light | Coefficient of variation < 2% |
+| Soil calibration points | Raw count in open air, in dry potting mix and in fully watered potting mix; 30 readings each | The three ranges don't overlap; dry < watered; recorded as the calibration constants |
+| Soil repeatability | 30 readings at 1 per 60 s in an undisturbed pot | Coefficient of variation < 5% |
+| Watering response | Water a dry pot during logging | Reading moves at least halfway from the dry range to the watered range within 2 soil samples (≤ 2 min) |
+| Drift | Sealed, unwatered pot logged over the 72 h soak | Report the trend; no step changes that aren't explained by the environment |
+
+### Plant-care alert correctness (planned, later milestone)
+
+The analysis engine is on the diagram as a later milestone, so these targets are committed now and measured when it lands. Every test replays recorded or synthetic logs through the engine on a dev machine, so no hardware is needed, and the same input always gives the same output.
+
+| Measurement | Method | Target |
+|---|---|---|
+| True alerts | Scripted logs for each condition: soil drying past the threshold, overwatered (stays wet for more than 48 h), low light (daily light total below the threshold), sensor offline | 100% of scripted conditions raise the matching alert |
+| False alerts | Replay the 72 h soak log from a healthy, correctly watered plant | 0 alerts |
+| Alert latency | Scripted threshold crossings | Alert raised within 1 sample period of the crossing being confirmed (60 s for soil) |
+| No flapping | A reading that hovers around a threshold for 1 h | At most 1 alert per crossing (hysteresis holds) |
+| Gaps are not data | Logs with GAP records and `sensor_offline` periods | No dry or low-light alert raised from missing data; a `sensor_offline` alert is raised instead |
+
 ## Ownership map
 
 Ownership means first authorship and answerability at the defense, not exclusive work. Either partner may contribute to any area.
@@ -435,7 +554,7 @@ Ownership means first authorship and answerability at the defense, not exclusive
 - **Soak testing:** the 72 h run at real rates that checks long-run stability and the failure-mode table's honesty.
 - **Milestone integration:** merging both partners' work and preparing each milestone's final submission.
 
-## AI-usage plan
+## AI-usage Plan
 
 **What we will use Claude for**
 - **Planning before implementation:** for each issue, we use Claude to plan the implementation first. We then use it to help implement the code for that issue, working from the agreed plan.
