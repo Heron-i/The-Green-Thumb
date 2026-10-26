@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include "ipc.h"
 #include "log_record.h"
+#include "gt_log.h"
 #include "storage_io.h"
 #include "storage_proto.h"
 #include "storage_recover.h"
@@ -138,6 +139,23 @@ gt_status   gt_storage_open(const char *dir, uint64_t now_us, gt_storage **stora
 /* Event flag from gt_storage_rx (DESIGN.md failure-mode table, Storage
  * "Malformed message on storage.sock" row). */
 #define GT_STORAGE_EV_BAD_MESSAGE          0x1000u /* wrong length or bad bytes: ipc_bad_message */
+
+/* How one GT_STORAGE_EV_* flag is logged (DESIGN.md failure-mode table,
+ * Storage rows), so the mapping lives in one tested place instead of in
+ * storage_main. `reason` tells apart two events that share a name: a
+ * failed write (DEGRADED) and a full buffer (QUEUE_FULL) are both
+ * storage_degraded, logged with reason=write_failed or reason=queue_full;
+ * it is NULL for every other event. */
+typedef struct {
+    const char  *name;     /* the log event name, never containing a space */
+    gt_log_level level;
+    const char  *reason;   /* value for a reason=... field, or NULL */
+} gt_storage_event;
+
+/* Describe exactly one flag. GT_ERR_INVAL for 0, an unknown bit, more than
+ * one bit set, or NULL out; *out is untouched on failure. The caller logs
+ * an events word by describing each set bit in turn. */
+gt_status   gt_storage_event_describe(unsigned flag, gt_storage_event *out);
 
 /* Accept one 24 B record as it arrived on storage.sock. Under the lock it
  * is checked with gt_record_decode, then its seq with gt_seq_check against
