@@ -279,15 +279,17 @@ static void test_sop07_clock_behind_keeps_newest(void)
 }
 
 /* ---- SOP-08: other files are ignored ----
- * A .corrupt file holding valid records, the marker and the lock file are
- * not segments: their seqs are not used and they are not touched. */
+ * A .corrupt file holding valid records, a stray file and the lock file
+ * are not segments: their seqs are not used and they are not touched.
+ * (The clean-shutdown marker is not ignored, open deletes it: that is
+ * tested in test_storage_shutdown.c.) */
 static void test_sop08_other_files_ignored(void)
 {
     const gt_file_ops *ops = fake_fs_ops(&fs);
     const uint32_t seqs[] = { 50 };
     const uint8_t marker = 1;
     put_segment(YESTERDAY ".corrupt", seqs, 1);
-    CHECK_EQ(fake_fs_put(&fs, "clean_shutdown", &marker, 1), GT_OK);
+    CHECK_EQ(fake_fs_put(&fs, "notes.txt", &marker, 1), GT_OK);
     CHECK_EQ(fake_fs_put(&fs, "storage.sock.lock", &marker, 1), GT_OK);
     gt_storage_open_info info;
     gt_storage *storage = open_ok(ops, TODAY_US, &info);
@@ -297,7 +299,7 @@ static void test_sop08_other_files_ignored(void)
     CHECK_EQ(info.has_last, 0);
     CHECK_EQ(fs.rename_calls, 0);
     CHECK(fake_fs_file(&fs, YESTERDAY ".corrupt") != NULL);
-    CHECK(fake_fs_file(&fs, "clean_shutdown") != NULL);
+    CHECK(fake_fs_file(&fs, "notes.txt") != NULL);
     CHECK(fake_fs_file(&fs, "storage.sock.lock") != NULL);
     close_and_check(storage);
 }

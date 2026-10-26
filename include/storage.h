@@ -28,9 +28,16 @@ int       gt_is_segment_name(const char *name);
 
 typedef struct gt_storage gt_storage;
 
+/* The clean-shutdown marker: an empty file gt_storage_shutdown creates
+ * after its final flush, and open deletes. If it is missing at open, the
+ * last run ended without a clean shutdown (power cut, kill -9, crash). */
+#define GT_STORAGE_MARKER_NAME "clean_shutdown"
+
 /* What gt_storage_open_ops found and did, for the caller to log
- * (recovery_event, segment_corrupt) and to answer the hub's seq_resume. */
+ * (unclean_shutdown, recovery_event, segment_corrupt) and to answer the
+ * hub's seq_resume. */
 typedef struct {
+    int      unclean_shutdown;               /* 1: segments exist but the marker was missing */
     char     active_name[GT_FILE_NAME_MAX];  /* the segment new records go to */
     int      created;                        /* 1 if open made that segment */
     int      recovered;                      /* 1 if a segment existed and was recovered */
@@ -55,6 +62,12 @@ typedef struct {
 /* Open storage over the directory behind ops/ctx, running recovery before
  * anything else (DESIGN.md "recovery runs before storage.sock accepts any
  * data"):
+ *   0. Check for the clean-shutdown marker (DESIGN.md recovery step 1).
+ *      Missing while segments exist means unclean_shutdown; a brand-new
+ *      directory has nothing to recover, so that is not reported. A marker
+ *      that is there is deleted and fsync_dir'd at once, so it can't
+ *      survive into a run that might itself end in a crash. The marker
+ *      only decides what is logged: recovery always runs.
  *   1. List the directory and keep only segment names, oldest first.
  *   2. Recover the newest segment with gt_storage_recover_ops. Only the
  *      file being appended to can have a damaged tail.
@@ -153,10 +166,24 @@ int         gt_storage_flush_due(gt_storage *storage, uint64_t now_ms);
  *   GT_ERR_INVAL NULL storage
  * *events_out is set to 0 first; pass NULL to ignore it. */
 gt_status   gt_storage_flush(gt_storage *storage, unsigned *events_out);
+/* Clean shutdown (DESIGN.md "On SIGTERM, the flush thread commits whatever
+ * is buffered, then writes a clean-shutdown marker"): flush every pending
+ * record, then create GT_STORAGE_MARKER_NAME and fsync_dir so the marker
+ * is durable. The marker is written only if the flush succeeded, so it
+ * never claims a shutdown lost nothing when it did. Call it once, right
+ * before gt_storage_close, and append nothing after it.
+ *   GT_OK        everything committed and the marker is on disk
+ *   GT_ERR_IO    the flush failed (its events, no marker), or the marker
+ *                could not be made (GT_STORAGE_EV_WRITE_ERROR; the records
+ *                are committed, only the marker is missing, so the next
+ *                open reports an unclean shutdown that wasn't one)
+ *   GT_ERR_INVAL NULL storage
+ * *events_out is set to 0 first; pass NULL to ignore it. */
+gt_status   gt_storage_shutdown(gt_storage *storage, unsigned *events_out);
+
 /* Close the segment, free everything and call ops->destroy(ctx) once.
- * For now it does not flush: pending records are dropped (Mechanism D
- * Step 9 makes close flush and write the clean-shutdown marker). NULL is
- * a no-op. */
+ * It writes nothing: pending records are dropped. Call gt_storage_shutdown
+ * first for a clean shutdown. NULL is a no-op. */
 void        gt_storage_close(gt_storage *storage);
 
 #endif
