@@ -50,7 +50,11 @@ static int scratch_init(scratch_dir *scratch)
 }
 
 /* Remove every file in the directory, then the directory itself. The test
- * only ever makes plain files in it, so one level is enough. */
+ * only ever makes plain files in it, so one level is enough. Each file is
+ * removed by name relative to the open directory (unlinkat on dirfd, the
+ * directory stream's descriptor), so no "dir/name" path is ever built: a
+ * d_name can be up to 255 bytes, and joining it into a fixed buffer is
+ * what gcc's -Wformat-truncation rejects. */
 static void scratch_remove(scratch_dir *scratch)
 {
     DIR *listing = opendir(scratch->dir);
@@ -61,9 +65,7 @@ static void scratch_remove(scratch_dir *scratch)
             if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
                 continue;
             }
-            char path[96];
-            snprintf(path, sizeof path, "%s/%s", scratch->dir, entry->d_name);
-            unlink(path);
+            unlinkat(dirfd(listing), entry->d_name, 0);
         }
         closedir(listing);
     }

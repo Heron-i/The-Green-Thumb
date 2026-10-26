@@ -244,15 +244,19 @@ static gt_status file_list(void *ctx, char names_out[GT_FILE_LIST_MAX][GT_FILE_N
             }
             break;
         }
+        size_t name_len = strlen(entry->d_name);
         if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0
-            || strlen(entry->d_name) >= GT_FILE_NAME_MAX) {
+            || name_len >= GT_FILE_NAME_MAX) {
             continue;   /* storage never makes names that long */
         }
         if (count == GT_FILE_LIST_MAX) {
             status = GT_ERR_FULL;
             break;
         }
-        strcpy(names_out[count], entry->d_name);
+        /* memcpy of the measured length (+1 for the NUL) rather than
+         * strcpy: d_name can be 255 bytes, and gcc can't always prove the
+         * check above keeps it inside the 32-byte row. */
+        memcpy(names_out[count], entry->d_name, name_len + 1);
         count++;
     }
     closedir(listing);
