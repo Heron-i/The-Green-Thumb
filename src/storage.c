@@ -7,8 +7,8 @@
  *     "How records are organized");
  *   - the storage object: open (recovery, picking the active segment,
  *     creating it durably), append (check, then queue for the next
- *     flush), flush (write + fsync, the durability point), stats and
- *     close.
+ *     flush), flush (write + fsync, the durability point), shutdown
+ *     (final flush + clean-shutdown marker), stats and close.
  *
  * All file access goes through the gt_file_ops seam (storage_io.h), so
  * tests run on tests/fake_file.h. */
@@ -193,10 +193,11 @@ static gt_status alloc_storage(const gt_file_ops *ops, void *ctx, size_t pending
 }
 
 /* List the directory and keep only segment names, sorted oldest first
- * (alphabetical order is date order, see storage.h). */
+ * (alphabetical order is date order, see storage.h). *marker_out is 1 if
+ * the clean-shutdown marker is there too. */
 static gt_status list_segments(const gt_file_ops *ops, void *ctx,
                                char segments[GT_FILE_LIST_MAX][GT_FILE_NAME_MAX],
-                               size_t *count_out)
+                               size_t *count_out, int *marker_out)
 {
     char names[GT_FILE_LIST_MAX][GT_FILE_NAME_MAX];
     size_t name_count = 0;
@@ -205,8 +206,11 @@ static gt_status list_segments(const gt_file_ops *ops, void *ctx,
     }
 
     size_t count = 0;
+    *marker_out = 0;
     for (size_t name_index = 0; name_index < name_count; name_index++) {
-        if (gt_is_segment_name(names[name_index])) {
+        if (strcmp(names[name_index], GT_STORAGE_MARKER_NAME) == 0) {
+            *marker_out = 1;
+        } else if (gt_is_segment_name(names[name_index])) {
             memcpy(segments[count], names[name_index], GT_FILE_NAME_MAX);
             count++;
         }
@@ -322,9 +326,19 @@ gt_status gt_storage_open_ops(const gt_file_ops *ops, void *ctx, uint64_t now_us
     memset(&info, 0, sizeof info);
     char segments[GT_FILE_LIST_MAX][GT_FILE_NAME_MAX];
     size_t segment_count = 0;
+    int marker_present = 0;
     long newest = -1;
 
-    status = list_segments(ops, ctx, segments, &segment_count);
+    status = list_segments(ops, ctx, segments, &segment_count, &marker_present);
+    if (status == GT_OK) {
+        /* Step 0: read the marker, then delete it durably at once. */
+        info.unclean_shutdown = !marker_present && segment_count > 0;
+        if (marker_present
+            && (ops->unlink(ctx, GT_STORAGE_MARKER_NAME) != GT_OK
+                || ops->fsync_dir(ctx) != GT_OK)) {
+            status = GT_ERR_IO;
+        }
+    }
     if (status == GT_OK) {
         status = find_newest(storage, segments, segment_count, &info, &newest);
     }
@@ -512,6 +526,38 @@ gt_status gt_storage_flush(gt_storage *storage, unsigned *events_out)
         *events_out = events;
     }
     return GT_OK;
+}
+
+/* The marker is an empty file, so only its directory entry has to be
+ * made durable: fsync_dir, no fsync of the file itself. */
+gt_status gt_storage_shutdown(gt_storage *storage, unsigned *events_out)
+{
+    if (events_out != NULL) {
+        *events_out = 0;
+    }
+    if (storage == NULL) {
+        return GT_ERR_INVAL;
+    }
+
+    gt_status status = gt_storage_flush(storage, events_out);
+    if (status != GT_OK) {
+        return status;   /* no marker: this shutdown lost records */
+    }
+
+    int marker_handle = -1;
+    if (storage->ops->open(storage->ctx, GT_STORAGE_MARKER_NAME, GT_FILE_CREATE,
+                           &marker_handle) != GT_OK) {
+        status = GT_ERR_IO;
+    } else {
+        storage->ops->close(storage->ctx, marker_handle);
+        if (storage->ops->fsync_dir(storage->ctx) != GT_OK) {
+            status = GT_ERR_IO;
+        }
+    }
+    if (status != GT_OK && events_out != NULL) {
+        *events_out |= GT_STORAGE_EV_WRITE_ERROR;
+    }
+    return status;
 }
 
 /* stats_out is filled under the lock so its fields all come from the same
