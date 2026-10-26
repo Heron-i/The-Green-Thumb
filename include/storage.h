@@ -28,6 +28,15 @@ gt_status gt_segment_name(uint64_t now_us, char name_out[GT_FILE_NAME_MAX]);
  * is checked, not that the digits are a real date. */
 int       gt_is_segment_name(const char *name);
 
+/* List the directory behind ops/ctx and keep only segment names, sorted
+ * oldest first (alphabetical order is date order). *marker_out is 1 if
+ * the clean-shutdown marker is there too. Storage, retention and the log
+ * verifier all read segments in this one order. GT_OK, or GT_ERR_IO if
+ * the listing fails. */
+gt_status gt_storage_list_segments(const gt_file_ops *ops, void *ctx,
+                                   char segments[GT_FILE_LIST_MAX][GT_FILE_NAME_MAX],
+                                   size_t *count_out, int *marker_out);
+
 typedef struct gt_storage gt_storage;
 
 /* The clean-shutdown marker: an empty file gt_storage_shutdown creates

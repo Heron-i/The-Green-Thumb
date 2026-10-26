@@ -197,12 +197,11 @@ static gt_status alloc_storage(const gt_file_ops *ops, void *ctx, size_t pending
     return GT_OK;
 }
 
-/* List the directory and keep only segment names, sorted oldest first
- * (alphabetical order is date order, see storage.h). *marker_out is 1 if
- * the clean-shutdown marker is there too. */
-static gt_status list_segments(const gt_file_ops *ops, void *ctx,
-                               char segments[GT_FILE_LIST_MAX][GT_FILE_NAME_MAX],
-                               size_t *count_out, int *marker_out)
+/* Declared in storage.h: storage, retention and the verifier all read the
+ * segments in this one order. */
+gt_status gt_storage_list_segments(const gt_file_ops *ops, void *ctx,
+                                   char segments[GT_FILE_LIST_MAX][GT_FILE_NAME_MAX],
+                                   size_t *count_out, int *marker_out)
 {
     char names[GT_FILE_LIST_MAX][GT_FILE_NAME_MAX];
     size_t name_count = 0;
@@ -359,7 +358,7 @@ gt_status gt_storage_open_ops(const gt_file_ops *ops, void *ctx, uint64_t now_us
     int marker_present = 0;
     long newest = -1;
 
-    status = list_segments(ops, ctx, segments, &segment_count, &marker_present);
+    status = gt_storage_list_segments(ops, ctx, segments, &segment_count, &marker_present);
     if (status == GT_OK) {
         /* Step 0: read the marker, then delete it durably at once. */
         info.unclean_shutdown = !marker_present && segment_count > 0;
@@ -612,7 +611,7 @@ static void delete_old_segments(gt_storage *storage, const char *cutoff,
     char segments[GT_FILE_LIST_MAX][GT_FILE_NAME_MAX];
     size_t segment_count = 0;
     int marker_present = 0;   /* not used here: the marker is never deleted by retention */
-    if (list_segments(storage->ops, storage->ctx, segments, &segment_count,
+    if (gt_storage_list_segments(storage->ops, storage->ctx, segments, &segment_count,
                       &marker_present) != GT_OK) {
         *events |= GT_STORAGE_EV_RETENTION_ERROR;
         return;
