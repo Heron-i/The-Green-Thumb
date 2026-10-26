@@ -70,6 +70,31 @@ static void append_expect(gt_storage *storage, uint32_t seq, gt_status expected_
     CHECK_EQ(events, expected_events);
 }
 
+/* The backlog level DESIGN.md defines for `pending` records out of
+ * TEST_CAPACITY (the highest of 50/75/90% reached), worked out here on its
+ * own rather than by calling storage, so the test can't share its bug. */
+static unsigned expected_level(size_t pending)
+{
+    const size_t capacity = TEST_CAPACITY;   /* size_t, so both sides compare unsigned */
+    if (pending * 100 >= capacity * 90) {
+        return 90;
+    }
+    if (pending * 100 >= capacity * 75) {
+        return 75;
+    }
+    return pending * 100 >= capacity * 50 ? 50 : 0;
+}
+
+/* The events an accepted record should report when it brings the buffer
+ * to `pending_after` records (one more than before): GT_STORAGE_EV_BACKLOG
+ * exactly when it reaches a new threshold. With capacity 8 that is the
+ * 4th, 6th and 8th record. */
+static unsigned fill_events(size_t pending_after)
+{
+    return expected_level(pending_after) > expected_level(pending_after - 1)
+               ? GT_STORAGE_EV_BACKLOG : 0;
+}
+
 /* Check the pending count and the last accepted seq. */
 static void check_accepted(const gt_storage *storage, size_t pending, uint32_t last_seq)
 {
@@ -188,7 +213,7 @@ static void test_sap08_full_refuses(void)
 
     /* invariant: records 1 .. seq - 1 are pending */
     for (uint32_t seq = 1; seq <= TEST_CAPACITY; seq++) {
-        append_expect(storage, seq, GT_OK, 0);
+        append_expect(storage, seq, GT_OK, fill_events(seq));   /* seq records pending after it */
     }
     append_expect(storage, TEST_CAPACITY + 1, GT_ERR_FULL, GT_STORAGE_EV_QUEUE_FULL);
     check_accepted(storage, TEST_CAPACITY, TEST_CAPACITY);
@@ -205,11 +230,11 @@ static void test_sap09_no_room_for_gap(void)
 
     /* invariant: records 1 .. seq - 1 are pending */
     for (uint32_t seq = 1; seq < TEST_CAPACITY; seq++) {
-        append_expect(storage, seq, GT_OK, 0);
+        append_expect(storage, seq, GT_OK, fill_events(seq));   /* seq records pending after it */
     }
     append_expect(storage, TEST_CAPACITY + 2, GT_ERR_FULL, GT_STORAGE_EV_QUEUE_FULL);
     check_accepted(storage, TEST_CAPACITY - 1, TEST_CAPACITY - 1);
-    append_expect(storage, TEST_CAPACITY, GT_OK, 0);
+    append_expect(storage, TEST_CAPACITY, GT_OK, fill_events(TEST_CAPACITY));
     check_accepted(storage, TEST_CAPACITY, TEST_CAPACITY);
     gt_storage_close(storage);
 }

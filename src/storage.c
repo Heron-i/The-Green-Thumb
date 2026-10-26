@@ -148,6 +148,7 @@ struct gt_storage {
     int                degraded;            /* 1 from a failed flush until one succeeds */
     unsigned           backlog_percent;     /* 0, 50, 75 or 90 */
     uint64_t           refused;             /* readings refused because the buffer was full */
+    int                full_episode;        /* 1 from a full refusal until a record is accepted */
 };
 
 /* Close the active segment, free everything and destroy ctx: the one
@@ -366,9 +367,40 @@ gt_status gt_storage_open_ops(const gt_file_ops *ops, void *ctx, uint64_t now_us
     return GT_OK;
 }
 
+/* The highest backlog threshold `pending` records have reached: 90, 75,
+ * 50 or 0 (DESIGN.md "storage_backlog at 50/75/90%"). Integer-only:
+ * pending * 100 >= capacity * threshold. Widened to uint64_t so the
+ * multiplication can't overflow even where size_t is 32 bits. */
+static unsigned backlog_level(size_t pending, size_t capacity)
+{
+    static const unsigned thresholds[] = { 90, 75, 50 };
+    uint64_t scaled_pending = (uint64_t)pending * 100u;
+
+    for (size_t threshold_index = 0; threshold_index < 3; threshold_index++) {
+        if (scaled_pending >= (uint64_t)capacity * thresholds[threshold_index]) {
+            return thresholds[threshold_index];
+        }
+    }
+    return 0;
+}
+
+/* A reading refused because the buffer is full: count it, and report the
+ * first refusal of a full episode once. */
+static gt_status refuse_full(gt_storage *storage, unsigned *events)
+{
+    storage->refused++;
+    if (!storage->full_episode) {
+        storage->full_episode = 1;
+        *events |= GT_STORAGE_EV_QUEUE_FULL;
+    }
+    return GT_ERR_FULL;
+}
+
 /* The part of append that runs under the lock: judge the seq, then store
  * the record (and its GAP first, if seqs are missing). A GAP needs two
- * free slots, checked before either is added, so it is both or neither. */
+ * free slots, checked before either is added, so it is both or neither.
+ * The seq check comes before any room check, so a duplicate arriving
+ * while full is rejected as a duplicate, never counted as refused. */
 static gt_status append_locked(gt_storage *storage, const uint8_t record[GT_REC_SIZE],
                                const gt_record *decoded, uint64_t now_ms, unsigned *events)
 {
@@ -379,26 +411,34 @@ static gt_status append_locked(gt_storage *storage, const uint8_t record[GT_REC_
         return GT_ERR_CORRUPT;
     }
 
+    size_t room = storage->capacity - gt_pending_count(storage->pending);
+    if (room < (verdict == GT_SEQ_GAP ? 2u : 1u)) {
+        return refuse_full(storage, events);
+    }
+
     if (verdict == GT_SEQ_GAP) {
         gt_record gap;
         uint8_t gap_wire[GT_REC_SIZE];
-        if (storage->capacity - gt_pending_count(storage->pending) < 2) {
-            return GT_ERR_FULL;
-        }
         if (gt_seq_gap_record(storage->last_accepted_seq, decoded, &gap) != GT_OK
             || gt_record_encode(&gap, gap_wire) != GT_OK
             || gt_pending_add(storage->pending, gap_wire, now_ms) != GT_OK) {
-            return GT_ERR_FULL;   /* can't happen after the room check */
+            return refuse_full(storage, events);   /* can't happen after the room check */
         }
         *events |= GT_STORAGE_EV_RECOVERY_GAP;
     }
-
-    gt_status status = gt_pending_add(storage->pending, record, now_ms);
-    if (status != GT_OK) {
-        return status;   /* GT_ERR_FULL; the GAP branch already made room */
+    if (gt_pending_add(storage->pending, record, now_ms) != GT_OK) {
+        return refuse_full(storage, events);       /* can't happen after the room check */
     }
+
     storage->has_last_accepted = 1;
     storage->last_accepted_seq = decoded->seq;
+    storage->full_episode = 0;
+
+    unsigned level = backlog_level(gt_pending_count(storage->pending), storage->capacity);
+    if (level > storage->backlog_percent) {
+        *events |= GT_STORAGE_EV_BACKLOG;
+    }
+    storage->backlog_percent = level;
     return GT_OK;
 }
 
@@ -513,6 +553,10 @@ gt_status gt_storage_flush(gt_storage *storage, unsigned *events_out)
                                          &last_record);
     pthread_mutex_lock(&storage->lock);
     gt_pending_commit(storage->pending, record_count);
+    /* A commit only removes records, so the level can only go down, and
+     * going down is silent; it re-arms the thresholds for the next rise. */
+    storage->backlog_percent = backlog_level(gt_pending_count(storage->pending),
+                                             storage->capacity);
     storage->committed_offset += byte_count;
     storage->committed_records += record_count;
     if (decoded == GT_OK) {
