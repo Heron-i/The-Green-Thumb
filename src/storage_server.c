@@ -43,10 +43,10 @@ static uint64_t wall_us(void)
     return (uint64_t)now.tv_sec * 1000000u + (uint64_t)now.tv_nsec / 1000u;
 }
 
-/* Log every bit set in `events`, one call each (gt_storage_event_describe
- * names one flag at a time). The loop stops when bit has shifted past the
- * top of an unsigned and become 0. */
-static void log_events(gt_storage_log_fn log, void *log_ctx, unsigned events)
+/* gt_storage_event_describe names one flag at a time, so each set bit is
+ * described on its own. The loop stops when bit has shifted past the top
+ * of an unsigned and become 0. */
+void gt_storage_log_events(gt_storage_log_fn log, void *log_ctx, unsigned events)
 {
     if (log == NULL) {
         return;
@@ -82,7 +82,7 @@ static frame_result read_frame(gt_storage *storage, int conn_fd, gt_storage_log_
     }
     unsigned events = 0;
     gt_rx_action action = gt_storage_rx(storage, buf, (long)len, monotonic_ms(), &events);
-    log_events(log, log_ctx, events);
+    gt_storage_log_events(log, log_ctx, events);
     return action == GT_RX_KEEP ? FRAME_KEEP : FRAME_CLOSE;
 }
 
@@ -219,12 +219,12 @@ void gt_flusher_tick(gt_flusher *flusher, uint64_t now_us, uint64_t now_ms, int 
     } else if (clock_synced) {
         flusher->logged_unsynced = 0;
     }
-    log_events(flusher->log, flusher->log_ctx, events);
+    gt_storage_log_events(flusher->log, flusher->log_ctx, events);
 
     if (gt_storage_flush_due(flusher->storage, now_ms)) {
         unsigned flush_events = 0;
         gt_storage_flush(flusher->storage, &flush_events);
-        log_events(flusher->log, flusher->log_ctx, flush_events);
+        gt_storage_log_events(flusher->log, flusher->log_ctx, flush_events);
     }
 }
 

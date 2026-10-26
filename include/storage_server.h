@@ -20,6 +20,12 @@
 typedef void (*gt_storage_log_fn)(void *log_ctx, gt_log_level level, const char *event,
                                   const char *fields);
 
+/* Log every GT_STORAGE_EV_* bit set in `events` through `log`, one call
+ * each, with reason=... as the fields where the event has one. The rx loop
+ * and the flush thread use it; storage_main uses it for its final
+ * shutdown. NULL log is a no-op. */
+void gt_storage_log_events(gt_storage_log_fn log, void *log_ctx, unsigned events);
+
 /* The rx loop, run on the process's main thread. poll() waits on three
  * things at once: the listening socket, the hub's connection (one at a
  * time) and stop_fd.
