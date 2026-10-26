@@ -737,6 +737,49 @@ gt_status gt_storage_open(const char *dir, uint64_t now_us, gt_storage **storage
     return gt_storage_open_ops(ops, ctx, now_us, 0, storage_out, info_out);
 }
 
+/* Everything but a malformed frame or a disconnect keeps the connection:
+ * a refused record (old seq, full buffer) is storage's decision, not a
+ * sign the hub is broken, so closing would only force a needless
+ * reconnect. A record's bad bytes are the one append refusal that means
+ * the stream can't be trusted. */
+gt_rx_action gt_storage_rx(gt_storage *storage, const uint8_t *buf, long len,
+                           uint64_t now_ms, unsigned *events_out)
+{
+    unsigned events = 0;
+    gt_rx_action action = GT_RX_CLOSE;
+
+    if (storage != NULL && buf != NULL && len > 0) {
+        if (len != GT_REC_SIZE) {
+            events |= GT_STORAGE_EV_BAD_MESSAGE;
+        } else {
+            gt_status status = gt_storage_append(storage, buf, now_ms, &events);
+            if (status == GT_ERR_CORRUPT && !(events & GT_STORAGE_EV_SEQ_REJECTED)) {
+                events |= GT_STORAGE_EV_BAD_MESSAGE;   /* bad bytes */
+            } else {
+                action = GT_RX_KEEP;
+            }
+        }
+    }
+    if (events_out != NULL) {
+        *events_out = events;
+    }
+    return action;
+}
+
+/* The same lock-through-const cast as gt_storage_read_stats. */
+gt_status gt_storage_resume(const gt_storage *storage, gt_resume *resume_out)
+{
+    if (storage == NULL || resume_out == NULL) {
+        return GT_ERR_INVAL;
+    }
+    pthread_mutex_t *lock = (pthread_mutex_t *)&storage->lock;
+    pthread_mutex_lock(lock);
+    resume_out->has_last = storage->has_last_accepted;
+    resume_out->seq = storage->has_last_accepted ? storage->last_accepted_seq : 0;
+    pthread_mutex_unlock(lock);
+    return GT_OK;
+}
+
 /* stats_out is filled under the lock so its fields all come from the same
  * moment. The lock is changed by locking, so the `const` is cast away for
  * that one call; the storage itself was never defined const, so this is

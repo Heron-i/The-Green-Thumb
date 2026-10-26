@@ -6,6 +6,7 @@
 #include "ipc.h"
 #include "log_record.h"
 #include "storage_io.h"
+#include "storage_proto.h"
 #include "storage_recover.h"
 
 #define GT_BATCH_MAX_RECORDS 64   /* N */
@@ -134,6 +135,9 @@ gt_status   gt_storage_open(const char *dir, uint64_t now_us, gt_storage **stora
 #define GT_STORAGE_EV_RETENTION_ERROR      0x800u  /* an old segment could not be deleted */
 
 #define GT_RETENTION_DAYS 30   /* segments kept: today and the 29 days before it */
+/* Event flag from gt_storage_rx (DESIGN.md failure-mode table, Storage
+ * "Malformed message on storage.sock" row). */
+#define GT_STORAGE_EV_BAD_MESSAGE          0x1000u /* wrong length or bad bytes: ipc_bad_message */
 
 /* Accept one 24 B record as it arrived on storage.sock. Under the lock it
  * is checked with gt_record_decode, then its seq with gt_seq_check against
@@ -164,6 +168,35 @@ gt_status   gt_storage_open(const char *dir, uint64_t now_us, gt_storage **stora
  * *events_out is set to 0 first; pass NULL to ignore it. */
 gt_status   gt_storage_append(gt_storage *storage, const uint8_t record[GT_REC_SIZE],
                               uint64_t now_ms, unsigned *events_out);
+/* What to do with the hub's connection after one received frame. */
+typedef enum {
+    GT_RX_KEEP,    /* go on reading from it */
+    GT_RX_CLOSE    /* close it; the hub reconnects and gets a fresh seq_resume */
+} gt_rx_action;
+
+/* Handle one frame from storage.sock. `len` is recv()'s return value, so
+ * it is signed (`long`), as in gt_ipc_frame_decode: -1 means recv()
+ * failed and 0 means the hub closed the connection. The caller recv()s
+ * into a GT_REC_SIZE + 1 buffer, because SOCK_SEQPACKET silently cuts off
+ * a message longer than the buffer; the extra byte makes an oversized
+ * frame show up as 25.
+ *   len -1 or 0           CLOSE, no event (a disconnect, not a bad message)
+ *   any other len but 24  CLOSE + GT_STORAGE_EV_BAD_MESSAGE
+ *   24                    gt_storage_append: bad bytes are CLOSE +
+ *                         BAD_MESSAGE; everything else is KEEP, with
+ *                         append's events (a duplicate seq or a full
+ *                         buffer is refused, but the hub is fine, so the
+ *                         connection stays)
+ * NULL storage or buf is CLOSE with no event. *events_out is set to 0
+ * first; pass NULL to ignore it. */
+gt_rx_action gt_storage_rx(gt_storage *storage, const uint8_t *buf, long len,
+                           uint64_t now_ms, unsigned *events_out);
+
+/* Fill *resume_out with the seq_resume reply for a newly connected hub:
+ * the last accepted seq (see storage_proto.h for why not the last
+ * committed). GT_ERR_INVAL for NULL args. */
+gt_status   gt_storage_resume(const gt_storage *storage, gt_resume *resume_out);
+
 /* 1 if a flush is due (GT_BATCH_MAX_RECORDS records pending, or the oldest
  * pending record is GT_BATCH_MAX_AGE_S old; see gt_pending_due), else 0.
  * now_ms is the same monotonic clock passed to append. 0 for NULL. */
