@@ -57,6 +57,8 @@ typedef struct {
     int      has_last_committed;
     uint32_t last_committed_seq;   /* newest record on disk */
     int      degraded;             /* 1 from a failed flush until one succeeds */
+    unsigned backlog_percent;      /* highest threshold reached now: 0, 50, 75 or 90 */
+    uint64_t refused;              /* readings refused because the buffer was full */
 } gt_storage_stats;
 
 /* Open storage over the directory behind ops/ctx, running recovery before
@@ -116,6 +118,10 @@ gt_status   gt_storage_recover(const char *segment_path, size_t *removed_records
 #define GT_STORAGE_EV_FSYNC_ERROR  0x8u   /* fsync failed: fsync_error */
 #define GT_STORAGE_EV_DEGRADED     0x10u  /* just became degraded: storage_degraded */
 #define GT_STORAGE_EV_RECOVERED    0x20u  /* first good flush after degraded: storage_recovered */
+/* Event flags from gt_storage_append for a filling buffer (DESIGN.md
+ * failure-mode table, Storage "backlog fills during an outage" row). */
+#define GT_STORAGE_EV_BACKLOG      0x40u  /* just crossed 50/75/90% going up: storage_backlog */
+#define GT_STORAGE_EV_QUEUE_FULL   0x80u  /* first refusal while full: storage_degraded */
 
 /* Accept one 24 B record as it arrived on storage.sock. Under the lock it
  * is checked with gt_record_decode, then its seq with gt_seq_check against
@@ -129,11 +135,21 @@ gt_status   gt_storage_recover(const char *segment_path, size_t *removed_records
  *                  duplicate or old seq (keep the connection); with no
  *                  event the bytes were bad (log ipc_bad_message and close
  *                  the connection).
- *   GT_ERR_FULL    refused: no room for it (or for it and its GAP).
- *                  Mechanism D Step 10 adds counting and a GAP for these.
+ *   GT_ERR_FULL    refused: no room for it (or for it and its GAP), and
+ *                  counted in gt_storage_stats.refused. The first refusal
+ *                  of a "full episode" adds GT_STORAGE_EV_QUEUE_FULL; the
+ *                  episode ends when a record is accepted again.
  *   GT_ERR_INVAL   NULL storage or record.
  * Nothing is stored on any refusal, and the last accepted seq is
- * unchanged. *events_out is set to 0 first; pass NULL to ignore it. */
+ * unchanged. That is what makes refused readings explicit: the next
+ * accepted record skips their seqs, so a GAP starting at the first
+ * refused seq goes in before it (DESIGN.md "Gaps created by storage use
+ * the seq of the first refused reading").
+ *
+ * GT_STORAGE_EV_BACKLOG is added when an accepted record takes the buffer
+ * across 50%, 75% or 90% going up (pending * 100 >= capacity * threshold).
+ * A flush that drains it below a threshold re-arms it, silently.
+ * *events_out is set to 0 first; pass NULL to ignore it. */
 gt_status   gt_storage_append(gt_storage *storage, const uint8_t record[GT_REC_SIZE],
                               uint64_t now_ms, unsigned *events_out);
 /* 1 if a flush is due (GT_BATCH_MAX_RECORDS records pending, or the oldest

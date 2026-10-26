@@ -146,6 +146,8 @@ struct gt_storage {
     int                has_last_committed;
     uint32_t           last_committed_seq;
     int                degraded;            /* 1 from a failed flush until one succeeds */
+    unsigned           backlog_percent;     /* 0, 50, 75 or 90 */
+    uint64_t           refused;             /* readings refused because the buffer was full */
 };
 
 /* Close the active segment, free everything and destroy ctx: the one
@@ -578,6 +580,8 @@ gt_status gt_storage_read_stats(const gt_storage *storage, gt_storage_stats *sta
     stats_out->has_last_committed = storage->has_last_committed;
     stats_out->last_committed_seq = storage->last_committed_seq;
     stats_out->degraded = storage->degraded;
+    stats_out->backlog_percent = storage->backlog_percent;
+    stats_out->refused = storage->refused;
     pthread_mutex_unlock(lock);
     return GT_OK;
 }

@@ -180,7 +180,8 @@ static void test_sap07_skip_after_restart(void)
 }
 
 /* ---- SAP-08: a full buffer refuses ----
- * Capacity 8: the 9th record is refused and nothing changes. */
+ * Capacity 8: the 9th record is refused and nothing changes. It is the
+ * first refusal of this full episode, so it reports QUEUE_FULL. */
 static void test_sap08_full_refuses(void)
 {
     gt_storage *storage = open_storage(0);
@@ -189,14 +190,15 @@ static void test_sap08_full_refuses(void)
     for (uint32_t seq = 1; seq <= TEST_CAPACITY; seq++) {
         append_expect(storage, seq, GT_OK, 0);
     }
-    append_expect(storage, TEST_CAPACITY + 1, GT_ERR_FULL, 0);
+    append_expect(storage, TEST_CAPACITY + 1, GT_ERR_FULL, GT_STORAGE_EV_QUEUE_FULL);
     check_accepted(storage, TEST_CAPACITY, TEST_CAPACITY);
     gt_storage_close(storage);
 }
 
 /* ---- SAP-09: no room for the GAP refuses both ----
  * 7 of 8 slots used, then a skip: the record would fit but its GAP would
- * not, so neither goes in. The next seq still fits. */
+ * not, so neither goes in (a QUEUE_FULL refusal, like SAP-08). The next
+ * seq still fits. */
 static void test_sap09_no_room_for_gap(void)
 {
     gt_storage *storage = open_storage(0);
@@ -205,7 +207,7 @@ static void test_sap09_no_room_for_gap(void)
     for (uint32_t seq = 1; seq < TEST_CAPACITY; seq++) {
         append_expect(storage, seq, GT_OK, 0);
     }
-    append_expect(storage, TEST_CAPACITY + 2, GT_ERR_FULL, 0);
+    append_expect(storage, TEST_CAPACITY + 2, GT_ERR_FULL, GT_STORAGE_EV_QUEUE_FULL);
     check_accepted(storage, TEST_CAPACITY - 1, TEST_CAPACITY - 1);
     append_expect(storage, TEST_CAPACITY, GT_OK, 0);
     check_accepted(storage, TEST_CAPACITY, TEST_CAPACITY);
