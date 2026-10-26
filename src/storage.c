@@ -149,6 +149,7 @@ struct gt_storage {
     unsigned           backlog_percent;     /* 0, 50, 75 or 90 */
     uint64_t           refused;             /* readings refused because the buffer was full */
     int                full_episode;        /* 1 from a full refusal until a record is accepted */
+    uint64_t           segments_deleted;    /* by retention, since open */
 };
 
 /* Close the active segment, free everything and destroy ctx: the one
@@ -626,6 +627,7 @@ gt_status gt_storage_read_stats(const gt_storage *storage, gt_storage_stats *sta
     stats_out->degraded = storage->degraded;
     stats_out->backlog_percent = storage->backlog_percent;
     stats_out->refused = storage->refused;
+    stats_out->segments_deleted = storage->segments_deleted;
     pthread_mutex_unlock(lock);
     return GT_OK;
 }

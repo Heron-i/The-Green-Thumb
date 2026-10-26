@@ -61,6 +61,7 @@ typedef struct {
     int      fail_fsync_dir_call;
     int      fail_rename_call;
     int      fail_list_call;
+    int      fail_unlink_call;
 
     /* Call counts, failed calls included. */
     int      open_calls;
@@ -357,6 +358,9 @@ static inline gt_status fake_fs_unlink(void *ctx, const char *name)
     fs->unlink_calls++;
     if (!fake_fs_name_ok(name)) {
         return GT_ERR_INVAL;
+    }
+    if (fs->unlink_calls == fs->fail_unlink_call) {
+        return GT_ERR_IO;
     }
     int slot = fake_fs_find_slot(fs, name);
     if (slot < 0) {

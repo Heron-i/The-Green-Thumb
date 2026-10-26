@@ -59,6 +59,7 @@ typedef struct {
     int      degraded;             /* 1 from a failed flush until one succeeds */
     unsigned backlog_percent;      /* highest threshold reached now: 0, 50, 75 or 90 */
     uint64_t refused;              /* readings refused because the buffer was full */
+    uint64_t segments_deleted;     /* old segments removed by retention since open */
 } gt_storage_stats;
 
 /* Open storage over the directory behind ops/ctx, running recovery before
@@ -122,6 +123,15 @@ gt_status   gt_storage_recover(const char *segment_path, size_t *removed_records
  * failure-mode table, Storage "backlog fills during an outage" row). */
 #define GT_STORAGE_EV_BACKLOG      0x40u  /* just crossed 50/75/90% going up: storage_backlog */
 #define GT_STORAGE_EV_QUEUE_FULL   0x80u  /* first refusal while full: storage_degraded */
+/* Event flags from gt_storage_rollover (DESIGN.md "With what retention",
+ * and the failure-mode table's segment_create_error, retention_skipped
+ * and retention_error rows). */
+#define GT_STORAGE_EV_ROLLOVER             0x100u  /* a new day's segment was created */
+#define GT_STORAGE_EV_SEGMENT_CREATE_ERROR 0x200u  /* it could not be: segment_create_error */
+#define GT_STORAGE_EV_RETENTION_SKIPPED    0x400u  /* clock unsynced: retention_skipped */
+#define GT_STORAGE_EV_RETENTION_ERROR      0x800u  /* an old segment could not be deleted */
+
+#define GT_RETENTION_DAYS 30   /* segments kept: today and the 29 days before it */
 
 /* Accept one 24 B record as it arrived on storage.sock. Under the lock it
  * is checked with gt_record_decode, then its seq with gt_seq_check against
@@ -182,6 +192,41 @@ int         gt_storage_flush_due(gt_storage *storage, uint64_t now_ms);
  *   GT_ERR_INVAL NULL storage
  * *events_out is set to 0 first; pass NULL to ignore it. */
 gt_status   gt_storage_flush(gt_storage *storage, unsigned *events_out);
+/* Daily rollover and retention. The flush thread calls this just before
+ * each flush, and only that thread may call it (it changes the active
+ * segment, which only the flushing thread touches).
+ *   1. If clock_synced is 0, do nothing and report RETENTION_SKIPPED
+ *      (DESIGN.md: skip rollover and retention while the clock is
+ *      unsynced; keep appending to the current segment). Storage can't
+ *      tell for itself: storage_main passes what adjtimex says.
+ *   2. If the UTC day of now_us is later than the active segment's,
+ *      create today's segment (header, fsync, fsync_dir, as in open) and
+ *      make it active: ROLLOVER. Pending records go into it at the next
+ *      flush. If the day is the same or earlier (the clock went back),
+ *      keep the active segment.
+ *   3. Only right after a rollover, delete old segments. A segment is
+ *      deleted only if BOTH its date is before the window (today and the
+ *      retention_days - 1 days before it) AND it is not one of the newest
+ *      retention_days segments. The second rule means a clock that jumps
+ *      years ahead can't wipe out the history: retention only ever trims
+ *      beyond retention_days files. The active segment, .corrupt files
+ *      and every other non-segment file are never deleted.
+ * retention_days 0 means GT_RETENTION_DAYS; tests pass a small number.
+ *
+ * Known limitation: a Pi that boots with no network time and an empty
+ * log starts writing log-19700101.bin. That file is outside the window
+ * at once, but the newest-N rule keeps it until N newer segments exist.
+ *   GT_OK        done (also for "nothing to do" and RETENTION_SKIPPED). A
+ *                failed delete adds RETENTION_ERROR and the rest go on:
+ *                history is never at risk.
+ *   GT_ERR_IO    today's segment could not be created:
+ *                SEGMENT_CREATE_ERROR; the old segment stays active, and
+ *                the next call tries again
+ *   GT_ERR_INVAL NULL storage, or a now_us past the year 9999
+ * *events_out is set to 0 first; pass NULL to ignore it. */
+gt_status   gt_storage_rollover(gt_storage *storage, uint64_t now_us, int clock_synced,
+                                unsigned retention_days, unsigned *events_out);
+
 /* Clean shutdown (DESIGN.md "On SIGTERM, the flush thread commits whatever
  * is buffered, then writes a clean-shutdown marker"): flush every pending
  * record, then create GT_STORAGE_MARKER_NAME and fsync_dir so the marker
