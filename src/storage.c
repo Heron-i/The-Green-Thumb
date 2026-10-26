@@ -723,6 +723,20 @@ gt_status gt_storage_shutdown(gt_storage *storage, unsigned *events_out)
     return status;
 }
 
+/* The real directory: the Linux file ops, then the same open as tests use.
+ * If storage_out is NULL, gt_storage_open_ops still destroys the ctx. */
+gt_status gt_storage_open(const char *dir, uint64_t now_us, gt_storage **storage_out,
+                          gt_storage_open_info *info_out)
+{
+    const gt_file_ops *ops = NULL;
+    void *ctx = NULL;
+    gt_status status = gt_file_ops_linux(dir, &ops, &ctx);
+    if (status != GT_OK) {
+        return status;
+    }
+    return gt_storage_open_ops(ops, ctx, now_us, 0, storage_out, info_out);
+}
+
 /* stats_out is filled under the lock so its fields all come from the same
  * moment. The lock is changed by locking, so the `const` is cast away for
  * that one call; the storage itself was never defined const, so this is

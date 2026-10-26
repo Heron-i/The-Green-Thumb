@@ -105,10 +105,12 @@ gt_status   gt_storage_open_ops(const gt_file_ops *ops, void *ctx, uint64_t now_
 /* Copy the counters into *stats_out. GT_ERR_INVAL for NULL args. */
 gt_status   gt_storage_read_stats(const gt_storage *storage, gt_storage_stats *stats_out);
 
-/* Opens the segment dir and runs recovery before accepting data. */
-gt_storage *gt_storage_open(const char *dir);
-/* Scan one segment; truncate at the first bad record. */
-gt_status   gt_storage_recover(const char *segment_path, size_t *removed_records);
+/* gt_storage_open_ops over the real directory `dir`, through
+ * gt_file_ops_linux, with the default 1 MB pending buffer. What storage_main
+ * calls; tests use gt_storage_open_ops with tests/fake_file.h instead.
+ * Returns what gt_file_ops_linux or gt_storage_open_ops returns. */
+gt_status   gt_storage_open(const char *dir, uint64_t now_us, gt_storage **storage_out,
+                            gt_storage_open_info *info_out);
 /* Event flags from gt_storage_append, one bit each like GT_IPC_EV_*; the
  * caller logs the matching event name. */
 #define GT_STORAGE_EV_SEQ_REJECTED 0x1u   /* a duplicate or old seq: log seq_rejected */

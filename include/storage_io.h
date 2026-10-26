@@ -68,4 +68,15 @@ typedef struct {
     void      (*destroy)(void *ctx);
 } gt_file_ops;
 
+/* Linux impl (src/storage_file.c): opens the directory `dir` (e.g.
+ * "/var/lib/plantpi") once and keeps it open in the ctx; every op then
+ * works on names inside it. A name containing '/' or equal to "." or ".."
+ * is GT_ERR_INVAL, so storage can never reach outside its directory.
+ * GT_ERR_INVAL for a NULL/empty dir; GT_ERR_IO if dir can't be opened (it
+ * must already exist: making /var/lib/plantpi is storage_main's job);
+ * GT_ERR_NOMEM if the ctx can't be allocated. Outputs are untouched on
+ * failure. The two outputs are pointer-to-pointer, as in
+ * gt_ipc_sock_linux (ipc_sock.h). */
+gt_status gt_file_ops_linux(const char *dir, const gt_file_ops **ops_out, void **ctx_out);
+
 #endif
