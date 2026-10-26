@@ -203,7 +203,12 @@ gt_status   gt_storage_flush(gt_storage *storage, unsigned *events_out);
  *      create today's segment (header, fsync, fsync_dir, as in open) and
  *      make it active: ROLLOVER. Pending records go into it at the next
  *      flush. If the day is the same or earlier (the clock went back),
- *      keep the active segment.
+ *      keep the active segment. If storage is degraded, the old segment
+ *      may end in torn bytes from the failed flush, and recovery only
+ *      ever repairs the newest segment, so the old one is first cut back
+ *      to its committed offset and fsynced. If that cut fails, there is
+ *      no rollover this time (WRITE_ERROR, GT_ERR_IO); the next call
+ *      tries again.
  *   3. Only right after a rollover, delete old segments. A segment is
  *      deleted only if BOTH its date is before the window (today and the
  *      retention_days - 1 days before it) AND it is not one of the newest
@@ -219,9 +224,10 @@ gt_status   gt_storage_flush(gt_storage *storage, unsigned *events_out);
  *   GT_OK        done (also for "nothing to do" and RETENTION_SKIPPED). A
  *                failed delete adds RETENTION_ERROR and the rest go on:
  *                history is never at risk.
- *   GT_ERR_IO    today's segment could not be created:
- *                SEGMENT_CREATE_ERROR; the old segment stays active, and
- *                the next call tries again
+ *   GT_ERR_IO    today's segment could not be created
+ *                (SEGMENT_CREATE_ERROR), or a degraded old segment could
+ *                not be cut back (WRITE_ERROR); the old segment stays
+ *                active, and the next call tries again
  *   GT_ERR_INVAL NULL storage, or a now_us past the year 9999
  * *events_out is set to 0 first; pass NULL to ignore it. */
 gt_status   gt_storage_rollover(gt_storage *storage, uint64_t now_us, int clock_synced,

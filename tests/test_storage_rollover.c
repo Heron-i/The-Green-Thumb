@@ -9,9 +9,10 @@
  * segments are deleted only when outside the window and not among the
  * newest N, so a clock that jumps years ahead can't wipe the history.
  * Non-segment files are never deleted, and a failed delete is reported
- * while the others still go. Uses tests/fake_file.h with a 3-day window
- * (the fake holds 8 files). Run under make test / asan / memcheck.
- * Implements SRO-01 through SRO-10.
+ * while the others still go. A rollover while degraded first cuts the old
+ * segment's torn tail, or waits if it can't. Uses tests/fake_file.h with a
+ * 3-day window (the fake holds 8 files). Run under make test / asan /
+ * memcheck. Implements SRO-01 through SRO-12.
  *
  * What these tests cannot prove: a real midnight on the Pi during the
  * soak, or how storage_main learns the clock is synced (Step 12d). */
@@ -284,6 +285,71 @@ static void test_sro09_failed_delete_reported(void)
     gt_storage_close(storage);
 }
 
+/* Open today, append records 1 and 2, and make their flush fail with 10
+ * torn bytes left at the end of today's segment: storage is degraded. */
+static gt_storage *open_degraded_with_torn_tail(const gt_file_ops *ops)
+{
+    gt_storage *storage = open_today(ops);
+    /* invariant: records 1 .. seq - 1 are pending */
+    for (uint32_t seq = 1; seq <= 2; seq++) {
+        const gt_record record = {
+            .type = GT_REC_DATA, .sensor_id = GT_SENSOR_LIGHT,
+            .seq = seq, .timestamp_us = 100 + seq, .value = seq,
+        };
+        uint8_t wire[GT_REC_SIZE];
+        CHECK_EQ(gt_record_encode(&record, wire), GT_OK);
+        CHECK_EQ(gt_storage_append(storage, wire, 0, NULL), GT_OK);
+    }
+    fs.fail_pwrite_call = fs.pwrite_calls + 1;
+    fs.pwrite_torn_bytes = 10;
+    CHECK_EQ(gt_storage_flush(storage, NULL), GT_ERR_IO);
+    CHECK_EQ(fake_fs_file(&fs, TODAY_NAME)->len, GT_SEG_HEADER_SZ + 10);
+    CHECK_EQ(read_stats(storage).degraded, 1);
+    return storage;
+}
+
+/* ---- SRO-11: a degraded rollover cuts the old tail ----
+ * Midnight arrives while a flush has failed. Yesterday's segment is cut
+ * back to its committed length (just the header) and fsynced before the
+ * switch, since recovery would never repair a segment that is no longer
+ * the newest. The pending records then land in the new segment. */
+static void test_sro11_degraded_rollover_cuts_tail(void)
+{
+    const gt_file_ops *ops = fake_fs_ops(&fs);
+    gt_storage *storage = open_degraded_with_torn_tail(ops);
+
+    rollover_expect(storage, TOMORROW_US, 1, GT_OK, GT_STORAGE_EV_ROLLOVER);
+    const fake_file *yesterday = fake_fs_file(&fs, TODAY_NAME);
+    CHECK_EQ(yesterday->len, GT_SEG_HEADER_SZ);
+    CHECK_EQ(yesterday->synced_len, GT_SEG_HEADER_SZ);
+
+    unsigned events = 0;
+    CHECK_EQ(gt_storage_flush(storage, &events), GT_OK);
+    CHECK_EQ(events, GT_STORAGE_EV_RECOVERED);
+    CHECK_EQ(fake_fs_file(&fs, TOMORROW_NAME)->synced_len, GT_SEG_HEADER_SZ + 2 * GT_REC_SIZE);
+    gt_storage_close(storage);
+}
+
+/* ---- SRO-12: a failed tail cut delays the rollover ----
+ * If the torn bytes can't be cut, the switch would strand them for good,
+ * so it waits: WRITE_ERROR, GT_ERR_IO, no new segment, the old one still
+ * active. The next call cuts and rolls over. */
+static void test_sro12_failed_cut_delays_rollover(void)
+{
+    const gt_file_ops *ops = fake_fs_ops(&fs);
+    gt_storage *storage = open_degraded_with_torn_tail(ops);
+    fs.fail_ftruncate_call = fs.ftruncate_calls + 1;
+
+    rollover_expect(storage, TOMORROW_US, 1, GT_ERR_IO, GT_STORAGE_EV_WRITE_ERROR);
+    CHECK(fake_fs_file(&fs, TOMORROW_NAME) == NULL);
+    CHECK_EQ(fake_fs_open_handles(&fs), 1);
+
+    rollover_expect(storage, TOMORROW_US, 1, GT_OK, GT_STORAGE_EV_ROLLOVER);
+    CHECK_EQ(fake_fs_file(&fs, TODAY_NAME)->synced_len, GT_SEG_HEADER_SZ);
+    CHECK(fake_fs_file(&fs, TOMORROW_NAME) != NULL);
+    gt_storage_close(storage);
+}
+
 /* ---- SRO-10: bad arguments are rejected ----
  * NULL storage and a year past 9999 are GT_ERR_INVAL; events_out may be
  * NULL. */
@@ -311,6 +377,8 @@ static const test_case_t tests[] = {
     {"SRO-08", "other files are never deleted", test_sro08_other_files_kept},
     {"SRO-09", "a failed delete is reported, rest go", test_sro09_failed_delete_reported},
     {"SRO-10", "bad arguments are rejected", test_sro10_bad_args},
+    {"SRO-11", "a degraded rollover cuts the old tail", test_sro11_degraded_rollover_cuts_tail},
+    {"SRO-12", "a failed tail cut delays the rollover", test_sro12_failed_cut_delays_rollover},
 };
 
 int main(void)

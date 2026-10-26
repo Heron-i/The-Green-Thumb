@@ -7,8 +7,9 @@
  *     "How records are organized");
  *   - the storage object: open (recovery, picking the active segment,
  *     creating it durably), append (check, then queue for the next
- *     flush), flush (write + fsync, the durability point), shutdown
- *     (final flush + clean-shutdown marker), stats and close.
+ *     flush), flush (write + fsync, the durability point), rollover
+ *     (a new segment each UTC day, plus retention), shutdown (final
+ *     flush + clean-shutdown marker), stats and close.
  *
  * All file access goes through the gt_file_ops seam (storage_io.h), so
  * tests run on tests/fake_file.h. */
@@ -278,32 +279,57 @@ static gt_status find_newest(gt_storage *storage,
     return GT_OK;
 }
 
-/* Steps 4 and 5 of open: make `name` the active segment. An existing one
- * is opened and appended to at its end; a new one gets its header, then
- * fsync (the header is on the card), then fsync_dir (the name is too). */
-static gt_status open_active(gt_storage *storage, const char *name, int create, uint64_t now_us)
+/* Create segment `name` durably: its header, then fsync (the header is on
+ * the card), then fsync_dir (the name is too). On GT_OK *handle_out is the
+ * open segment; on failure no handle is left open, so a caller's current
+ * segment is never disturbed. If a file of that name is already there (a
+ * half-made one from an earlier failure), it is reused and its header
+ * rewritten. */
+static gt_status create_segment(const gt_file_ops *ops, void *ctx, const char *name,
+                                uint64_t now_us, int *handle_out)
 {
-    const gt_file_ops *ops = storage->ops;
-    void *ctx = storage->ctx;
-
-    if (ops->open(ctx, name, create ? GT_FILE_CREATE : 0, &storage->handle) != GT_OK) {
-        storage->handle = -1;
+    int handle = -1;
+    if (ops->open(ctx, name, GT_FILE_CREATE, &handle) != GT_OK) {
         return GT_ERR_IO;
-    }
-    memcpy(storage->active_name, name, GT_FILE_NAME_MAX);
-
-    if (!create) {
-        return ops->size(ctx, storage->handle, &storage->committed_offset);
     }
     const gt_seg_header header = { .created_at_us = now_us };
     uint8_t header_bytes[GT_SEG_HEADER_SZ];
     if (gt_seg_header_encode(&header, header_bytes) != GT_OK
-        || ops->pwrite(ctx, storage->handle, 0, header_bytes, sizeof header_bytes) != GT_OK
-        || ops->fsync(ctx, storage->handle) != GT_OK
+        || ops->pwrite(ctx, handle, 0, header_bytes, sizeof header_bytes) != GT_OK
+        || ops->fsync(ctx, handle) != GT_OK
         || ops->fsync_dir(ctx) != GT_OK) {
+        ops->close(ctx, handle);
         return GT_ERR_IO;
     }
-    storage->committed_offset = GT_SEG_HEADER_SZ;
+    *handle_out = handle;
+    return GT_OK;
+}
+
+/* Steps 4 and 5 of open: make `name` the active segment. An existing one
+ * is opened and appended to at its end; a new one is made with
+ * create_segment. */
+static gt_status open_active(gt_storage *storage, const char *name, int create, uint64_t now_us)
+{
+    const gt_file_ops *ops = storage->ops;
+    void *ctx = storage->ctx;
+    int handle = -1;
+
+    if (create) {
+        if (create_segment(ops, ctx, name, now_us, &handle) != GT_OK) {
+            return GT_ERR_IO;
+        }
+        storage->committed_offset = GT_SEG_HEADER_SZ;
+    } else {
+        if (ops->open(ctx, name, 0, &handle) != GT_OK) {
+            return GT_ERR_IO;
+        }
+        if (ops->size(ctx, handle, &storage->committed_offset) != GT_OK) {
+            ops->close(ctx, handle);
+            return GT_ERR_IO;
+        }
+    }
+    storage->handle = handle;
+    memcpy(storage->active_name, name, GT_FILE_NAME_MAX);
     return GT_OK;
 }
 
@@ -573,6 +599,96 @@ gt_status gt_storage_flush(gt_storage *storage, unsigned *events_out)
         *events_out = events;
     }
     return GT_OK;
+}
+
+/* Step 3 of rollover: delete segments that are both before the window
+ * (older than `cutoff`, the name of the window's first day) and not among
+ * the newest retention_days segments. The active segment is never one of
+ * them, but it is checked anyway. A failed delete is reported and the
+ * others still go. */
+static void delete_old_segments(gt_storage *storage, const char *cutoff,
+                                unsigned retention_days, unsigned *events)
+{
+    char segments[GT_FILE_LIST_MAX][GT_FILE_NAME_MAX];
+    size_t segment_count = 0;
+    int marker_present = 0;   /* not used here: the marker is never deleted by retention */
+    if (list_segments(storage->ops, storage->ctx, segments, &segment_count,
+                      &marker_present) != GT_OK) {
+        *events |= GT_STORAGE_EV_RETENTION_ERROR;
+        return;
+    }
+    if (segment_count <= retention_days) {
+        return;   /* every segment is among the newest N */
+    }
+
+    /* Sorted oldest first, so the newest N are the last N: only
+     * segments[0 .. segment_count - retention_days - 1] may go.
+     * invariant: every candidate before old_index has been deleted or
+     * reported */
+    for (size_t old_index = 0; old_index < segment_count - retention_days; old_index++) {
+        const char *name = segments[old_index];
+        if (strcmp(name, cutoff) >= 0 || strcmp(name, storage->active_name) == 0) {
+            continue;
+        }
+        if (storage->ops->unlink(storage->ctx, name) != GT_OK) {
+            *events |= GT_STORAGE_EV_RETENTION_ERROR;
+            continue;
+        }
+        pthread_mutex_lock(&storage->lock);
+        storage->segments_deleted++;
+        pthread_mutex_unlock(&storage->lock);
+    }
+}
+
+/* handle, active_name and committed_offset belong to the flushing thread
+ * (see flush), so the switch to the new segment needs no lock: append
+ * never reads them. */
+gt_status gt_storage_rollover(gt_storage *storage, uint64_t now_us, int clock_synced,
+                              unsigned retention_days, unsigned *events_out)
+{
+    unsigned events = 0;
+    gt_status status = GT_OK;
+    char today[GT_FILE_NAME_MAX];
+
+    if (storage == NULL || gt_segment_name(now_us, today) != GT_OK) {
+        status = GT_ERR_INVAL;
+    } else if (!clock_synced) {
+        events |= GT_STORAGE_EV_RETENTION_SKIPPED;
+    } else if (strcmp(today, storage->active_name) > 0) {
+        int new_handle = -1;
+        if (storage->degraded
+            && (storage->ops->ftruncate(storage->ctx, storage->handle,
+                                        storage->committed_offset) != GT_OK
+                || storage->ops->fsync(storage->ctx, storage->handle) != GT_OK)) {
+            /* A failed flush may have left torn bytes at the end of the old
+             * segment. Once it stops being the newest, recovery never looks
+             * at it again, so the tail must be cut now or not at all. */
+            events |= GT_STORAGE_EV_WRITE_ERROR;
+            status = GT_ERR_IO;
+        } else if (create_segment(storage->ops, storage->ctx, today, now_us,
+                                  &new_handle) != GT_OK) {
+            events |= GT_STORAGE_EV_SEGMENT_CREATE_ERROR;
+            status = GT_ERR_IO;
+        } else {
+            storage->ops->close(storage->ctx, storage->handle);
+            storage->handle = new_handle;
+            memcpy(storage->active_name, today, GT_FILE_NAME_MAX);
+            storage->committed_offset = GT_SEG_HEADER_SZ;
+            events |= GT_STORAGE_EV_ROLLOVER;
+
+            /* The window's first day: today minus (days - 1), never before
+             * the epoch. */
+            unsigned days = retention_days != 0 ? retention_days : GT_RETENTION_DAYS;
+            uint64_t window_us = (uint64_t)(days - 1) * 86400u * 1000000u;
+            char cutoff[GT_FILE_NAME_MAX];
+            gt_segment_name(now_us > window_us ? now_us - window_us : 0, cutoff);
+            delete_old_segments(storage, cutoff, days, &events);
+        }
+    }
+    if (events_out != NULL) {
+        *events_out = events;
+    }
+    return status;
 }
 
 /* The marker is an empty file, so only its directory entry has to be
