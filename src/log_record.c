@@ -7,10 +7,14 @@
  * 0-19 is what lets the startup recovery scan (DESIGN.md "What happens when
  * the power dies mid-write") spot a torn or damaged record and truncate there.
  *
+ * The 16 B segment header that starts every segment file is packed here
+ * too, the same way.
+ *
  * Pure byte packing and arithmetic: no files or sockets. */
 #include "log_record.h"
 
 #include <stddef.h>
+#include <string.h>
 
 /* The standard CRC-32 polynomial (zlib, Ethernet, PNG) in reflected form:
  * bits are processed lowest first, so the polynomial is bit-reversed. */
@@ -52,6 +56,19 @@ static uint64_t get_u64_le(const uint8_t *in)
          | ((uint64_t)get_u32_le(&in[4]) << 32);
 }
 
+/* Write `value` into out[0..1], lowest byte first. */
+static void put_u16_le(uint8_t *out, uint16_t value)
+{
+    out[0] = (uint8_t)(value);
+    out[1] = (uint8_t)(value >> 8);
+}
+
+/* Read in[0..1], lowest byte first. */
+static uint16_t get_u16_le(const uint8_t *in)
+{
+    return (uint16_t)(in[0] | (in[1] << 8));
+}
+
 /* Whether type and sensor_id are allowed in a record: DATA or GAP, from the
  * light or soil sensor. GT_SENSOR_ALL is allowed only in a GAP, because
  * storage records one gap for every sensor when its own queue is full; a
@@ -88,6 +105,45 @@ uint32_t gt_crc32(const void *buf, size_t len)
         }
     }
     return crc ^ 0xFFFFFFFFu;
+}
+
+/* The magic is 4 ASCII bytes with no NUL; GT_SEG_MAGIC is a C string
+ * literal, so it also has a hidden NUL at index 4 that is never written. */
+#define SEG_MAGIC_LEN 4
+
+/* Pack `header` into the 16 bytes in `out`: magic, version, record_size,
+ * then created_at. GT_ERR_INVAL on NULL args, with `out` untouched. */
+gt_status gt_seg_header_encode(const gt_seg_header *header, uint8_t out[GT_SEG_HEADER_SZ])
+{
+    if (header == NULL || out == NULL) {
+        return GT_ERR_INVAL;
+    }
+
+    memcpy(&out[0], GT_SEG_MAGIC, SEG_MAGIC_LEN);
+    put_u16_le(&out[4], GT_SEG_VERSION);
+    put_u16_le(&out[6], GT_REC_SIZE);
+    put_u64_le(&out[8], header->created_at_us);
+    return GT_OK;
+}
+
+/* Unpack 16 bytes from `in` into `header`. The header has no CRC, so all
+ * three fixed fields must match before created_at is trusted; `header` is
+ * written only once they do. GT_ERR_INVAL on NULL args; GT_ERR_CORRUPT on
+ * a bad magic, version or record_size (recovery renames that segment to
+ * .corrupt). */
+gt_status gt_seg_header_decode(const uint8_t in[GT_SEG_HEADER_SZ], gt_seg_header *header)
+{
+    if (in == NULL || header == NULL) {
+        return GT_ERR_INVAL;
+    }
+    if (memcmp(&in[0], GT_SEG_MAGIC, SEG_MAGIC_LEN) != 0
+        || get_u16_le(&in[4]) != GT_SEG_VERSION
+        || get_u16_le(&in[6]) != GT_REC_SIZE) {
+        return GT_ERR_CORRUPT;
+    }
+
+    header->created_at_us = get_u64_le(&in[8]);
+    return GT_OK;
 }
 
 /* Bytes 0-19 are covered by the CRC; the CRC itself sits at 20-23. */

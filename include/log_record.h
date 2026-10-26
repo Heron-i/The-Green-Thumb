@@ -37,6 +37,30 @@ typedef struct {
     uint32_t value;      /* DATA: raw count; GAP: refused-reading count */
 } gt_record;
 
+/* 16 B segment header: written once at the start of each segment file
+ * (DESIGN.md "Segment header"), before any record.
+ *
+ * Wire layout, little-endian, written byte by byte like the record:
+ *   off 0  magic        GT_SEG_MAGIC, the 4 ASCII bytes "GTLG" (no NUL)
+ *   off 4  version      u16, GT_SEG_VERSION
+ *   off 6  record_size  u16, GT_REC_SIZE
+ *   off 8  created_at   u64, us since epoch
+ * The header has no CRC: recovery trusts it only if magic, version and
+ * record_size all match. Magic, version and record_size are not struct
+ * fields, because they are always the same. */
+typedef struct {
+    uint64_t created_at_us;
+} gt_seg_header;
+
+/* Write `header` as 16 bytes into `out`. GT_ERR_INVAL for NULL args;
+ * `out` is untouched on failure. */
+gt_status gt_seg_header_encode(const gt_seg_header *header, uint8_t out[GT_SEG_HEADER_SZ]);
+
+/* Read 16 bytes into `header`. GT_ERR_CORRUPT for a bad magic, version or
+ * record_size, and GT_ERR_INVAL for NULL args; `header` is untouched on
+ * failure. */
+gt_status gt_seg_header_decode(const uint8_t in[GT_SEG_HEADER_SZ], gt_seg_header *header);
+
 /* Standard CRC-32 (the one zlib and Ethernet use) over `len` bytes of `buf`.
  * `const void *` means "a pointer to bytes of any type, read-only". */
 uint32_t  gt_crc32(const void *buf, size_t len);
