@@ -49,6 +49,7 @@ typedef struct {
     uint32_t last_accepted_seq;    /* newest record accepted (maybe still pending) */
     int      has_last_committed;
     uint32_t last_committed_seq;   /* newest record on disk */
+    int      degraded;             /* 1 from a failed flush until one succeeds */
 } gt_storage_stats;
 
 /* Open storage over the directory behind ops/ctx, running recovery before
@@ -96,6 +97,12 @@ gt_status   gt_storage_recover(const char *segment_path, size_t *removed_records
  * caller logs the matching event name. */
 #define GT_STORAGE_EV_SEQ_REJECTED 0x1u   /* a duplicate or old seq: log seq_rejected */
 #define GT_STORAGE_EV_RECOVERY_GAP 0x2u   /* seqs were missing: log recovery_gap */
+/* Event flags from gt_storage_flush (DESIGN.md failure-mode table,
+ * Storage "write() or fsync() fails" row). */
+#define GT_STORAGE_EV_WRITE_ERROR  0x4u   /* write or truncate failed: storage_write_error */
+#define GT_STORAGE_EV_FSYNC_ERROR  0x8u   /* fsync failed: fsync_error */
+#define GT_STORAGE_EV_DEGRADED     0x10u  /* just became degraded: storage_degraded */
+#define GT_STORAGE_EV_RECOVERED    0x20u  /* first good flush after degraded: storage_recovered */
 
 /* Accept one 24 B record as it arrived on storage.sock. Under the lock it
  * is checked with gt_record_decode, then its seq with gt_seq_check against
@@ -129,13 +136,23 @@ int         gt_storage_flush_due(gt_storage *storage, uint64_t now_ms);
  * A record is committed once this returns GT_OK. Records appended while
  * the write is running stay pending for the next flush. Only one thread
  * may flush at a time (the flush thread).
+ *
+ * Failures never lose or duplicate a record. A failed write or fsync
+ * keeps every record pending and marks storage degraded. The next flush
+ * first truncates the segment back to the committed offset, cutting off
+ * any partly written (torn) bytes, then writes the records again and
+ * fsyncs, so the file never holds a partial record or the same record
+ * twice.
  *   GT_OK        committed (also when nothing was pending: then nothing
- *                is written and nothing fsynced)
- *   GT_ERR_IO    the write or fsync failed; every record stays pending.
- *                Mechanism D Step 8 adds the degraded state and the
- *                truncate-back before the retry.
- *   GT_ERR_INVAL NULL storage */
-gt_status   gt_storage_flush(gt_storage *storage);
+ *                is written and nothing fsynced). GT_STORAGE_EV_RECOVERED
+ *                if storage was degraded.
+ *   GT_ERR_IO    the truncate, write or fsync failed; every record stays
+ *                pending. GT_STORAGE_EV_WRITE_ERROR (truncate or write) or
+ *                GT_STORAGE_EV_FSYNC_ERROR, plus GT_STORAGE_EV_DEGRADED
+ *                the first time only.
+ *   GT_ERR_INVAL NULL storage
+ * *events_out is set to 0 first; pass NULL to ignore it. */
+gt_status   gt_storage_flush(gt_storage *storage, unsigned *events_out);
 /* Close the segment, free everything and call ops->destroy(ctx) once.
  * For now it does not flush: pending records are dropped (Mechanism D
  * Step 9 makes close flush and write the clean-shutdown marker). NULL is

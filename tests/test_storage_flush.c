@@ -112,7 +112,7 @@ static void test_sfl01_flushed_records_durable(void)
     append_ok(storage, 3, 0);
     int pwrites_before = fs.pwrite_calls, fsyncs_before = fs.fsync_calls;
 
-    CHECK_EQ(gt_storage_flush(storage), GT_OK);
+    CHECK_EQ(gt_storage_flush(storage, NULL), GT_OK);
     CHECK_EQ(fs.pwrite_calls - pwrites_before, 1);
     CHECK_EQ(fs.fsync_calls - fsyncs_before, 1);
     check_segment_holds(1, 3);
@@ -145,7 +145,7 @@ static void test_sfl03_gap_before_record(void)
     append_ok(storage, 1, 0);
     append_ok(storage, 4, 0);
 
-    CHECK_EQ(gt_storage_flush(storage), GT_OK);
+    CHECK_EQ(gt_storage_flush(storage, NULL), GT_OK);
     const fake_file *file = fake_fs_file(&fs, TODAY_NAME);
     CHECK_EQ(file->synced_len, RECORD_OFFSET(3));
     check_record_at(file->synced_data, 0, 1);
@@ -171,7 +171,7 @@ static void test_sfl04_empty_flush_noop(void)
     gt_storage *storage = open_storage(ops, TEST_CAPACITY);
     int pwrites_before = fs.pwrite_calls, fsyncs_before = fs.fsync_calls;
 
-    CHECK_EQ(gt_storage_flush(storage), GT_OK);
+    CHECK_EQ(gt_storage_flush(storage, NULL), GT_OK);
     CHECK_EQ(fs.pwrite_calls, pwrites_before);
     CHECK_EQ(fs.fsync_calls, fsyncs_before);
     check_committed(storage, 0, 0, 0);
@@ -188,13 +188,13 @@ static void test_sfl05_flushes_append_in_order(void)
     gt_storage *storage = open_storage(ops, TEST_CAPACITY);
     append_ok(storage, 1, 0);
     append_ok(storage, 2, 0);
-    CHECK_EQ(gt_storage_flush(storage), GT_OK);
+    CHECK_EQ(gt_storage_flush(storage, NULL), GT_OK);
 
     append_ok(storage, 3, 0);
     check_committed(storage, 1, 2, 2);
     check_segment_holds(1, 2);
 
-    CHECK_EQ(gt_storage_flush(storage), GT_OK);
+    CHECK_EQ(gt_storage_flush(storage, NULL), GT_OK);
     check_segment_holds(1, 3);
     check_committed(storage, 0, 3, 3);
     gt_storage_close(storage);
@@ -217,7 +217,7 @@ static void test_sfl06_existing_segment_grows(void)
     gt_storage *storage = open_storage(ops, TEST_CAPACITY);
     append_ok(storage, 4, 0);
 
-    CHECK_EQ(gt_storage_flush(storage), GT_OK);
+    CHECK_EQ(gt_storage_flush(storage, NULL), GT_OK);
     check_segment_holds(1, 4);
     CHECK(memcmp(fake_fs_file(&fs, TODAY_NAME)->synced_data, segment, sizeof segment) == 0);
     check_committed(storage, 0, 1, 4);
@@ -234,7 +234,7 @@ static void test_sfl07_failed_write_keeps_records(void)
     append_ok(storage, 2, 0);
     fs.fail_pwrite_call = fs.pwrite_calls + 1;
 
-    CHECK_EQ(gt_storage_flush(storage), GT_ERR_IO);
+    CHECK_EQ(gt_storage_flush(storage, NULL), GT_ERR_IO);
     check_committed(storage, 2, 0, 0);
     gt_storage_close(storage);
 }
@@ -250,7 +250,7 @@ static void test_sfl08_failed_fsync_keeps_records(void)
     append_ok(storage, 2, 0);
     fs.fail_fsync_call = fs.fsync_calls + 1;
 
-    CHECK_EQ(gt_storage_flush(storage), GT_ERR_IO);
+    CHECK_EQ(gt_storage_flush(storage, NULL), GT_ERR_IO);
     check_committed(storage, 2, 0, 0);
     CHECK_EQ(fake_fs_file(&fs, TODAY_NAME)->synced_len, GT_SEG_HEADER_SZ);
     gt_storage_close(storage);
@@ -268,7 +268,7 @@ static void test_sfl09_flush_due_rules(void)
     append_ok(storage, 1, 1000);
     CHECK_EQ(gt_storage_flush_due(storage, 1000 + AGE_LIMIT_MS - 1), 0);
     CHECK_EQ(gt_storage_flush_due(storage, 1000 + AGE_LIMIT_MS), 1);
-    CHECK_EQ(gt_storage_flush(storage), GT_OK);
+    CHECK_EQ(gt_storage_flush(storage, NULL), GT_OK);
     CHECK_EQ(gt_storage_flush_due(storage, UINT64_MAX), 0);
 
     /* invariant: records 2 .. seq - 1 are pending */
@@ -284,7 +284,7 @@ static void test_sfl09_flush_due_rules(void)
 /* ---- SFL-10: NULL storage is rejected ---- */
 static void test_sfl10_null_args(void)
 {
-    CHECK_EQ(gt_storage_flush(NULL), GT_ERR_INVAL);
+    CHECK_EQ(gt_storage_flush(NULL, NULL), GT_ERR_INVAL);
     CHECK_EQ(gt_storage_flush_due(NULL, UINT64_MAX), 0);
 }
 

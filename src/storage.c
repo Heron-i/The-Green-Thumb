@@ -145,6 +145,7 @@ struct gt_storage {
     uint32_t           last_accepted_seq;
     int                has_last_committed;
     uint32_t           last_committed_seq;
+    int                degraded;            /* 1 from a failed flush until one succeeds */
 };
 
 /* Close the active segment, free everything and destroy ctx: the one
@@ -420,11 +421,43 @@ int gt_storage_flush_due(gt_storage *storage, uint64_t now_ms)
     return due;
 }
 
-/* handle and committed_offset are read and written outside the lock: only
- * the one flushing thread ever changes them (see storage.h), and append
- * never reads them. Everything append touches is changed under the lock. */
-gt_status gt_storage_flush(gt_storage *storage)
+/* Step 2 of flush: put byte_count bytes of the flush buffer on the card.
+ * After a failed flush (degraded), the file may end in torn bytes past
+ * the committed offset, or hold a full copy that was never fsynced, so
+ * it is first cut back to the committed offset. Writing on top of torn
+ * bytes is never allowed: if the cut fails, nothing is written. Returns
+ * GT_OK, or GT_ERR_IO with WRITE_ERROR or FSYNC_ERROR added to *events. */
+static gt_status write_batch(gt_storage *storage, size_t byte_count, unsigned *events)
 {
+    const gt_file_ops *ops = storage->ops;
+
+    if (storage->degraded
+        && ops->ftruncate(storage->ctx, storage->handle, storage->committed_offset) != GT_OK) {
+        *events |= GT_STORAGE_EV_WRITE_ERROR;
+        return GT_ERR_IO;
+    }
+    if (ops->pwrite(storage->ctx, storage->handle, storage->committed_offset,
+                    storage->flush_buf, byte_count) != GT_OK) {
+        *events |= GT_STORAGE_EV_WRITE_ERROR;
+        return GT_ERR_IO;
+    }
+    if (ops->fsync(storage->ctx, storage->handle) != GT_OK) {
+        *events |= GT_STORAGE_EV_FSYNC_ERROR;
+        return GT_ERR_IO;
+    }
+    return GT_OK;
+}
+
+/* handle, committed_offset and degraded are read outside the lock: only
+ * the one flushing thread ever changes them (see storage.h), and it
+ * changes degraded under the lock so read_stats sees a consistent value.
+ * Everything append touches is changed under the lock. */
+gt_status gt_storage_flush(gt_storage *storage, unsigned *events_out)
+{
+    unsigned events = 0;
+    if (events_out != NULL) {
+        *events_out = 0;
+    }
     if (storage == NULL) {
         return GT_ERR_INVAL;
     }
@@ -443,10 +476,18 @@ gt_status gt_storage_flush(gt_storage *storage)
 
     /* 2. Write and fsync with no lock held, so append never waits on the card. */
     size_t byte_count = record_count * GT_REC_SIZE;
-    if (storage->ops->pwrite(storage->ctx, storage->handle, storage->committed_offset,
-                             storage->flush_buf, byte_count) != GT_OK
-        || storage->ops->fsync(storage->ctx, storage->handle) != GT_OK) {
-        return GT_ERR_IO;   /* the records are still pending */
+    if (write_batch(storage, byte_count, &events) != GT_OK) {
+        /* The records are still pending; mark degraded (reported once). */
+        pthread_mutex_lock(&storage->lock);
+        if (!storage->degraded) {
+            storage->degraded = 1;
+            events |= GT_STORAGE_EV_DEGRADED;
+        }
+        pthread_mutex_unlock(&storage->lock);
+        if (events_out != NULL) {
+            *events_out = events;
+        }
+        return GT_ERR_IO;
     }
 
     /* 3. They are committed: drop them and move the counters on. Every
@@ -462,7 +503,14 @@ gt_status gt_storage_flush(gt_storage *storage)
         storage->has_last_committed = 1;
         storage->last_committed_seq = last_record.seq;
     }
+    if (storage->degraded) {
+        storage->degraded = 0;
+        events |= GT_STORAGE_EV_RECOVERED;
+    }
     pthread_mutex_unlock(&storage->lock);
+    if (events_out != NULL) {
+        *events_out = events;
+    }
     return GT_OK;
 }
 
@@ -483,6 +531,7 @@ gt_status gt_storage_read_stats(const gt_storage *storage, gt_storage_stats *sta
     stats_out->last_accepted_seq = storage->last_accepted_seq;
     stats_out->has_last_committed = storage->has_last_committed;
     stats_out->last_committed_seq = storage->last_committed_seq;
+    stats_out->degraded = storage->degraded;
     pthread_mutex_unlock(lock);
     return GT_OK;
 }
