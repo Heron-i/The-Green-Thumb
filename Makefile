@@ -18,7 +18,7 @@ TEST_BINS := $(patsubst tests/%.c,$(BUILD)/%,$(TEST_SRC))
 
 VALGRIND := valgrind --leak-check=full --show-leak-kinds=all --error-exitcode=1
 
-all: $(TEST_BINS) $(BUILD)/light_probe $(BUILD)/hub_listen $(BUILD)/storage_main $(BUILD)/storage_feed
+all: $(TEST_BINS) $(BUILD)/light_probe $(BUILD)/hub_listen $(BUILD)/storage_main $(BUILD)/storage_feed $(BUILD)/log_verify
 
 $(BUILD)/%: tests/%.c $(LIB_SRC) $(HEADERS)
 	@mkdir -p $(BUILD)
@@ -56,6 +56,14 @@ $(BUILD)/storage_feed: src/storage_feed_main.c $(LIB_SRC) $(HEADERS)
 
 storage_feed: $(BUILD)/storage_feed
 
+# Offline log verifier (see src/log_verify_main.c), used after every fault
+# test. Not run by `make test`: it needs a real log directory.
+$(BUILD)/log_verify: src/log_verify_main.c $(LIB_SRC) $(HEADERS)
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) $(LIB_SRC) $< -o $@
+
+log_verify: $(BUILD)/log_verify
+
 # Every test binary runs even if an earlier one fails; failures are listed
 # at the end and the target still exits nonzero for CI.
 test: $(TEST_BINS)
@@ -79,4 +87,4 @@ memcheck: $(TEST_BINS)
 clean:
 	rm -rf build
 
-.PHONY: all test asan ubsan memcheck clean light_probe hub_listen storage_main storage_feed
+.PHONY: all test asan ubsan memcheck clean light_probe hub_listen storage_main storage_feed log_verify
