@@ -21,21 +21,20 @@
  * job in the real hub. Only one hub_listen can run per socket path: it
  * holds an fcntl lock on "<path>.lock" for its whole life, and only the
  * lock holder may remove and re-create the socket file (see
- * Sensor-Pipeline.md, Decisions). A second copy exits with
+ * Sensor-Pipeline.md, Decisions; the shared helper is listen_sock.h).
+ * A second copy exits with
  * "already running" and touches nothing.
  *
  * Usage: hub_listen /run/plantpi/hub.sock    (Ctrl-C to stop) */
 #include <errno.h>
-#include <fcntl.h>
 #include <poll.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
-#include <sys/stat.h>
-#include <sys/un.h>
 #include <unistd.h>
 
 #include "ipc.h"
+#include "listen_sock.h"
 
 /* Sensor connections served at once: light and soil, plus room for a
  * restarted sensor whose old connection hasn't been noticed closed yet. */
@@ -48,93 +47,41 @@ typedef struct {
     uint32_t expected_counter;
 } counter_track;
 
-/* Make sure this is the only hub_listen on `sock_path`, by holding an
- * exclusive lock on "<sock_path>.lock" for as long as the process runs.
- * `struct flock` describes the lock: F_WRLCK is an exclusive (write)
- * lock, and l_start = l_len = 0 covers the whole file. F_SETLK fails at
- * once (EACCES or EAGAIN) instead of waiting if another process holds it.
- * The kernel drops the lock when the holder exits for any reason,
- * kill -9 included, so a lock is never left stale; the lock file itself
- * stays and is reused. Holding the lock is what makes it safe for
- * bind_listener to remove an old socket file. One fcntl rule to know:
- * closing *any* fd this process has on the lock file releases the lock,
- * so the file is opened only here. Returns the fd that holds the lock
- * (keep it open), or -1 after printing why. */
+/* Make sure this is the only hub_listen on `sock_path` (the shared rule in
+ * listen_sock.h): hold "<sock_path>.lock" for as long as the process runs.
+ * Holding it is what makes it safe for bind_listener to remove an old
+ * socket file. Returns the fd that holds the lock (keep it open), or -1
+ * after printing why. */
 static int take_instance_lock(const char *sock_path)
 {
-    char lock_path[128];   /* a valid socket path (< 108) + ".lock" fits */
-    int needed = snprintf(lock_path, sizeof lock_path, "%s.lock", sock_path);
-    if (needed < 0 || (size_t)needed >= sizeof lock_path) {
-        fprintf(stderr, "hub_listen: socket path too long\n");
-        return -1;
+    int lock_fd = -1, already_running = 0;
+    gt_status status = gt_listen_lock(sock_path, &lock_fd, &already_running);
+    if (status == GT_ERR_INVAL) {
+        fprintf(stderr, "hub_listen: socket path must be 1..107 characters\n");
+    } else if (status != GT_OK && already_running) {
+        fprintf(stderr, "hub_listen: already running on %s (%s.lock is locked)\n",
+                sock_path, sock_path);
+    } else if (status != GT_OK) {
+        fprintf(stderr, "hub_listen: lock %s.lock: %s\n", sock_path, strerror(errno));
     }
-    int lock_fd = open(lock_path, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
-    if (lock_fd < 0) {
-        fprintf(stderr, "hub_listen: %s: %s\n", lock_path, strerror(errno));
-        return -1;
-    }
-
-    struct flock lock;
-    memset(&lock, 0, sizeof lock);
-    lock.l_type = F_WRLCK;
-    lock.l_whence = SEEK_SET;
-    lock.l_start = 0;
-    lock.l_len = 0;
-    if (fcntl(lock_fd, F_SETLK, &lock) != 0) {
-        if (errno == EACCES || errno == EAGAIN) {
-            fprintf(stderr, "hub_listen: already running on %s (%s is locked)\n",
-                    sock_path, lock_path);
-        } else {
-            fprintf(stderr, "hub_listen: lock %s: %s\n", lock_path, strerror(errno));
-        }
-        close(lock_fd);
-        return -1;
-    }
-    return lock_fd;
+    return status == GT_OK ? lock_fd : -1;
 }
 
-/* Create the listening socket at `path`. A hub_listen killed with kill -9
- * leaves its socket file behind, and bind() refuses a path that exists
- * (EADDRINUSE), so an old socket file is removed first. lstat() describes
- * the path itself without following links, and S_ISSOCK checks that it
- * really is a socket: any other kind of file is left alone and reported.
- * Call only while holding take_instance_lock: the lock proves no other
- * hub_listen is alive, so the old file can't belong to a running one.
+/* Create the listening socket at `path`, replacing a socket file left by a
+ * hub_listen killed with kill -9 (gt_listen_bind). Call only while holding
+ * take_instance_lock. The path was already checked by the lock, so
+ * GT_ERR_INVAL here means something that is not a socket is in the way.
  * Returns the listening fd, or -1 after printing why. */
 static int bind_listener(const char *path)
 {
-    struct sockaddr_un addr;
-    memset(&addr, 0, sizeof addr);
-    size_t path_len = strlen(path);
-    if (path_len == 0 || path_len >= sizeof addr.sun_path) {
-        fprintf(stderr, "hub_listen: socket path must be 1..%zu characters\n",
-                sizeof addr.sun_path - 1);
-        return -1;
-    }
-    addr.sun_family = AF_UNIX;
-    memcpy(addr.sun_path, path, path_len + 1);
-
-    struct stat info;
-    if (lstat(path, &info) == 0) {
-        if (!S_ISSOCK(info.st_mode)) {
-            fprintf(stderr, "hub_listen: %s exists and is not a socket; not removing it\n", path);
-            return -1;
-        }
-        unlink(path);
-    }
-
-    int listen_fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
-    if (listen_fd < 0) {
-        perror("hub_listen: socket");
-        return -1;
-    }
-    if (bind(listen_fd, (const struct sockaddr *)&addr, sizeof addr) != 0 ||
-        listen(listen_fd, MAX_SENSOR_CONNS) != 0) {
+    int listen_fd = -1;
+    gt_status status = gt_listen_bind(path, MAX_SENSOR_CONNS, &listen_fd);
+    if (status == GT_ERR_INVAL) {
+        fprintf(stderr, "hub_listen: %s exists and is not a socket; not removing it\n", path);
+    } else if (status != GT_OK) {
         fprintf(stderr, "hub_listen: %s: %s\n", path, strerror(errno));
-        close(listen_fd);
-        return -1;
     }
-    return listen_fd;
+    return status == GT_OK ? listen_fd : -1;
 }
 
 /* Handle one message on a connection that poll() says is readable. It
@@ -257,8 +204,6 @@ int main(int argc, char **argv)
     for (size_t conn_index = 1; conn_index < conn_count; conn_index++) {
         close(conns[conn_index].fd);
     }
-    close(listen_fd);
-    unlink(argv[1]);
-    close(lock_fd);   /* last: the socket file is removed while still locked */
+    gt_listen_release(argv[1], listen_fd, lock_fd);   /* the lock goes last */
     return 1;
 }
