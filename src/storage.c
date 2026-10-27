@@ -18,6 +18,7 @@
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "storage_pending.h"
 #include "storage_recover.h"
@@ -140,6 +141,14 @@ struct gt_storage {
 
     pthread_mutex_t    lock;
     int                lock_ready;          /* 1 once pthread_mutex_init succeeded */
+    /* due_cond is a condition variable: a place a thread can sleep, with
+     * the lock let go, until another thread signals it. The flush thread
+     * sleeps on it in gt_storage_wait_due; append signals it when a flush
+     * becomes due (PF-11). due_signal says why it woke and is guarded by
+     * `lock`, since a condition variable can also wake for no reason. */
+    pthread_cond_t     due_cond;
+    int                cond_ready;          /* 1 once pthread_cond_init succeeded */
+    int                due_signal;          /* 1 from "flush became due" (or a wake) until a wait uses it */
 
     uint64_t           committed_records;
     int                has_last_accepted;
@@ -167,6 +176,9 @@ static void free_storage(gt_storage *storage)
     if (storage->handle >= 0) {
         storage->ops->close(storage->ctx, storage->handle);
     }
+    if (storage->cond_ready) {
+        pthread_cond_destroy(&storage->due_cond);
+    }
     if (storage->lock_ready) {
         pthread_mutex_destroy(&storage->lock);
     }
@@ -174,6 +186,34 @@ static void free_storage(gt_storage *storage)
     free(storage->flush_buf);
     storage->ops->destroy(storage->ctx);
     free(storage);
+}
+
+/* The clock gt_storage_wait_due measures its deadline on. On Linux the
+ * condition variable is told to use CLOCK_MONOTONIC, so an NTP step
+ * can't stretch or cut a wait. macOS has no pthread_condattr_setclock,
+ * so there it stays on the default wall clock. */
+#ifdef __linux__
+#define WAIT_CLOCK CLOCK_MONOTONIC
+#else
+#define WAIT_CLOCK CLOCK_REALTIME
+#endif
+
+/* Make the condition variable on WAIT_CLOCK. A pthread_condattr_t holds
+ * the options for pthread_cond_init and is only needed until then.
+ * Returns 1 on success. */
+static int init_due_cond(gt_storage *storage)
+{
+    pthread_condattr_t options;
+    if (pthread_condattr_init(&options) != 0) {
+        return 0;
+    }
+    int ok = 1;
+#ifdef __linux__
+    ok = pthread_condattr_setclock(&options, WAIT_CLOCK) == 0;
+#endif
+    ok = ok && pthread_cond_init(&storage->due_cond, &options) == 0;
+    pthread_condattr_destroy(&options);
+    return ok;
 }
 
 /* The memory half of open, done before any file is touched, so running
@@ -195,8 +235,9 @@ static gt_status alloc_storage(const gt_file_ops *ops, void *ctx, size_t pending
     }
     if (storage->flush_buf != NULL && pthread_mutex_init(&storage->lock, NULL) == 0) {
         storage->lock_ready = 1;
+        storage->cond_ready = init_due_cond(storage);
     }
-    if (!storage->lock_ready) {
+    if (!storage->lock_ready || !storage->cond_ready) {
         free_storage(storage);   /* also destroys ctx: storage owns it now */
         return GT_ERR_NOMEM;
     }
@@ -503,7 +544,14 @@ gt_status gt_storage_append(gt_storage *storage, const uint8_t record[GT_REC_SIZ
         status = GT_ERR_CORRUPT;
     } else {
         pthread_mutex_lock(&storage->lock);
+        int was_due = gt_pending_due(storage->pending, now_ms);
         status = append_locked(storage, record, &decoded, now_ms, &events);
+        /* Signal only the change to due, not every append while due (see
+         * gt_storage_wait_due in storage.h): a waiting flusher wakes now. */
+        if (!was_due && gt_pending_due(storage->pending, now_ms)) {
+            storage->due_signal = 1;
+            pthread_cond_signal(&storage->due_cond);
+        }
         pthread_mutex_unlock(&storage->lock);
     }
     if (events_out != NULL) {
@@ -521,6 +569,48 @@ int gt_storage_flush_due(gt_storage *storage, uint64_t now_ms)
     int due = gt_pending_due(storage->pending, now_ms);
     pthread_mutex_unlock(&storage->lock);
     return due;
+}
+
+/* pthread_cond_timedwait takes an absolute deadline on WAIT_CLOCK, not a
+ * duration, so a wait that wakes early for no reason (allowed by POSIX)
+ * and goes back to sleep still ends on time. It lets go of the lock while
+ * asleep and takes it back before returning. */
+int gt_storage_wait_due(gt_storage *storage, unsigned max_wait_ms)
+{
+    if (storage == NULL) {
+        return 0;
+    }
+    struct timespec deadline;
+    clock_gettime(WAIT_CLOCK, &deadline);
+    deadline.tv_sec += max_wait_ms / 1000u;
+    deadline.tv_nsec += (long)(max_wait_ms % 1000u) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000000000L;
+    }
+    pthread_mutex_lock(&storage->lock);
+    /* invariant: the signal was not raised at any check so far, and every
+     * wake so far came before the deadline */
+    while (!storage->due_signal) {
+        if (pthread_cond_timedwait(&storage->due_cond, &storage->lock, &deadline) != 0) {
+            break;   /* ETIMEDOUT (or an error): stop waiting */
+        }
+    }
+    int raised = storage->due_signal;
+    storage->due_signal = 0;   /* used up: the next wait sleeps again */
+    pthread_mutex_unlock(&storage->lock);
+    return raised;
+}
+
+void gt_storage_wake(gt_storage *storage)
+{
+    if (storage == NULL) {
+        return;
+    }
+    pthread_mutex_lock(&storage->lock);
+    storage->due_signal = 1;
+    pthread_cond_signal(&storage->due_cond);
+    pthread_mutex_unlock(&storage->lock);
 }
 
 /* The storage clock in us, or 0 when none was set. */
@@ -875,6 +965,21 @@ void gt_storage_set_clock(gt_storage *storage, gt_clock_us_fn clock_us)
         return;
     }
     storage->clock_us = clock_us;
+}
+
+/* The limits live in the pending buffer, which checks them; storage only
+ * converts T to ms and holds the lock, since gt_storage_flush_due reads
+ * them under it. */
+gt_status gt_storage_set_batch(gt_storage *storage, size_t batch_records, unsigned max_age_s)
+{
+    if (storage == NULL) {
+        return GT_ERR_INVAL;
+    }
+    pthread_mutex_lock(&storage->lock);
+    gt_status status = gt_pending_set_limits(storage->pending, batch_records,
+                                             (uint64_t)max_age_s * 1000u);
+    pthread_mutex_unlock(&storage->lock);
+    return status;
 }
 
 /* stats_out is filled under the lock so its fields all come from the same

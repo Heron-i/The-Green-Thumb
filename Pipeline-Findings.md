@@ -185,6 +185,7 @@ Storage itself was correct: the feed's output file later held `seq_resume: last=
     - `log_verify [--sent A..B] DIR` prints `sent=N lost=L` and fails on a mismatch.
     - `storage_faults.sh`'s settle check uses it in place of the bash arithmetic. It still checks N = B − A + 1 (no `seq` reused) and that the log starts at A, since its log starts empty.
   - **Docs:** DESIGN.md *Test tooling → Verifier*; Sensor-Pipeline.md's Mechanism D Code map, a Decisions bullet, the `VSR` prefix and the settle-check description.
+  - **Tests:** `make test`, `make asan` and `make memcheck` all pass with VSR included (2026-10-27).
   - **Still to do:**
     - Record a `storage_faults.sh sigterm` / `kill9` run with the new check.
     - The hub logs its own sent range when it stops (hub step H8), so the same flag works on the Pi.

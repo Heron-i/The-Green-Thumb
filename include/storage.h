@@ -179,6 +179,17 @@ gt_status   gt_storage_active_segment(const gt_storage *storage, char name_out[G
  * NULL clock_us turns timing off (durations 0); NULL storage is a no-op. */
 void        gt_storage_set_clock(gt_storage *storage, gt_clock_us_fn clock_us);
 
+/* Change when a flush is due (PF-11): at batch_records records pending
+ * (N), or once the oldest has waited max_age_s seconds (T). Storage starts
+ * at GT_BATCH_MAX_RECORDS and GT_BATCH_MAX_AGE_S; storage_main sets the
+ * values from its -n / -t options, so DESIGN.md's (N, T) experiment runs
+ * on one build. Call it right after open, before the flush thread starts
+ * (like gt_storage_set_clock); it takes the lock all the same.
+ *   GT_OK        changed
+ *   GT_ERR_INVAL NULL storage, a 0 batch or age, or a batch bigger than
+ *                the pending buffer; nothing changes */
+gt_status   gt_storage_set_batch(gt_storage *storage, size_t batch_records, unsigned max_age_s);
+
 /* gt_storage_open_ops over the real directory `dir`, through
  * gt_file_ops_linux, with the default 1 MB pending buffer. What storage_main
  * calls; tests use gt_storage_open_ops with tests/fake_file.h instead.
@@ -294,6 +305,28 @@ gt_status   gt_storage_resume(const gt_storage *storage, gt_resume *resume_out);
  * pending record is GT_BATCH_MAX_AGE_S old; see gt_pending_due), else 0.
  * now_ms is the same monotonic clock passed to append. 0 for NULL. */
 int         gt_storage_flush_due(gt_storage *storage, uint64_t now_ms);
+
+/* Let the flush thread sleep until there is work (PF-11). Without this
+ * the flusher only looks once a second, so N = 1 could not mean one fsync
+ * per record. gt_storage_append raises a "flush became due" signal when an
+ * append makes gt_storage_flush_due go from 0 to 1, and wakes a waiting
+ * thread at once. The signal is raised on that change only, not while a
+ * flush stays due: after a failed flush the records are still pending, and
+ * a waiter that returned at once every time would spin retrying a broken
+ * card instead of waiting for the next 1 s tick.
+ *
+ * Wait up to max_wait_ms (a monotonic clock on Linux, so setting the wall
+ * clock can't stretch it) for the signal. Returns 1 if it was raised
+ * (also if it was raised before the call and not yet used), or
+ * gt_storage_wake was called; the signal is used up, so the next wait
+ * sleeps again. Returns 0 on timeout, and for NULL storage at once. */
+int         gt_storage_wait_due(gt_storage *storage, unsigned max_wait_ms);
+
+/* Raise the signal by hand, so a waiting flush thread returns at once.
+ * storage_main calls it on stop, after the rx loop returns: it can't be
+ * called from the signal handler, because pthread_cond_signal is not one
+ * of the few calls a handler may safely make. NULL is a no-op. */
+void        gt_storage_wake(gt_storage *storage);
 
 /* Commit every pending record (DESIGN.md "Commit sequence"):
  *   1. lock, copy the pending records into the flush buffer, unlock;

@@ -3,7 +3,8 @@
  *
  * Purpose: hold every record between storage accepting it and fsync
  * returning for it, so a failed flush loses nothing, and say when a flush
- * is due (N = 64 records or T = 60 s, DESIGN.md "How writes are batched").
+ * is due (N = 64 records or T = 60 s by default, DESIGN.md "How writes
+ * are batched"; gt_pending_set_limits changes them, PF-11).
  *
  * Layout: two arrays allocated once at create time, filled from index 0.
  * Record i's 24 bytes are at records[i * GT_REC_SIZE] and the time it was
@@ -23,6 +24,8 @@ struct gt_pending {
     size_t    count;      /* records waiting, at indexes 0 .. count - 1 */
     uint8_t  *records;    /* capacity * GT_REC_SIZE bytes */
     uint64_t *added_ms;   /* capacity add times, same order as records */
+    size_t    batch_records;   /* N: due at this many records */
+    uint64_t  max_age_ms;      /* T: due once the oldest has waited this long */
 };
 
 /* malloc returns NULL when it can't allocate, and free(NULL) is allowed,
@@ -40,6 +43,8 @@ gt_pending *gt_pending_create(size_t capacity_records)
     }
     pending->capacity = capacity_records;
     pending->count = 0;
+    pending->batch_records = GT_BATCH_MAX_RECORDS;
+    pending->max_age_ms = (uint64_t)GT_BATCH_MAX_AGE_S * 1000u;
     pending->records = malloc(capacity_records * GT_REC_SIZE);
     pending->added_ms = malloc(capacity_records * sizeof *pending->added_ms);
     if (pending->records == NULL || pending->added_ms == NULL) {
@@ -69,6 +74,20 @@ size_t gt_pending_count(const gt_pending *pending)
     return pending == NULL ? 0 : pending->count;
 }
 
+/* A batch bigger than the buffer could never fill, so N would never
+ * trigger; it is refused rather than quietly capped. */
+gt_status gt_pending_set_limits(gt_pending *pending, size_t batch_records,
+                                uint64_t max_age_ms)
+{
+    if (pending == NULL || batch_records == 0 || max_age_ms == 0
+        || batch_records > pending->capacity) {
+        return GT_ERR_INVAL;
+    }
+    pending->batch_records = batch_records;
+    pending->max_age_ms = max_age_ms;
+    return GT_OK;
+}
+
 /* The age check is written as now_ms >= oldest + limit (not
  * now_ms - oldest >= limit), so a now_ms earlier than the oldest add
  * can't wrap around to a huge age. */
@@ -77,10 +96,10 @@ int gt_pending_due(const gt_pending *pending, uint64_t now_ms)
     if (pending == NULL || pending->count == 0) {
         return 0;
     }
-    if (pending->count >= GT_BATCH_MAX_RECORDS) {
+    if (pending->count >= pending->batch_records) {
         return 1;
     }
-    uint64_t age_limit_ms = (uint64_t)GT_BATCH_MAX_AGE_S * 1000u;
+    uint64_t age_limit_ms = pending->max_age_ms;
     uint64_t oldest_ms = pending->added_ms[0];
     return oldest_ms <= UINT64_MAX - age_limit_ms && now_ms >= oldest_ms + age_limit_ms;
 }

@@ -101,8 +101,10 @@ void gt_flusher_tick(gt_flusher *flusher, uint64_t now_us, uint64_t now_ms, int 
  * clocks and clock_synced_fn(), until *stop is set. `atomic_int` is an int
  * that two threads can safely read and write at the same time (from
  * <stdatomic.h>); storage_main sets it, this loop reads it. A pass that
- * is due runs within about a second, which keeps a commit inside the
- * 62 s target. The final flush is not done here: storage_main calls
+ * is due by age runs within about a second, which keeps a commit inside
+ * the 62 s target. Between passes it sleeps in gt_storage_wait_due, so a
+ * flush that becomes due by count (N), or a gt_storage_wake, starts the
+ * next pass at once (PF-11). The final flush is not done here: storage_main calls
  * gt_storage_shutdown after joining this thread. */
 void gt_flusher_run(gt_flusher *flusher, const atomic_int *stop, int (*clock_synced_fn)(void));
 
