@@ -70,7 +70,7 @@ flowchart TB
     LT -.->|"heartbeat 1 Hz"| SUPSOCK
     ST -.->|"heartbeat 1 Hz"| SUPSOCK
     HT -.->|"heartbeat 1 Hz"| SUPSOCK
-    FL -.->|"heartbeat 1 Hz"| SUPSOCK
+    RX -.->|"heartbeat 1 Hz"| SUPSOCK
     SUPSOCK -.->|"heartbeat 1 Hz, timeout 5 s (4 msg/s total)"| SUP
     SIG -.->|"event: SIGCHLD"| SUP
     SUP -.->|"event: restart, backoff 1→2→4… max 30 s"| LP
@@ -123,7 +123,7 @@ flowchart TB
 
 ## Failure-mode table
 
-Log format for every component: `timestamp level component event key=value`. `timestamp` is µs since the Unix epoch, written as an integer (the same unit as the on-disk record, so log lines and records can be joined), and `level` is one of `DEBUG`, `INFO`, `WARN` or `ERROR`. Every component builds its lines with the shared `gt_log_format` (`src/gt_log.c`). Rule: whichever component refuses a reading records the gap (start, end, count), so no reading is ever lost silently. Besides the events in the table, storage logs `storage_start` / `storage_stop` (with segment, last `seq`, committed and refused counts), `segment_rollover`, and `hub_connected` / `hub_disconnected` / `hub_duplicate_client` for its one hub connection; `storage_degraded` carries `reason=write_failed` or `reason=queue_full`. The flag-to-name table is `src/storage_event.c`.
+Log format for every component: `timestamp level component event key=value`. `timestamp` is µs since the Unix epoch, written as an integer (the same unit as the on-disk record, so log lines and records can be joined), and `level` is one of `DEBUG`, `INFO`, `WARN` or `ERROR`. Every component builds its lines with the shared `gt_log_format` (`src/gt_log.c`) and writes them to stderr; children inherit the supervisor's stderr, so under systemd every line reaches the journal. Rule: whichever component refuses a reading records the gap (start, end, count), so no reading is ever lost silently. Besides the events in the table, storage logs `storage_start` / `storage_stop` (with segment, last `seq`, committed and refused counts), `segment_rollover`, and `hub_connected` / `hub_disconnected` / `hub_duplicate_client` for its one hub connection; `storage_degraded` carries `reason=write_failed` or `reason=queue_full`. The flag-to-name table is `src/storage_event.c`.
 
 | Component | Failure | Detection | Response | Log |
 |---|---|---|---|---|
