@@ -46,9 +46,21 @@ gt_status   gt_pending_add(gt_pending *pending, const uint8_t record[GT_REC_SIZE
 /* Records waiting right now. 0 for NULL. */
 size_t      gt_pending_count(const gt_pending *pending);
 
-/* 1 if a flush is due: at least GT_BATCH_MAX_RECORDS records are waiting,
- * or the oldest waiting record was added GT_BATCH_MAX_AGE_S seconds ago
- * or more. An empty buffer is never due. 0 for NULL. */
+/* Change when a flush is due (PF-11): at batch_records records waiting
+ * (N), or once the oldest has waited max_age_ms (T). A new buffer starts
+ * at GT_BATCH_MAX_RECORDS and GT_BATCH_MAX_AGE_S; this lets storage_main
+ * run the (N, T) experiment without a rebuild. Records already waiting
+ * keep their add times, so a new T applies to them at once.
+ *   GT_OK        changed
+ *   GT_ERR_INVAL NULL buffer, a 0 batch or age, or a batch larger than
+ *                the capacity (it could never fill); nothing changes */
+gt_status   gt_pending_set_limits(gt_pending *pending, size_t batch_records,
+                                  uint64_t max_age_ms);
+
+/* 1 if a flush is due: at least the batch size (N) of records are waiting,
+ * or the oldest waiting record was added the age limit (T) ago or more
+ * (GT_BATCH_MAX_RECORDS and GT_BATCH_MAX_AGE_S unless changed by
+ * gt_pending_set_limits). An empty buffer is never due. 0 for NULL. */
 int         gt_pending_due(const gt_pending *pending, uint64_t now_ms);
 
 /* The waiting records, oldest first, as one block of

@@ -20,10 +20,18 @@
  * clean shutdown (final flush + marker), close, and the socket and lock
  * are released.
  *
- * Log lines go to stderr in gt_log_format's format, component "storage".
- * The heartbeat to sup.sock arrives with Mechanism E.
+ * After the rx loop returns, gt_storage_wake ends the flush thread's wait
+ * so it sees the stop at once.
  *
- * Usage: storage_main /var/lib/plantpi /run/plantpi/storage.sock */
+ * -n N and -t T_SECONDS set when a flush is due (default 64 records and
+ * 60 s), so DESIGN.md's (N, T) experiment runs on one build (PF-11);
+ * storage_start logs them as batch_n and batch_t_s.
+ *
+ * Log lines go to stderr in gt_log_format's format, component "storage"
+ * (the shared sink, PF-18). The heartbeat to sup.sock arrives with
+ * Mechanism E.
+ *
+ * Usage: storage_main [-n N] [-t T_SECONDS] /var/lib/plantpi /run/plantpi/storage.sock */
 #define _DEFAULT_SOURCE   /* adjtimex() in <sys/timex.h> is a Linux extension */
 
 #include <errno.h>
@@ -31,6 +39,7 @@
 #include <signal.h>
 #include <stdatomic.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -42,6 +51,7 @@
 #include "gt_log.h"
 #include "listen_sock.h"
 #include "storage.h"
+#include "storage_pending.h"
 #include "storage_server.h"
 
 #define LISTEN_BACKLOG 4
@@ -55,6 +65,10 @@
 /* How long an empty log waits for the clock before the first segment is
  * named (wait_for_clock_if_empty, PF-20). */
 #define CLOCK_WAIT_MAX_S 120
+
+/* The largest -t: a day. Longer would only hold records in memory past
+ * DESIGN.md's commit-latency target for no gain. */
+#define BATCH_AGE_MAX_S 86400
 
 /* Set by the signal handler, read by both threads. */
 static atomic_int stop_requested;
@@ -139,6 +153,54 @@ static void wait_for_clock_if_empty(const char *log_dir)
     log_line(NULL, synced ? GT_LOG_INFO : GT_LOG_WARN, "clock_wait_done", fields);
 }
 
+/* Parse a whole decimal number from 1 to max_value. Returns 1 on success;
+ * *value_out is untouched on failure. */
+static int parse_bounded(const char *text, unsigned long max_value, unsigned long *value_out)
+{
+    if (text[0] < '0' || text[0] > '9') {
+        return 0;   /* empty, or a sign/space strtoul would accept */
+    }
+    char *end = NULL;
+    errno = 0;
+    unsigned long value = strtoul(text, &end, 10);
+    if (errno != 0 || *end != '\0' || value == 0 || value > max_value) {
+        return 0;
+    }
+    *value_out = value;
+    return 1;
+}
+
+/* Read the optional "-n N" and "-t T_SECONDS" pairs at the front of argv,
+ * in either order, into *batch_out and *age_s_out (left at their defaults
+ * if not given). N runs from 1 to the pending buffer's size, T from 1 s to
+ * a day. *arg_base_out is the index of the first argument after them.
+ * Returns 1 on success, 0 for a bad or repeated option. */
+static int parse_batch_options(int argc, char **argv, unsigned long *batch_out,
+                               unsigned long *age_s_out, int *arg_base_out)
+{
+    int seen_batch = 0, seen_age = 0;
+    int arg_index = 1;
+    /* invariant: argv[1 .. arg_index - 1] are whole, valid option pairs */
+    while (arg_index + 1 < argc && argv[arg_index][0] == '-') {
+        if (strcmp(argv[arg_index], "-n") == 0 && !seen_batch) {
+            seen_batch = parse_bounded(argv[arg_index + 1], GT_PENDING_MAX_RECORDS, batch_out);
+            if (!seen_batch) {
+                return 0;
+            }
+        } else if (strcmp(argv[arg_index], "-t") == 0 && !seen_age) {
+            seen_age = parse_bounded(argv[arg_index + 1], BATCH_AGE_MAX_S, age_s_out);
+            if (!seen_age) {
+                return 0;
+            }
+        } else {
+            return 0;
+        }
+        arg_index += 2;
+    }
+    *arg_base_out = arg_index;
+    return 1;
+}
+
 /* SIGTERM / SIGINT: set the flag and wake the rx loop's poll(). errno is
  * saved and restored, because write() may change it under the code the
  * signal interrupted. */
@@ -183,8 +245,10 @@ static void log_recovery(const char *name, const gt_recover_report *report)
 
 /* Log what open found: whether the last run ended cleanly, and what
  * recovery did to the newest segment (DESIGN.md: unclean_shutdown,
- * recovery_event, segment_corrupt). */
-static void log_open_info(const gt_storage_open_info *info)
+ * recovery_event, segment_corrupt). storage_start also carries N and T,
+ * so a run of the (N, T) experiment says which point it was (PF-11). */
+static void log_open_info(const gt_storage_open_info *info, unsigned long batch_records,
+                          unsigned long batch_age_s)
 {
     char fields[160];
     if (info->unclean_shutdown) {
@@ -202,11 +266,12 @@ static void log_open_info(const gt_storage_open_info *info)
         log_line(NULL, GT_LOG_WARN, "recovery_unlisted", fields);
     }
     if (info->has_last) {
-        snprintf(fields, sizeof fields, "segment=%s created=%d last_seq=%lu",
-                 info->active_name, info->created, (unsigned long)info->last_seq);
+        snprintf(fields, sizeof fields, "segment=%s created=%d last_seq=%lu batch_n=%lu batch_t_s=%lu",
+                 info->active_name, info->created, (unsigned long)info->last_seq,
+                 batch_records, batch_age_s);
     } else {
-        snprintf(fields, sizeof fields, "segment=%s created=%d last_seq=none",
-                 info->active_name, info->created);
+        snprintf(fields, sizeof fields, "segment=%s created=%d last_seq=none batch_n=%lu batch_t_s=%lu",
+                 info->active_name, info->created, batch_records, batch_age_s);
     }
     log_line(NULL, GT_LOG_INFO, "storage_start", fields);
 }
@@ -245,12 +310,21 @@ static int start_flusher(pthread_t *thread, gt_flusher *flusher)
 
 int main(int argc, char **argv)
 {
-    if (argc != 3) {
-        fprintf(stderr, "usage: %s /var/lib/plantpi /run/plantpi/storage.sock\n", argv[0]);
+    unsigned long batch_records = GT_BATCH_MAX_RECORDS;
+    unsigned long batch_age_s = GT_BATCH_MAX_AGE_S;
+    int arg_base = 1;
+    if (!parse_batch_options(argc, argv, &batch_records, &batch_age_s, &arg_base)
+        || argc - arg_base != 2) {
+        fprintf(stderr,
+                "usage: %s [-n N] [-t T_SECONDS] /var/lib/plantpi /run/plantpi/storage.sock\n"
+                "  N: flush at N records, 1..%u (default %u)\n"
+                "  T: flush once the oldest record is T s old, 1..%u (default %u)\n",
+                argv[0], (unsigned)GT_PENDING_MAX_RECORDS, (unsigned)GT_BATCH_MAX_RECORDS,
+                (unsigned)BATCH_AGE_MAX_S, (unsigned)GT_BATCH_MAX_AGE_S);
         return 2;
     }
-    const char *log_dir = argv[1];
-    const char *sock_path = argv[2];
+    const char *log_dir = argv[arg_base];
+    const char *sock_path = argv[arg_base + 1];
 
     /* 1. The lock, before anything touches the log. */
     int lock_fd = -1, already_running = 0;
@@ -282,8 +356,11 @@ int main(int argc, char **argv)
         gt_listen_release(sock_path, -1, lock_fd);
         return 1;
     }
-    log_open_info(&info);
+    log_open_info(&info, batch_records, batch_age_s);
     gt_storage_set_clock(storage, monotonic_us);   /* before the flush thread starts */
+    /* N and T were range-checked above, so this can't fail; it is set
+     * before the flush thread starts, like the clock (PF-11). */
+    gt_storage_set_batch(storage, (size_t)batch_records, (unsigned)batch_age_s);
 
     /* 3. Bind storage.sock, and make the stop pipe. */
     int listen_fd = -1;
@@ -315,6 +392,7 @@ int main(int argc, char **argv)
     /* Shut down: stop and join the flush thread, then the final flush and
      * the marker, then release everything. */
     atomic_store(&stop_requested, 1);
+    gt_storage_wake(storage);   /* the flush thread sees the stop at once (PF-11) */
     if (flusher_running) {
         pthread_join(flush_thread, NULL);
     }

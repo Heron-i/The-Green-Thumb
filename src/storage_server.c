@@ -312,20 +312,27 @@ void gt_flusher_tick(gt_flusher *flusher, uint64_t now_us, uint64_t now_ms, int 
 }
 
 /* The sleep is cut into FLUSHER_STEP_MS pieces so a stop is noticed
- * within 0.1 s rather than a whole period. */
+ * within 0.1 s rather than a whole period. Each piece is a
+ * gt_storage_wait_due rather than a plain sleep (PF-11): when an append
+ * makes a flush due (N reached), or storage_main calls gt_storage_wake,
+ * the wait returns at once and the next tick runs straight away, so
+ * N = 1 means one fsync per record instead of one per second. The age
+ * rule (T), rollover and the clock checks still run on the 1 s tick. */
 void gt_flusher_run(gt_flusher *flusher, const atomic_int *stop, int (*clock_synced_fn)(void))
 {
     if (flusher == NULL || stop == NULL) {
         return;
     }
-    const struct timespec step = { .tv_sec = 0, .tv_nsec = FLUSHER_STEP_MS * 1000000L };
     while (!atomic_load(stop)) {
         int synced = clock_synced_fn != NULL ? clock_synced_fn() : 1;
         gt_flusher_tick(flusher, wall_us(), monotonic_ms(), synced);
-        /* invariant: slept_ms of this period have passed, with no stop seen */
+        /* invariant: slept_ms of this period have passed, with no stop
+         * seen and no flush becoming due */
         for (int slept_ms = 0; slept_ms < FLUSHER_PERIOD_MS && !atomic_load(stop);
              slept_ms += FLUSHER_STEP_MS) {
-            nanosleep(&step, NULL);
+            if (gt_storage_wait_due(flusher->storage, FLUSHER_STEP_MS)) {
+                break;   /* a flush became due (or a wake): tick now */
+            }
         }
     }
 }
