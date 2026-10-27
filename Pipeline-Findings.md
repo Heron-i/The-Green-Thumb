@@ -21,13 +21,13 @@ Adversarial review of branch `Menu-Mechanism-D` (Lucas's Mechanism D storage wor
 | PF-06 | Records from the end of a day go into the next day's segment | DESIGN.md | Medium | Resolved (2026-10-26) |
 | PF-07 | A storage-made GAP record carries the gap's end time | DESIGN.md | Medium | Resolved (2026-10-26) |
 | PF-08 | Commits are not logged and fsync is not timed | DESIGN.md (2 rows) | Medium | Open |
-| PF-09 | DESIGN.md describes disk-full and read-only handling as done | DESIGN.md | Medium | Open |
+| PF-09 | DESIGN.md describes disk-full and read-only handling as done | DESIGN.md | Medium | Resolved in docs (2026-10-26); handling not built |
 | PF-10 | Storage heartbeat: not built, and DESIGN.md disagrees with itself | DESIGN.md | Medium | Open |
 | PF-11 | The (N, T) batching experiment can't run as specified | DESIGN.md | Low | Open |
 | PF-12 | The verifier doesn't compare against the hub's sent `seq`s | DESIGN.md | Low | Open |
 | PF-13 | `clock_unsynced` / `clock_synced` are never logged | DESIGN.md | Low | Open |
 | PF-14 | Some log lines are missing their `key=value` fields | DESIGN.md | Low | Open |
-| PF-15 | Doc errors: "lux" range check, wrong decode function | [Both docs] / DESIGN.md | Low | Open |
+| PF-15 | Doc errors: "lux" range check, wrong decode function | [Both docs] / DESIGN.md | Low | Resolved (2026-10-26) |
 | PF-16 | Socket calls outside `src/ipc_sock.c` | Sensor-Pipeline.md | Low | Open |
 | PF-17 | Lily's Status section edited; "storage is done" overclaims | Sensor-Pipeline.md | Low | Open |
 | PF-18 | The log sink was chosen by one side | Sensor-Pipeline.md | Low | Open |
@@ -145,6 +145,12 @@ Storage itself was correct: the feed's output file later held `seq_resume: last=
 ### PF-09: DESIGN.md describes disk-full and read-only handling as done
 - The `storage_disk_full` row (`ENOSPC`, `statvfs`, the 64 KB reserve) and the `storage_readonly` row (`EROFS`) read as built. Nothing in `src/` mentions `statvfs`, `ENOSPC` or `EROFS`; a full card shows up only as `storage_write_error` + `storage_degraded`.
 - Lucas's *Not done yet (Mechanism D)* list says so. DESIGN.md should mark both rows as planned until they land.
+- **Resolution (2026-10-26, docs only):**
+  - **Disk-full row:** ENOSPC / `statvfs` and `storage_disk_full` are marked planned. The built parts (backlog at 50/75/90%, refuse and count when the buffer is full, the GAP on recovery) are left as they were.
+  - **Read-only row:** marked `Storage (planned)`, matching the *Analysis (planned)* rows.
+  - **Today's behaviour is stated in both rows:** a full card or EROFS shows as `storage_write_error` (or `fsync_error`, or `segment_create_error` at rollover) + `storage_degraded`, with the records kept in memory.
+  - ***With what retention*:** the disk-full steps and the 64 KB reserve are marked planned too.
+  - **Still to do:** the handling itself, which needs a "disk full" status out of the file seam first (Lucas's *Not done yet*).
 
 ### PF-10: Storage heartbeat: not built, and DESIGN.md disagrees with itself
 - The architecture diagram has the **flush thread** send a 1 Hz heartbeat to `sup.sock`; the `fsync_slow` row says the **rx thread** sends it (so a stalled fsync can't stop it).
@@ -170,6 +176,9 @@ Storage itself was correct: the feed's output file later held `seq_resume: last=
 ### PF-15: Doc errors
 - **[Both docs]** The Hub range-check row says "light 0–65535 **lux**". Sensor-Pipeline.md says "Raw counts are stored, never lux", and its Step 7 changed this row to "raw count". Git history shows the fix was lost in merge #71 (`complete-pipe` → `main`), not by Lucas.
 - The Storage "malformed message" row says `gt_msg_decode()` detects it; storage actually uses `gt_record_decode`.
+- **Resolution (2026-10-26):**
+  - **Range-check row:** the Hub row reads "light raw count 0–65535" again, the wording Sensor-Pipeline.md's Step 7 had put in. Sensor-Pipeline.md itself already said raw counts, so only DESIGN.md changed.
+  - **Malformed-message row:** the Storage row now names `gt_record_decode()`.
 
 ## Contradicts Sensor-Pipeline.md only
 
@@ -224,5 +233,5 @@ Storage itself was correct: the feed's output file later held `seq_resume: last=
 1. ~~**Decide PF-01 to PF-03 in DESIGN.md:** the hub stamps the timestamp on arrival and `seq` + CRC at send time; the socket seam gains a `recv` op and the sender a "waiting for `seq_resume`" state; a running hub keeps its own `seq` counter. Update Sensor-Pipeline.md's *Decisions* and `include/hub.h` to match.~~ **Done in both documents (2026-10-26).** `include/hub.h` waits for the hub steps.
 2. ~~**Fix PF-04** (and PF-05), then run `storage_faults.sh sigterm 20` and `kill9 50` and record the results.~~ **Done (2026-10-26):** both ran with 0 failed checks; results are in PF-04/05 and the Mechanism D Status table.
 3. ~~**Fix or document PF-06 and PF-07.**~~ **Done (2026-10-26):** both fixed test-first; see their Resolution lines.
-4. **Mark PF-09's rows as planned** and settle PF-10's heartbeat owner thread.
-5. **Clean up the docs:** PF-15 (restore "raw count"), PF-17 (Status ownership and file scope), PF-19 (Code map).
+4. ~~**Mark PF-09's rows as planned**~~ (done 2026-10-26) and settle PF-10's heartbeat owner thread.
+5. **Clean up the docs:** ~~PF-15 (restore "raw count")~~ (done 2026-10-26), PF-17 (Status ownership and file scope), PF-19 (Code map).
