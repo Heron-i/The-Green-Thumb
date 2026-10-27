@@ -56,6 +56,8 @@ typedef struct {
     gt_recover_report recovery;              /* valid when recovered is 1 */
     int      has_last;                       /* 1 if any segment holds a record */
     uint32_t last_seq;                       /* seq of the newest record on disk */
+    uint64_t last_timestamp_us;              /* that record's timestamp: a GAP found after
+                                              * this restart is stamped with it (PF-07) */
 } gt_storage_open_info;
 
 /* Counters for tests, heartbeats and the seq_resume reply. A pair of
@@ -187,7 +189,10 @@ gt_status   gt_storage_event_describe(unsigned flag, gt_storage_event *out);
  * unchanged. That is what makes refused readings explicit: the next
  * accepted record skips their seqs, so a GAP starting at the first
  * refused seq goes in before it (DESIGN.md "Gaps created by storage use
- * the seq of the first refused reading").
+ * the seq of the first refused reading"). Every storage-made GAP is
+ * stamped with the last accepted record's time, the moment the gap could
+ * first have started; after open that is the newest record on disk
+ * (PF-07).
  *
  * GT_STORAGE_EV_BACKLOG is added when an accepted record takes the buffer
  * across 50%, 75% or 90% going up (pending * 100 >= capacity * threshold).
@@ -261,11 +266,17 @@ gt_status   gt_storage_flush(gt_storage *storage, unsigned *events_out);
  *      (DESIGN.md: skip rollover and retention while the clock is
  *      unsynced; keep appending to the current segment). Storage can't
  *      tell for itself: storage_main passes what adjtimex says.
- *   2. If the UTC day of now_us is later than the active segment's,
- *      create today's segment (header, fsync, fsync_dir, as in open) and
- *      make it active: ROLLOVER. Pending records go into it at the next
- *      flush. If the day is the same or earlier (the clock went back),
- *      keep the active segment. If storage is degraded, the old segment
+ *   2. If the UTC day of now_us is later than the active segment's, first
+ *      flush every pending record into the old segment (gt_storage_flush,
+ *      its events included: WRITE_ERROR / FSYNC_ERROR, DEGRADED,
+ *      RECOVERED), so a day's records stay in that day's file (PF-06).
+ *      Records that arrive between midnight and this call still count as
+ *      the old day's: at most one flusher period (1 s). Then create today's
+ *      segment (header, fsync, fsync_dir, as in open) and make it active:
+ *      ROLLOVER. If the pre-flush failed, the records stay pending and go
+ *      into the new segment at the next flush. If the day is the same or
+ *      earlier (the clock went back), keep the active segment. If storage
+ *      is degraded (including after a failed pre-flush), the old segment
  *      may end in torn bytes from the failed flush, and recovery only
  *      ever repairs the newest segment, so the old one is first cut back
  *      to its committed offset and fsynced. If that cut fails, there is

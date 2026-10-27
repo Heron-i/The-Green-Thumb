@@ -39,12 +39,15 @@ gt_seq_verdict gt_seq_check(uint32_t last_accepted, int has_last, uint32_t incom
  * last_accepted and incoming->seq:
  *   type GAP, sensor_id GT_SENSOR_ALL (storage can't know which sensor
  *   the missing records came from), seq last_accepted + 1, value the
- *   number of missing seqs, and timestamp_us the incoming record's time.
+ *   number of missing seqs, and timestamp_us = last_accepted_us, the
+ *   last accepted record's time.
  * The missing records' own times are lost with them, so the gap is
- * stamped with the time storage found out about it.
+ * stamped with the earliest moment it could have started: right after
+ * the last record storage has. DESIGN.md: a GAP's time is the gap's
+ * start, and the gap ends at the next record's time (PF-07).
  * GT_ERR_INVAL for NULL args, or when incoming->seq is not more than
  * last_accepted + 1 (there is no gap); *gap_out is untouched on failure. */
-gt_status gt_seq_gap_record(uint32_t last_accepted, const gt_record *incoming,
-                            gt_record *gap_out);
+gt_status gt_seq_gap_record(uint32_t last_accepted, uint64_t last_accepted_us,
+                            const gt_record *incoming, gt_record *gap_out);
 
 #endif

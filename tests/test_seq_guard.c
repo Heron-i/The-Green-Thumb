@@ -70,9 +70,11 @@ static void test_sqg06_skip_is_gap(void)
 }
 
 /* ---- SQG-07: the gap record covers the missing seqs ----
- * Last 7, incoming 10: seqs 8 and 9 are missing, so the GAP has seq 8 and
- * value 2. Its seq sits between the two records, so the log still
- * increases, and storage's own record encoder accepts it. */
+ * Last 7 (stamped 4000), incoming 10 (stamped 5000): seqs 8 and 9 are
+ * missing, so the GAP has seq 8 and value 2. It carries 4000, the time
+ * the gap could first have started, not 5000, when it ended (PF-07). Its
+ * seq sits between the two records, so the log still increases, and
+ * storage's own record encoder accepts it. */
 static void test_sqg07_gap_record_fields(void)
 {
     const gt_record incoming = {
@@ -82,11 +84,11 @@ static void test_sqg07_gap_record_fields(void)
     gt_record gap;
     uint8_t wire[GT_REC_SIZE];
 
-    CHECK_EQ(gt_seq_gap_record(7, &incoming, &gap), GT_OK);
+    CHECK_EQ(gt_seq_gap_record(7, 4000, &incoming, &gap), GT_OK);
     CHECK_EQ(gap.type, GT_REC_GAP);
     CHECK_EQ(gap.sensor_id, GT_SENSOR_ALL);
     CHECK_EQ(gap.seq, 8);
-    CHECK(gap.timestamp_us == 5000);   /* u64: too big for CHECK_EQ's long long */
+    CHECK(gap.timestamp_us == 4000);   /* u64: too big for CHECK_EQ's long long */
     CHECK_EQ(gap.value, 2);
     CHECK(gap.seq > 7 && gap.seq < incoming.seq);
     CHECK_EQ(gt_record_encode(&gap, wire), GT_OK);
@@ -109,7 +111,7 @@ static void test_sqg08_no_gap_no_record(void)
         memset(&gap, 0x5A, sizeof gap);
         memset(&untouched, 0x5A, sizeof untouched);
 
-        CHECK_EQ(gt_seq_gap_record(7, &incoming, &gap), GT_ERR_INVAL);
+        CHECK_EQ(gt_seq_gap_record(7, 4000, &incoming, &gap), GT_ERR_INVAL);
         CHECK(memcmp(&gap, &untouched, sizeof gap) == 0);
     }
 }
@@ -123,8 +125,8 @@ static void test_sqg09_null_args(void)
     };
     gt_record gap;
 
-    CHECK_EQ(gt_seq_gap_record(7, NULL, &gap), GT_ERR_INVAL);
-    CHECK_EQ(gt_seq_gap_record(7, &incoming, NULL), GT_ERR_INVAL);
+    CHECK_EQ(gt_seq_gap_record(7, 4000, NULL, &gap), GT_ERR_INVAL);
+    CHECK_EQ(gt_seq_gap_record(7, 4000, &incoming, NULL), GT_ERR_INVAL);
 }
 
 static const test_case_t tests[] = {

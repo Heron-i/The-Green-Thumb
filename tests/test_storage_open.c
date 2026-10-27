@@ -8,7 +8,7 @@
  * ignores every file that isn't a segment. On any failure it returns an
  * error, leaves *storage_out alone, calls destroy exactly once and leaves
  * no handle open. Uses tests/fake_file.h, so no disk is touched. Run under
- * make test / asan / memcheck. Implements SOP-01 through SOP-12.
+ * make test / asan / memcheck. Implements SOP-01 through SOP-13.
  *
  * What these tests cannot prove: append, flush and the clean-shutdown
  * marker (Mechanism D Steps 7c, 7d and 9), or real ext4 (Step 12a). */
@@ -380,6 +380,31 @@ static void test_sop12_bad_args(void)
     close_and_check(storage);
 }
 
+/* ---- SOP-13: open reports the newest record's time ----
+ * Today's segment holds 2 records (stamped 2000 and 2001): 2001. Then,
+ * with today's segment header-only and yesterday's holding 3 records, the
+ * walk back for the last seq brings back yesterday's last time, 2002.
+ * Storage stamps a GAP found after a restart with this time (PF-07). */
+static void test_sop13_last_timestamp_reported(void)
+{
+    const uint32_t seqs[] = { 4, 5, 6 };
+    const gt_file_ops *ops = fake_fs_ops(&fs);
+    put_segment(TODAY_NAME, seqs, 2);
+    gt_storage_open_info info;
+    gt_storage *storage = open_ok(ops, TODAY_US, &info);
+    CHECK_EQ(info.last_seq, 5);
+    CHECK(info.last_timestamp_us == 2001);   /* u64: too big for CHECK_EQ's long long */
+    close_and_check(storage);
+
+    ops = fake_fs_ops(&fs);
+    put_segment(YESTERDAY, seqs, 3);
+    put_segment(TODAY_NAME, NULL, 0);
+    storage = open_ok(ops, TODAY_US, &info);
+    CHECK_EQ(info.last_seq, 6);
+    CHECK(info.last_timestamp_us == 2002);
+    close_and_check(storage);
+}
+
 static const test_case_t tests[] = {
     {"SOP-01", "an empty directory gets today's segment", test_sop01_empty_dir_creates_today},
     {"SOP-02", "today's clean segment is reused", test_sop02_today_reused},
@@ -393,6 +418,7 @@ static const test_case_t tests[] = {
     {"SOP-10", "a failed recovery fails open", test_sop10_recovery_failure},
     {"SOP-11", "close cleans up; info may be NULL", test_sop11_close_and_null_info},
     {"SOP-12", "bad arguments are rejected", test_sop12_bad_args},
+    {"SOP-13", "open reports the newest record's time", test_sop13_last_timestamp_reported},
 };
 
 int main(void)

@@ -26,8 +26,8 @@ gt_seq_verdict gt_seq_check(uint32_t last_accepted, int has_last, uint32_t incom
     return GT_SEQ_GAP;
 }
 
-gt_status gt_seq_gap_record(uint32_t last_accepted, const gt_record *incoming,
-                            gt_record *gap_out)
+gt_status gt_seq_gap_record(uint32_t last_accepted, uint64_t last_accepted_us,
+                            const gt_record *incoming, gt_record *gap_out)
 {
     if (incoming == NULL || gap_out == NULL) {
         return GT_ERR_INVAL;
@@ -39,7 +39,7 @@ gt_status gt_seq_gap_record(uint32_t last_accepted, const gt_record *incoming,
     gap_out->type = GT_REC_GAP;
     gap_out->sensor_id = GT_SENSOR_ALL;
     gap_out->seq = last_accepted + 1;
-    gap_out->timestamp_us = incoming->timestamp_us;
+    gap_out->timestamp_us = last_accepted_us;   /* the gap started after it (PF-07) */
     gap_out->value = incoming->seq - last_accepted - 1;   /* the seqs strictly between */
     return GT_OK;
 }

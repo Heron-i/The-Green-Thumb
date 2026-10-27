@@ -9,10 +9,12 @@
  * segments are deleted only when outside the window and not among the
  * newest N, so a clock that jumps years ahead can't wipe the history.
  * Non-segment files are never deleted, and a failed delete is reported
- * while the others still go. A rollover while degraded first cuts the old
- * segment's torn tail, or waits if it can't. Uses tests/fake_file.h with a
- * 3-day window (the fake holds 8 files). Run under make test / asan /
- * memcheck. Implements SRO-01 through SRO-12.
+ * while the others still go. Records still pending at midnight are
+ * flushed into the old day's segment before the switch (PF-06). If that
+ * flush fails, the old segment's torn tail is cut first, or the switch
+ * waits if it can't be. Uses tests/fake_file.h with a 3-day window (the
+ * fake holds 8 files). Run under make test / asan / memcheck. Implements
+ * SRO-01 through SRO-14.
  *
  * What these tests cannot prove: a real midnight on the Pi during the
  * soak, or how storage_main learns the clock is synced (Step 12d). */
@@ -308,17 +310,92 @@ static gt_storage *open_degraded_with_torn_tail(const gt_file_ops *ops)
     return storage;
 }
 
-/* ---- SRO-11: a degraded rollover cuts the old tail ----
- * Midnight arrives while a flush has failed. Yesterday's segment is cut
- * back to its committed length (just the header) and fsynced before the
- * switch, since recovery would never repair a segment that is no longer
- * the newest. The pending records then land in the new segment. */
-static void test_sro11_degraded_rollover_cuts_tail(void)
+/* ---- SRO-11: a degraded rollover flushes the old day first ----
+ * Midnight arrives while a flush has failed. Before the switch, the
+ * pending records are flushed into yesterday's segment, where they belong
+ * (DESIGN.md "one segment file per UTC day", PF-06): the retried flush
+ * cuts the torn tail, writes both records and fsyncs, so storage
+ * recovers. Tomorrow's segment starts with just its header. */
+static void test_sro11_degraded_rollover_flushes_old_day(void)
 {
     const gt_file_ops *ops = fake_fs_ops(&fs);
     gt_storage *storage = open_degraded_with_torn_tail(ops);
 
+    rollover_expect(storage, TOMORROW_US, 1, GT_OK,
+                    GT_STORAGE_EV_RECOVERED | GT_STORAGE_EV_ROLLOVER);
+    const fake_file *yesterday = fake_fs_file(&fs, TODAY_NAME);
+    CHECK_EQ(yesterday->len, GT_SEG_HEADER_SZ + 2 * GT_REC_SIZE);
+    CHECK_EQ(yesterday->synced_len, GT_SEG_HEADER_SZ + 2 * GT_REC_SIZE);
+    CHECK_EQ(fake_fs_file(&fs, TOMORROW_NAME)->synced_len, GT_SEG_HEADER_SZ);
+    CHECK_EQ(read_stats(storage).degraded, 0);
+    gt_storage_close(storage);
+}
+
+/* ---- SRO-12: a failed tail cut delays the rollover ----
+ * The flush tried before the switch fails again (another torn write), and
+ * the torn bytes can't be cut either. The switch would strand them for
+ * good, so it waits: WRITE_ERROR, GT_ERR_IO, no new segment, the old one
+ * still active. The next call's flush succeeds, so the records go into
+ * the old day, and then it rolls over. */
+static void test_sro12_failed_cut_delays_rollover(void)
+{
+    const gt_file_ops *ops = fake_fs_ops(&fs);
+    gt_storage *storage = open_degraded_with_torn_tail(ops);
+    fs.fail_pwrite_call = fs.pwrite_calls + 1;         /* the pre-flush's write */
+    fs.fail_ftruncate_call = fs.ftruncate_calls + 2;   /* the tail cut; +1 is the pre-flush's own */
+
+    rollover_expect(storage, TOMORROW_US, 1, GT_ERR_IO, GT_STORAGE_EV_WRITE_ERROR);
+    CHECK(fake_fs_file(&fs, TOMORROW_NAME) == NULL);
+    CHECK_EQ(fake_fs_open_handles(&fs), 1);
+
+    rollover_expect(storage, TOMORROW_US, 1, GT_OK,
+                    GT_STORAGE_EV_RECOVERED | GT_STORAGE_EV_ROLLOVER);
+    CHECK_EQ(fake_fs_file(&fs, TODAY_NAME)->synced_len, GT_SEG_HEADER_SZ + 2 * GT_REC_SIZE);
+    CHECK(fake_fs_file(&fs, TOMORROW_NAME) != NULL);
+    gt_storage_close(storage);
+}
+
+/* ---- SRO-13: pending records go into the old day ----
+ * A record received before midnight but not flushed yet is written to
+ * yesterday's segment before the switch, not to tomorrow's (PF-06). The
+ * next flush then has nothing left to write. */
+static void test_sro13_pending_goes_to_old_day(void)
+{
+    const gt_file_ops *ops = fake_fs_ops(&fs);
+    gt_storage *storage = open_today(ops);
+    const gt_record record = {
+        .type = GT_REC_DATA, .sensor_id = GT_SENSOR_LIGHT,
+        .seq = 1, .timestamp_us = 101, .value = 1,
+    };
+    uint8_t wire[GT_REC_SIZE];
+    CHECK_EQ(gt_record_encode(&record, wire), GT_OK);
+    CHECK_EQ(gt_storage_append(storage, wire, 0, NULL), GT_OK);
+
     rollover_expect(storage, TOMORROW_US, 1, GT_OK, GT_STORAGE_EV_ROLLOVER);
+    CHECK_EQ(fake_fs_file(&fs, TODAY_NAME)->synced_len, GT_SEG_HEADER_SZ + GT_REC_SIZE);
+    CHECK_EQ(fake_fs_file(&fs, TOMORROW_NAME)->synced_len, GT_SEG_HEADER_SZ);
+
+    int pwrites_before = fs.pwrite_calls;
+    CHECK_EQ(gt_storage_flush(storage, NULL), GT_OK);
+    CHECK_EQ(fs.pwrite_calls, pwrites_before);   /* nothing left to write */
+    gt_storage_close(storage);
+}
+
+/* ---- SRO-14: a failed pre-flush still rolls over ----
+ * Midnight arrives while a flush has failed, and the flush tried before
+ * the switch fails too (another torn write). Yesterday's segment is cut
+ * back to its committed length (just the header) and fsynced, since
+ * recovery would never repair a segment that is no longer the newest, and
+ * the switch goes ahead. The records stay pending and land in the new
+ * segment at the next flush, so nothing is lost. */
+static void test_sro14_failed_preflush_still_rolls(void)
+{
+    const gt_file_ops *ops = fake_fs_ops(&fs);
+    gt_storage *storage = open_degraded_with_torn_tail(ops);
+    fs.fail_pwrite_call = fs.pwrite_calls + 1;   /* the pre-flush's write */
+
+    rollover_expect(storage, TOMORROW_US, 1, GT_OK,
+                    GT_STORAGE_EV_WRITE_ERROR | GT_STORAGE_EV_ROLLOVER);
     const fake_file *yesterday = fake_fs_file(&fs, TODAY_NAME);
     CHECK_EQ(yesterday->len, GT_SEG_HEADER_SZ);
     CHECK_EQ(yesterday->synced_len, GT_SEG_HEADER_SZ);
@@ -327,26 +404,6 @@ static void test_sro11_degraded_rollover_cuts_tail(void)
     CHECK_EQ(gt_storage_flush(storage, &events), GT_OK);
     CHECK_EQ(events, GT_STORAGE_EV_RECOVERED);
     CHECK_EQ(fake_fs_file(&fs, TOMORROW_NAME)->synced_len, GT_SEG_HEADER_SZ + 2 * GT_REC_SIZE);
-    gt_storage_close(storage);
-}
-
-/* ---- SRO-12: a failed tail cut delays the rollover ----
- * If the torn bytes can't be cut, the switch would strand them for good,
- * so it waits: WRITE_ERROR, GT_ERR_IO, no new segment, the old one still
- * active. The next call cuts and rolls over. */
-static void test_sro12_failed_cut_delays_rollover(void)
-{
-    const gt_file_ops *ops = fake_fs_ops(&fs);
-    gt_storage *storage = open_degraded_with_torn_tail(ops);
-    fs.fail_ftruncate_call = fs.ftruncate_calls + 1;
-
-    rollover_expect(storage, TOMORROW_US, 1, GT_ERR_IO, GT_STORAGE_EV_WRITE_ERROR);
-    CHECK(fake_fs_file(&fs, TOMORROW_NAME) == NULL);
-    CHECK_EQ(fake_fs_open_handles(&fs), 1);
-
-    rollover_expect(storage, TOMORROW_US, 1, GT_OK, GT_STORAGE_EV_ROLLOVER);
-    CHECK_EQ(fake_fs_file(&fs, TODAY_NAME)->synced_len, GT_SEG_HEADER_SZ);
-    CHECK(fake_fs_file(&fs, TOMORROW_NAME) != NULL);
     gt_storage_close(storage);
 }
 
@@ -377,8 +434,10 @@ static const test_case_t tests[] = {
     {"SRO-08", "other files are never deleted", test_sro08_other_files_kept},
     {"SRO-09", "a failed delete is reported, rest go", test_sro09_failed_delete_reported},
     {"SRO-10", "bad arguments are rejected", test_sro10_bad_args},
-    {"SRO-11", "a degraded rollover cuts the old tail", test_sro11_degraded_rollover_cuts_tail},
+    {"SRO-11", "a degraded rollover flushes the old day", test_sro11_degraded_rollover_flushes_old_day},
     {"SRO-12", "a failed tail cut delays the rollover", test_sro12_failed_cut_delays_rollover},
+    {"SRO-13", "pending records go into the old day", test_sro13_pending_goes_to_old_day},
+    {"SRO-14", "a failed pre-flush still rolls over", test_sro14_failed_preflush_still_rolls},
 };
 
 int main(void)

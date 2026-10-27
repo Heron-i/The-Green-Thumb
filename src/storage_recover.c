@@ -47,6 +47,7 @@ gt_status gt_recover_scan(const uint8_t *bytes, size_t len, gt_scan_result *out)
         }
         result.has_records = 1;
         result.last_seq = record.seq;
+        result.last_timestamp_us = record.timestamp_us;
         result.records_kept++;
         offset += GT_REC_SIZE;
     }
@@ -154,6 +155,7 @@ gt_status gt_storage_recover_ops(const gt_file_ops *ops, void *ctx,
     report.records_kept = scan.records_kept;
     report.has_records = scan.has_records;
     report.last_seq = scan.last_seq;
+    report.last_timestamp_us = scan.last_timestamp_us;
 
     ops->close(ctx, handle);
     free(bytes);

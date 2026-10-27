@@ -18,8 +18,8 @@ Adversarial review of branch `Menu-Mechanism-D` (Lucas's Mechanism D storage wor
 | PF-03 | A storage `kill -9` loses records with no trace in the log | [Both docs] | High | Decided in docs; `gt_next_seq`, `storage_feed` and the fault rounds follow it; hub sender not built |
 | PF-04 | `storage_faults.sh` fails every round | Tooling (confirmed by a run) | High | Resolved (2026-10-26) |
 | PF-05 | `kill9` rounds verify the log before recovery has run | Tooling (plausible) | Medium | Resolved (2026-10-26) |
-| PF-06 | Records from the end of a day go into the next day's segment | DESIGN.md | Medium | Open |
-| PF-07 | A storage-made GAP record carries the gap's end time | DESIGN.md | Medium | Open |
+| PF-06 | Records from the end of a day go into the next day's segment | DESIGN.md | Medium | Resolved (2026-10-26) |
+| PF-07 | A storage-made GAP record carries the gap's end time | DESIGN.md | Medium | Resolved (2026-10-26) |
 | PF-08 | Commits are not logged and fsync is not timed | DESIGN.md (2 rows) | Medium | Open |
 | PF-09 | DESIGN.md describes disk-full and read-only handling as done | DESIGN.md | Medium | Open |
 | PF-10 | Storage heartbeat: not built, and DESIGN.md disagrees with itself | DESIGN.md | Medium | Open |
@@ -123,10 +123,20 @@ Storage itself was correct: the feed's output file later held `seq_resume: last=
 - **DESIGN.md:** "one segment file per UTC day".
 - `gt_flusher_tick` rolls over to the new day's segment *before* it flushes ([src/storage_server.c:212-228](src/storage_server.c#L212-L228)), and `gt_storage_rollover` doesn't flush first. Up to about 60 s of records received before midnight are written into the new day's file.
 - **Fix:** flush (or attempt to) before switching segments.
+- **Resolution (2026-10-26):** the fix was adopted.
+  - **The change:** `gt_storage_rollover` flushes pending records into the old segment before creating the new one, and its events are passed on. If that flush fails, the existing degraded path cuts the old tail and the records go into the new segment.
+  - **Remaining limit:** records that arrive between midnight and the flusher's next pass (≤ 1 s) still go into the old day's file. This is now written in DESIGN.md.
+  - **Tests:** SRO-13 and SRO-14 are new. SRO-11, SRO-12 and FTK-05 were changed with approval, because they asserted the old behaviour; each kept its scenario. All were seen red, then green.
 
 ### PF-07: A storage-made GAP record carries the gap's end time
 - **DESIGN.md** record table: a GAP's timestamp is the "gap start"; "a gap ends at the timestamp of the next DATA record".
 - `gt_seq_gap_record` uses the incoming record's timestamp ([src/storage_seq.c:42](src/storage_seq.c#L42)), so start and end come out identical and the gap's length is lost. Its `seq` (the first refused reading) and `value` are correct.
+- **Resolution (2026-10-26):**
+  - **The rule:** a storage-made GAP is stamped with the last accepted record's time, the earliest the gap could have started.
+  - **After a restart:** recovery reports the newest record's time (`last_timestamp_us` in `gt_scan_result`, `gt_recover_report` and `gt_storage_open_info`), so a GAP found after a `kill -9` gets it too.
+  - **Signature change:** `gt_seq_gap_record` gained a `last_accepted_us` argument.
+  - **Tests:** RSC-10, SRV-11, SOP-13 and SFL-11 are new, and SBL-03 gained a timestamp check. SQG-07 and SFL-03 were changed with approval, because they asserted the end time. All were seen red, then green (322 tests).
+  - **Real process:** in a manual `kill -9` run, the GAP for seqs 372–458 carried record 371's time, and the next record showed it lasted 1.063 s. `storage_faults.sh kill9 5` and `sigterm 3` still gave 0 failed checks.
 
 ### PF-08: Commits are not logged and fsync is not timed
 - **DESIGN.md**, Mechanism D: "Every commit logged with count and duration; report fsync p50/p99". The `fsync_slow` row: "fsync duration measured on every commit; log any fsync over 1 s".
@@ -213,6 +223,6 @@ Storage itself was correct: the feed's output file later held `seq_resume: last=
 
 1. ~~**Decide PF-01 to PF-03 in DESIGN.md:** the hub stamps the timestamp on arrival and `seq` + CRC at send time; the socket seam gains a `recv` op and the sender a "waiting for `seq_resume`" state; a running hub keeps its own `seq` counter. Update Sensor-Pipeline.md's *Decisions* and `include/hub.h` to match.~~ **Done in both documents (2026-10-26).** `include/hub.h` waits for the hub steps.
 2. ~~**Fix PF-04** (and PF-05), then run `storage_faults.sh sigterm 20` and `kill9 50` and record the results.~~ **Done (2026-10-26):** both ran with 0 failed checks; results are in PF-04/05 and the Mechanism D Status table.
-3. **Fix or document PF-06 and PF-07.**
+3. ~~**Fix or document PF-06 and PF-07.**~~ **Done (2026-10-26):** both fixed test-first; see their Resolution lines.
 4. **Mark PF-09's rows as planned** and settle PF-10's heartbeat owner thread.
 5. **Clean up the docs:** PF-15 (restore "raw count"), PF-17 (Status ownership and file scope), PF-19 (Code map).

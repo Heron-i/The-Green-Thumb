@@ -144,6 +144,7 @@ struct gt_storage {
     uint64_t           committed_records;
     int                has_last_accepted;
     uint32_t           last_accepted_seq;
+    uint64_t           last_accepted_us;    /* that record's timestamp: a GAP's start (PF-07) */
     int                has_last_committed;
     uint32_t           last_committed_seq;
     int                degraded;            /* 1 from a failed flush until one succeeds */
@@ -271,6 +272,7 @@ static gt_status find_newest(gt_storage *storage,
         if (report.has_records) {
             info->has_last = 1;
             info->last_seq = report.last_seq;
+            info->last_timestamp_us = report.last_timestamp_us;
             break;
         }
     }
@@ -386,6 +388,7 @@ gt_status gt_storage_open_ops(const gt_file_ops *ops, void *ctx, uint64_t now_us
     memcpy(info.active_name, storage->active_name, GT_FILE_NAME_MAX);
     storage->has_last_accepted = storage->has_last_committed = info.has_last;
     storage->last_accepted_seq = storage->last_committed_seq = info.last_seq;
+    storage->last_accepted_us = info.last_timestamp_us;
     if (info_out != NULL) {
         *info_out = info;
     }
@@ -445,7 +448,8 @@ static gt_status append_locked(gt_storage *storage, const uint8_t record[GT_REC_
     if (verdict == GT_SEQ_GAP) {
         gt_record gap;
         uint8_t gap_wire[GT_REC_SIZE];
-        if (gt_seq_gap_record(storage->last_accepted_seq, decoded, &gap) != GT_OK
+        if (gt_seq_gap_record(storage->last_accepted_seq, storage->last_accepted_us, decoded,
+                              &gap) != GT_OK
             || gt_record_encode(&gap, gap_wire) != GT_OK
             || gt_pending_add(storage->pending, gap_wire, now_ms) != GT_OK) {
             return refuse_full(storage, events);   /* can't happen after the room check */
@@ -458,6 +462,7 @@ static gt_status append_locked(gt_storage *storage, const uint8_t record[GT_REC_
 
     storage->has_last_accepted = 1;
     storage->last_accepted_seq = decoded->seq;
+    storage->last_accepted_us = decoded->timestamp_us;
     storage->full_episode = 0;
 
     unsigned level = backlog_level(gt_pending_count(storage->pending), storage->capacity);
@@ -654,6 +659,13 @@ gt_status gt_storage_rollover(gt_storage *storage, uint64_t now_us, int clock_sy
     } else if (!clock_synced) {
         events |= GT_STORAGE_EV_RETENTION_SKIPPED;
     } else if (strcmp(today, storage->active_name) > 0) {
+        /* Records received before midnight belong in the old day's segment
+         * (PF-06), so flush them there first. If this flush fails, storage
+         * is degraded and the tail cut below runs as usual; the records stay
+         * pending and go into the new segment. */
+        unsigned flush_events = 0;
+        gt_storage_flush(storage, &flush_events);
+        events |= flush_events;
         int new_handle = -1;
         if (storage->degraded
             && (storage->ops->ftruncate(storage->ctx, storage->handle,

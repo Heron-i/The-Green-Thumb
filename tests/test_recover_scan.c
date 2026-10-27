@@ -6,8 +6,10 @@
  * unknown record_type or wrong version", "CRC mismatch", "seq that does
  * not increase", "a partial (fewer than 24 B) trailing record"), and that
  * a bad header is reported instead of scanned. Every segment here is built
- * in memory with gt_seg_header_encode and gt_record_encode: no files. Run
- * under make test / asan / memcheck. Implements RSC-01 through RSC-09.
+ * in memory with gt_seg_header_encode and gt_record_encode: no files. The
+ * last kept record's seq and time are reported, for the seq_resume reply
+ * and for stamping a GAP found after a restart (PF-07). Run under make
+ * test / asan / memcheck. Implements RSC-01 through RSC-10.
  *
  * What these tests cannot prove: that the file is truncated and fsynced,
  * that a bad segment is renamed to .corrupt, or that seq increases across
@@ -215,6 +217,31 @@ static void test_rsc09_null_args(void)
     CHECK_EQ(gt_recover_scan(segment, len, NULL), GT_ERR_INVAL);
 }
 
+/* ---- RSC-10: the last kept record's time is reported ----
+ * Records 1-3 are stamped 2000-2002. A clean segment reports 2002. With
+ * record 3 damaged, the scan keeps 1-2 and reports 2001: the time of the
+ * last record kept, not of the one cut. A header-only segment reports 0.
+ * Storage stamps a GAP found after a restart with this time (PF-07). */
+static void test_rsc10_last_kept_timestamp(void)
+{
+    const uint32_t seqs[] = { 1, 2, 3 };
+    uint8_t segment[SEGMENT_BUF_SIZE];
+    gt_scan_result result;
+    size_t len = build_segment(segment, seqs, 3);
+
+    CHECK_EQ(gt_recover_scan(segment, len, &result), GT_OK);
+    CHECK(result.last_timestamp_us == 2002);   /* u64: too big for CHECK_EQ's long long */
+
+    segment[RECORD_OFFSET(2) + 16] ^= 0x01;   /* low byte of record 3's value */
+    CHECK_EQ(gt_recover_scan(segment, len, &result), GT_OK);
+    CHECK_EQ(result.records_kept, 2);
+    CHECK(result.last_timestamp_us == 2001);
+
+    len = build_segment(segment, NULL, 0);
+    CHECK_EQ(gt_recover_scan(segment, len, &result), GT_OK);
+    CHECK(result.last_timestamp_us == 0);
+}
+
 static const test_case_t tests[] = {
     {"RSC-01", "a header-only segment is clean", test_rsc01_header_only},
     {"RSC-02", "a clean segment is kept whole", test_rsc02_clean_segment_kept},
@@ -225,6 +252,7 @@ static const test_case_t tests[] = {
     {"RSC-07", "seq 0 counts as a record", test_rsc07_seq_zero_is_a_record},
     {"RSC-08", "a bad or short header is reported", test_rsc08_bad_header_reported},
     {"RSC-09", "NULL arguments are rejected", test_rsc09_null_args},
+    {"RSC-10", "the last kept record's time is reported", test_rsc10_last_kept_timestamp},
 };
 
 int main(void)

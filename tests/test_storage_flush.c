@@ -8,8 +8,9 @@
  * just before its record. An empty flush touches nothing, and a failed
  * write or fsync keeps every record pending. flush_due follows the N = 64
  * / T = 60 s rule. Uses tests/fake_file.h; durability is checked in the
- * fake's synced view. Run under make test / asan / memcheck. Implements
- * SFL-01 through SFL-10.
+ * fake's synced view. A GAP carries the last accepted record's time, also
+ * after a restart. Run under make test / asan / memcheck. Implements
+ * SFL-01 through SFL-11.
  *
  * What these tests cannot prove: a flush racing appends on another thread
  * (these are single-threaded; an append between two flushes stands in),
@@ -137,7 +138,8 @@ static void test_sfl02_nothing_before_flush(void)
 
 /* ---- SFL-03: a GAP lands before its record ----
  * 1 then 4: the file holds 1, then the GAP for seqs 2-3 (all sensors,
- * stamped with record 4's time), then 4. */
+ * stamped with record 1's time, when the gap could first have started:
+ * PF-07), then 4. */
 static void test_sfl03_gap_before_record(void)
 {
     const gt_file_ops *ops = fake_fs_ops(&fs);
@@ -157,8 +159,35 @@ static void test_sfl03_gap_before_record(void)
     CHECK_EQ(gap.sensor_id, GT_SENSOR_ALL);
     CHECK_EQ(gap.seq, 2);
     CHECK_EQ(gap.value, 2);
-    CHECK(gap.timestamp_us == 9000 + 4);
+    CHECK(gap.timestamp_us == 9000 + 1);
     check_committed(storage, 0, 3, 4);
+    gt_storage_close(storage);
+}
+
+/* ---- SFL-11: a GAP after a restart has the last stored time ----
+ * Storage commits seq 7 (stamped 9007) and closes without its shutdown
+ * marker, as a kill -9 leaves it. Reopened, it gets seq 10: the GAP for
+ * 8-9 carries 9007, the time of the last record on disk, which open
+ * learned from recovery. The missing records were lost after it (PF-07). */
+static void test_sfl11_gap_after_restart(void)
+{
+    const gt_file_ops *ops = fake_fs_ops(&fs);
+    gt_storage *storage = open_storage(ops, TEST_CAPACITY);
+    append_ok(storage, 7, 0);
+    CHECK_EQ(gt_storage_flush(storage, NULL), GT_OK);
+    gt_storage_close(storage);
+
+    storage = open_storage(ops, TEST_CAPACITY);
+    append_ok(storage, 10, 0);
+    CHECK_EQ(gt_storage_flush(storage, NULL), GT_OK);
+    const fake_file *file = fake_fs_file(&fs, TODAY_NAME);
+    CHECK_EQ(file->synced_len, RECORD_OFFSET(3));
+    gt_record gap;
+    CHECK_EQ(gt_record_decode(&file->synced_data[RECORD_OFFSET(1)], &gap), GT_OK);
+    CHECK_EQ(gap.type, GT_REC_GAP);
+    CHECK_EQ(gap.seq, 8);
+    CHECK_EQ(gap.value, 2);
+    CHECK(gap.timestamp_us == 9000 + 7);   /* u64: too big for CHECK_EQ's long long */
     gt_storage_close(storage);
 }
 
@@ -299,6 +328,7 @@ static const test_case_t tests[] = {
     {"SFL-08", "a failed fsync keeps every record", test_sfl08_failed_fsync_keeps_records},
     {"SFL-09", "flush_due follows N and T", test_sfl09_flush_due_rules},
     {"SFL-10", "NULL storage is rejected", test_sfl10_null_args},
+    {"SFL-11", "a GAP after a restart has the last time", test_sfl11_gap_after_restart},
 };
 
 int main(void)

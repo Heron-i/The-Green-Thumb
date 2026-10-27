@@ -151,7 +151,7 @@ Log format for every component: `timestamp level component event key=value`. `ti
 | Storage | Disk full, or backlog fills during an outage | ENOSPC / `statvfs`; queue depth (1 MB, about 11 h) | Log the backlog at 50/75/90%; never delete history early; when full, refuse and count new readings and write a gap record on recovery | `storage_disk_full`, `storage_backlog`, `storage_degraded`, `storage_recovered` |
 | Storage | Corrupt tail or bad segment header after a crash | Startup scan: bad magic, CRC or header, backwards seq, partial record | Truncate at the first bad record (or rename a bad segment to `.corrupt`) and fsync, then accept data | `recovery_event`, `segment_corrupt` |
 | Storage | Process crashes or hangs | SIGCHLD, or no heartbeat for 5 s | Supervisor restarts it; recovery runs before the socket accepts data | `child_exit` / `heartbeat_timeout`, `recovery_event` |
-| Storage | Killed (`kill -9` or OOM) with an unsynced batch, or with records the hub sent still unread in `storage.sock` | After restart, the running hub's first `seq` is greater than storage's last accepted + 1 | Loss is limited to the unsynced batch plus the socket's unread records (≤ 60 s, the same bound as a power cut) and is made explicit: storage writes one GAP record (`sensor_id` 0, `seq` = last accepted + 1, count = the missing `seq`s) before the hub's record. This relies on the hub keeping its counter across the reconnect (hub row above). If the hub restarted too, it has no counter, no hole appears, and the loss shows only as `unclean_shutdown` (*Power* row). An empty log (`has_last` = 0) accepts any first `seq`, so wiping the log is not reported as a gap | `recovery_gap` |
+| Storage | Killed (`kill -9` or OOM) with an unsynced batch, or with records the hub sent still unread in `storage.sock` | After restart, the running hub's first `seq` is greater than storage's last accepted + 1 | Loss is limited to the unsynced batch plus the socket's unread records (≤ 60 s, the same bound as a power cut) and is made explicit: storage writes one GAP record (`sensor_id` 0, `seq` = last accepted + 1, count = the missing `seq`s, timestamp = the last accepted record's time) before the hub's record. This relies on the hub keeping its counter across the reconnect (hub row above). If the hub restarted too, it has no counter, no hole appears, and the loss shows only as `unclean_shutdown` (*Power* row). An empty log (`has_last` = 0) accepts any first `seq`, so wiping the log is not reported as a gap | `recovery_gap` |
 | Storage | Malformed message on `storage.sock` | `gt_msg_decode()` fails | Discard it and close the connection; the hub reconnects | `ipc_bad_message` |
 | Storage | Filesystem remounted read-only (ext4 after SD errors) | `open()` / `write()` returns EROFS | Mark degraded and queue in memory (1 MB); this needs a reboot or fsck, so log it as an error | `storage_readonly`, `storage_degraded` |
 | Storage | `fsync()` stalls for seconds (consumer SD) | fsync duration measured on every commit | Log any fsync over 1 s. Storage's heartbeat is sent by the rx thread, which never blocks on disk, and carries "flush in progress since t" plus the committed-record count. The supervisor allows up to 30 s while a flush is in progress, and still kills storage if the committed count stops advancing past that | `fsync_slow` |
@@ -234,7 +234,7 @@ The log is an **append-only binary log** of fixed 24 B records, packed and littl
 - A gap ends at the timestamp of the next DATA record for the same sensor, so it needs no separate end field.
 - Every record has a `seq`, and `seq` is strictly increasing across the log:
   - Gaps created by a sensor or by the hub receive a hub-assigned `seq`.
-  - Gaps created by storage use the `seq` of the first refused reading.
+  - Gaps created by storage use the `seq` of the first refused reading. Their timestamp is that of the last record storage accepted before the gap: the earliest moment the gap could have started, since the missing readings' own times are lost with them. After a restart, recovery supplies it from the newest record on disk. A storage gap (`sensor_id` 0) ends at the next record of any sensor.
 - Any record with an unknown `record_type` is treated as corrupt.
 
 **Storage → hub `seq_resume` reply** (8 B, little-endian, defined in `include/storage_proto.h`), sent once as soon as the hub connects to `storage.sock`:
@@ -267,6 +267,7 @@ The log is an **append-only binary log** of fixed 24 B records, packed and littl
 ### How records are organized
 
 - There is one segment file per UTC day: `/var/lib/plantpi/log-YYYYMMDD.bin`.
+  - At midnight, storage first flushes the records it is holding into the old day's file, then creates the new one. A record goes into the previous day's file only if it arrived between midnight and the flush thread's next pass (≤ 1 s).
 - Records are appended in `seq` order. Only the current day's file is open for writing, so only its tail can ever need recovery.
 - When a new segment is created, storage fsyncs the directory as well, so the new file cannot disappear after a power cut.
 
@@ -299,7 +300,7 @@ This follows the project's policy: protect existing history, and make any unavoi
   - The batch stays in memory and storage is marked degraded immediately.
   - On the next cycle, storage truncates the file back to the last committed offset, then rewrites and fsyncs the batch, so no duplicate or partial records reach the log.
   - While the disk is unavailable, records keep queueing in the pending buffer, up to 1 MB (about 11 h). Storage logs `storage_backlog` once at each of 50%, 75% and 90% going up.
-  - When the buffer is full, storage refuses and counts new readings (`storage_degraded reason=queue_full`, once per full spell). The next accepted reading skips their `seq`s, so a GAP whose `seq` is the first refused reading and whose count is the number refused goes in just before it.
+  - When the buffer is full, storage refuses and counts new readings (`storage_degraded reason=queue_full`, once per full spell). The next accepted reading skips their `seq`s, so a GAP whose `seq` is the first refused reading and whose count is the number refused goes in just before it. The GAP is stamped with the time of the last reading storage accepted before the refusals.
 
 See *Mechanism D* (batching, durability point and outage rows) and *Failure-mode table → Storage*.
 

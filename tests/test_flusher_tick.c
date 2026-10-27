@@ -171,10 +171,11 @@ static void test_ftk04_unsynced_once_per_spell(void)
     gt_storage_close(storage);
 }
 
-/* ---- FTK-05: a new day is logged and used ----
- * The first pass after midnight rolls over (segment_rollover, INFO) and
- * the due record is written to the new segment in the same pass. */
-static void test_ftk05_new_day_used(void)
+/* ---- FTK-05: a new day is logged; old records stay ----
+ * The first pass after midnight rolls over (segment_rollover, INFO). The
+ * record received before midnight is written to the old day's segment
+ * before the switch (PF-06), so the new segment holds just its header. */
+static void test_ftk05_new_day_keeps_old_records(void)
 {
     gt_flusher flusher;
     gt_storage *storage = open_with_flusher(&flusher);
@@ -183,8 +184,8 @@ static void test_ftk05_new_day_used(void)
     gt_flusher_tick(&flusher, TOMORROW_US, AGE_LIMIT_MS, 1);
     CHECK_EQ(logged("segment_rollover"), 1);
     CHECK_EQ(book.levels[0], GT_LOG_INFO);
-    CHECK_EQ(fake_fs_file(&fs, TOMORROW_NAME)->synced_len, GT_SEG_HEADER_SZ + GT_REC_SIZE);
-    CHECK_EQ(fake_fs_file(&fs, TODAY_NAME)->synced_len, GT_SEG_HEADER_SZ);
+    CHECK_EQ(fake_fs_file(&fs, TODAY_NAME)->synced_len, GT_SEG_HEADER_SZ + GT_REC_SIZE);
+    CHECK_EQ(fake_fs_file(&fs, TOMORROW_NAME)->synced_len, GT_SEG_HEADER_SZ);
     gt_storage_close(storage);
 }
 
@@ -200,7 +201,7 @@ static const test_case_t tests[] = {
     {"FTK-02", "a due pass commits quietly", test_ftk02_due_pass_commits},
     {"FTK-03", "a failed flush is logged", test_ftk03_failed_flush_logged},
     {"FTK-04", "unsynced is logged once per spell", test_ftk04_unsynced_once_per_spell},
-    {"FTK-05", "a new day is logged and used", test_ftk05_new_day_used},
+    {"FTK-05", "a new day is logged; old records stay", test_ftk05_new_day_keeps_old_records},
     {"FTK-06", "NULL is a safe no-op", test_ftk06_null_safe},
 };
 

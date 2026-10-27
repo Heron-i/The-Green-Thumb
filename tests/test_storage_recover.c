@@ -8,7 +8,7 @@
  * bad header is renamed to .corrupt and the directory fsynced. Failures of
  * any file op are reported, never hidden, and no handle or memory is
  * leaked on any path. Uses tests/fake_file.h, so no disk is touched. Run
- * under make test / asan / memcheck. Implements SRV-01 through SRV-10.
+ * under make test / asan / memcheck. Implements SRV-01 through SRV-11.
  *
  * What these tests cannot prove: that real ext4 behaves like the fake
  * (Mechanism D Step 12a's loopback tests and the on-Pi power pulls do),
@@ -280,6 +280,24 @@ static void test_srv10_bad_args(void)
     CHECK_EQ(fs.open_calls, 0);
 }
 
+/* ---- SRV-11: the report carries the last kept record's time ----
+ * 2 records stamped 2000 and 2001, then a torn tail: after the cut, the
+ * report gives 2001, the time of the last record left in the file. Open
+ * passes it on so a GAP found after a restart can be stamped (PF-07). */
+static void test_srv11_report_last_timestamp(void)
+{
+    const uint32_t seqs[] = { 1, 2 };
+    uint8_t segment[SEGMENT_BUF_SIZE];
+    size_t good_len = build_segment(segment, seqs, 2);
+    memset(&segment[good_len], 0xA7, 10);
+    const gt_file_ops *ops = setup(segment, good_len + 10);
+    gt_recover_report report;
+
+    recover_expect(ops, GT_OK, &report);
+    CHECK_EQ(report.outcome, GT_RECOVER_TRUNCATED);
+    CHECK(report.last_timestamp_us == 2001);   /* u64: too big for CHECK_EQ's long long */
+}
+
 static const test_case_t tests[] = {
     {"SRV-01", "a clean segment is left alone", test_srv01_clean_left_alone},
     {"SRV-02", "a header-only segment is clean", test_srv02_header_only_clean},
@@ -291,6 +309,7 @@ static const test_case_t tests[] = {
     {"SRV-08", "a failed truncate or fsync is reported", test_srv08_truncate_fsync_failures},
     {"SRV-09", "a failed rename or fsync_dir is reported", test_srv09_rename_failures},
     {"SRV-10", "bad arguments are rejected", test_srv10_bad_args},
+    {"SRV-11", "the report carries the last record's time", test_srv11_report_last_timestamp},
 };
 
 int main(void)
