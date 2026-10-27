@@ -15,6 +15,21 @@
 static const char *const level_names[] = { "DEBUG", "INFO", "WARN", "ERROR" };
 #define LEVEL_COUNT (sizeof level_names / sizeof level_names[0])
 
+/* 1 if gt_log_format's arguments can make a valid line, 0 if not. */
+static int log_args_valid(const char *line_out, size_t line_size, gt_log_level level,
+                          const char *component, const char *event)
+{
+    if (line_out == NULL || line_size == 0 || component == NULL || event == NULL) {
+        return 0;
+    }
+    /* Cast to unsigned so a negative stray value is also out of range. */
+    if ((unsigned)level >= LEVEL_COUNT) {
+        return 0;
+    }
+    /* A space would split one field into two when the line is parsed. */
+    return strchr(component, ' ') == NULL && strchr(event, ' ') == NULL;
+}
+
 /* Format one line into line_out. snprintf never writes more than line_size
  * bytes and always ends with '\0', and it returns the length the whole line
  * would have had, so a result >= line_size means the line was cut:
@@ -23,15 +38,7 @@ gt_status gt_log_format(char *line_out, size_t line_size, uint64_t timestamp_us,
                         gt_log_level level, const char *component,
                         const char *event, const char *fields)
 {
-    if (line_out == NULL || line_size == 0 || component == NULL || event == NULL) {
-        return GT_ERR_INVAL;
-    }
-    /* Cast to unsigned so a negative stray value is also out of range. */
-    if ((unsigned)level >= LEVEL_COUNT) {
-        return GT_ERR_INVAL;
-    }
-    /* A space would split one field into two when the line is parsed. */
-    if (strchr(component, ' ') != NULL || strchr(event, ' ') != NULL) {
+    if (!log_args_valid(line_out, line_size, level, component, event)) {
         return GT_ERR_INVAL;
     }
 
@@ -42,8 +49,5 @@ gt_status gt_log_format(char *line_out, size_t line_size, uint64_t timestamp_us,
     if (line_length < 0) {
         return GT_ERR_INVAL;   /* snprintf could not format at all */
     }
-    if ((size_t)line_length >= line_size) {
-        return GT_ERR_FULL;
-    }
-    return GT_OK;
+    return (size_t)line_length >= line_size ? GT_ERR_FULL : GT_OK;
 }

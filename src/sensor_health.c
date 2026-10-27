@@ -39,26 +39,21 @@ int gt_health_should_read(const gt_health *health, uint64_t now_ms)
     return now_ms >= health->next_probe_ms;
 }
 
-/* Record one read result taken at `now_ms` and return the transition, if
- * any. Any success resets the failure run (and ends an outage); the 10th
- * consecutive failure starts one. While offline, each failed probe pushes
- * the next probe GT_HEALTH_RETRY_MS past this one, measured from the probe
- * itself so a late probe never shortens the gap. */
-gt_health_event gt_health_record(gt_health *health, gt_status read_result, uint64_t now_ms)
+/* A successful read: reset the failure run, and end an outage if one is on. */
+static gt_health_event record_success(gt_health *health)
 {
-    if (health == NULL) {
-        return GT_HEALTH_EV_NONE;
+    health->consecutive_fails = 0;
+    if (health->state == GT_HEALTH_OFFLINE) {
+        health->state = GT_HEALTH_ONLINE;
+        return GT_HEALTH_EV_ONLINE;
     }
+    return GT_HEALTH_EV_NONE;
+}
 
-    if (read_result == GT_OK) {
-        health->consecutive_fails = 0;
-        if (health->state == GT_HEALTH_OFFLINE) {
-            health->state = GT_HEALTH_ONLINE;
-            return GT_HEALTH_EV_ONLINE;
-        }
-        return GT_HEALTH_EV_NONE;
-    }
-
+/* A failed read: push the next probe while offline, else count the failure
+ * and go offline on the GT_HEALTH_OFFLINE_AFTER-th in a row. */
+static gt_health_event record_failure(gt_health *health, uint64_t now_ms)
+{
     if (health->state == GT_HEALTH_OFFLINE) {
         health->next_probe_ms = now_ms + GT_HEALTH_RETRY_MS;
         return GT_HEALTH_EV_NONE;
@@ -71,6 +66,19 @@ gt_health_event gt_health_record(gt_health *health, gt_status read_result, uint6
         return GT_HEALTH_EV_OFFLINE;
     }
     return GT_HEALTH_EV_NONE;
+}
+
+/* Record one read result taken at `now_ms` and return the transition, if
+ * any. Any success resets the failure run (and ends an outage); the 10th
+ * consecutive failure starts one. While offline, each failed probe pushes
+ * the next probe GT_HEALTH_RETRY_MS past this one, measured from the probe
+ * itself so a late probe never shortens the gap. */
+gt_health_event gt_health_record(gt_health *health, gt_status read_result, uint64_t now_ms)
+{
+    if (health == NULL) {
+        return GT_HEALTH_EV_NONE;
+    }
+    return read_result == GT_OK ? record_success(health) : record_failure(health, now_ms);
 }
 
 /* Map a transition to its DESIGN.md log event name. NONE and any stray

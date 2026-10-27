@@ -319,37 +319,17 @@ static void report_lock_error(const char *sock_path, int already_running)
     fprintf(stderr, "storage_main: lock %s.lock: %s\n", sock_path, strerror(errno));
 }
 
-int main(int argc, char **argv)
+/* Start-up step 2: make the log directory if it isn't there yet (a fresh
+ * install), open storage (recovery runs here), log what open found, and
+ * set the clock and (N, T) before the flush thread starts. N and T were
+ * range-checked by the caller, so set_batch can't fail (PF-11). Returns
+ * NULL on failure, already reported. */
+static gt_storage *open_storage(const char *log_dir, unsigned long batch_records,
+                                unsigned long batch_age_s)
 {
-    unsigned long batch_records = GT_BATCH_MAX_RECORDS;
-    unsigned long batch_age_s = GT_BATCH_MAX_AGE_S;
-    int arg_base = 1;
-    if (!parse_batch_options(argc, argv, &batch_records, &batch_age_s, &arg_base)
-        || argc - arg_base != 2) {
-        fprintf(stderr,
-                "usage: %s [-n N] [-t T_SECONDS] /var/lib/plantpi /run/plantpi/storage.sock\n"
-                "  N: flush at N records, 1..%u (default %u)\n"
-                "  T: flush once the oldest record is T s old, 1..%u (default %u)\n",
-                argv[0], (unsigned)GT_PENDING_MAX_RECORDS, (unsigned)GT_BATCH_MAX_RECORDS,
-                (unsigned)BATCH_AGE_MAX_S, (unsigned)GT_BATCH_MAX_AGE_S);
-        return 2;
-    }
-    const char *log_dir = argv[arg_base];
-    const char *sock_path = argv[arg_base + 1];
-
-    /* 1. The lock, before anything touches the log. */
-    int lock_fd = -1, already_running = 0;
-    if (gt_listen_lock(sock_path, &lock_fd, &already_running) != GT_OK) {
-        report_lock_error(sock_path, already_running);
-        return 1;
-    }
-
-    /* 2. Open storage; recovery runs here. The log directory is made if
-     * it isn't there yet (a fresh install). */
     if (mkdir(log_dir, 0755) != 0 && errno != EEXIST) {
         fprintf(stderr, "storage_main: %s: %s\n", log_dir, strerror(errno));
-        gt_listen_release(sock_path, -1, lock_fd);
-        return 1;
+        return NULL;
     }
     wait_for_clock_if_empty(log_dir);
     gt_storage *storage = NULL;
@@ -359,14 +339,33 @@ int main(int argc, char **argv)
         char fields[48];
         snprintf(fields, sizeof fields, "status=%d", (int)status);
         log_line(NULL, GT_LOG_ERROR, "storage_open_error", fields);
+        return NULL;
+    }
+    log_open_info(&info, batch_records, batch_age_s);
+    gt_storage_set_clock(storage, monotonic_us);
+    gt_storage_set_batch(storage, (size_t)batch_records, (unsigned)batch_age_s);
+    return storage;
+}
+
+/* The whole life of the process after the arguments are read: start-up
+ * steps 1-4, the rx loop, then shutdown. Returns the exit code: 0 for a
+ * clean stop, 1 for any failure. */
+static int run_storage(const char *log_dir, const char *sock_path,
+                       unsigned long batch_records, unsigned long batch_age_s)
+{
+    /* 1. The lock, before anything touches the log. */
+    int lock_fd = -1, already_running = 0;
+    if (gt_listen_lock(sock_path, &lock_fd, &already_running) != GT_OK) {
+        report_lock_error(sock_path, already_running);
+        return 1;
+    }
+
+    /* 2. Open storage; recovery runs here. */
+    gt_storage *storage = open_storage(log_dir, batch_records, batch_age_s);
+    if (storage == NULL) {
         gt_listen_release(sock_path, -1, lock_fd);
         return 1;
     }
-    log_open_info(&info, batch_records, batch_age_s);
-    gt_storage_set_clock(storage, monotonic_us);   /* before the flush thread starts */
-    /* N and T were range-checked above, so this can't fail; it is set
-     * before the flush thread starts, like the clock (PF-11). */
-    gt_storage_set_batch(storage, (size_t)batch_records, (unsigned)batch_age_s);
 
     /* 3. Bind storage.sock, and make the stop pipe. */
     int listen_fd = -1;
@@ -430,4 +429,22 @@ int main(int argc, char **argv)
     close(stop_pipe[1]);
     gt_listen_release(sock_path, listen_fd, lock_fd);
     return shutdown_status == GT_OK && flusher_running ? 0 : 1;
+}
+
+int main(int argc, char **argv)
+{
+    unsigned long batch_records = GT_BATCH_MAX_RECORDS;
+    unsigned long batch_age_s = GT_BATCH_MAX_AGE_S;
+    int arg_base = 1;
+    if (!parse_batch_options(argc, argv, &batch_records, &batch_age_s, &arg_base)
+        || argc - arg_base != 2) {
+        fprintf(stderr,
+                "usage: %s [-n N] [-t T_SECONDS] /var/lib/plantpi /run/plantpi/storage.sock\n"
+                "  N: flush at N records, 1..%u (default %u)\n"
+                "  T: flush once the oldest record is T s old, 1..%u (default %u)\n",
+                argv[0], (unsigned)GT_PENDING_MAX_RECORDS, (unsigned)GT_BATCH_MAX_RECORDS,
+                (unsigned)BATCH_AGE_MAX_S, (unsigned)GT_BATCH_MAX_AGE_S);
+        return 2;
+    }
+    return run_storage(argv[arg_base], argv[arg_base + 1], batch_records, batch_age_s);
 }

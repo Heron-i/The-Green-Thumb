@@ -65,6 +65,24 @@ gt_status gt_recover_scan(const uint8_t *bytes, size_t len, gt_scan_result *out)
     return GT_OK;
 }
 
+/* Read `len` (> 0) bytes from the start of the file into a new malloc'd
+ * buffer, stored in *bytes_out only on success; freed again if the read
+ * fails. */
+static gt_status read_into_new_buffer(const gt_file_ops *ops, void *ctx, int handle,
+                                      size_t len, uint8_t **bytes_out)
+{
+    uint8_t *bytes = malloc(len);
+    if (bytes == NULL) {
+        return GT_ERR_NOMEM;
+    }
+    if (ops->pread(ctx, handle, 0, bytes, len) != GT_OK) {
+        free(bytes);
+        return GT_ERR_IO;
+    }
+    *bytes_out = bytes;
+    return GT_OK;
+}
+
 /* Read the whole open file into a new malloc'd buffer. *bytes_out is NULL
  * for an empty file (there is nothing to allocate). The caller frees the
  * buffer with free(), which accepts NULL. A size that changes when it is
@@ -87,17 +105,7 @@ static gt_status read_whole_file(const gt_file_ops *ops, void *ctx, int handle,
     if (file_size == 0) {
         return GT_OK;
     }
-
-    uint8_t *bytes = malloc((size_t)file_size);
-    if (bytes == NULL) {
-        return GT_ERR_NOMEM;
-    }
-    if (ops->pread(ctx, handle, 0, bytes, (size_t)file_size) != GT_OK) {
-        free(bytes);
-        return GT_ERR_IO;
-    }
-    *bytes_out = bytes;
-    return GT_OK;
+    return read_into_new_buffer(ops, ctx, handle, (size_t)file_size, bytes_out);
 }
 
 /* 1 if a file called `name` can be opened, i.e. it exists. */
