@@ -1,6 +1,8 @@
 # Sensor Pipeline: plan and status
 
-The official plan for Green Thumb's sensor-side pipeline, from the I2C seam up to the 16 B message a sensor process sends to the hub and the 24 B record the hub sends to storage. That covers the BH1750 light-sensor driver and the shared pieces it relies on: sensor health tracking, the log line formatter, the sensor→hub message and the hub→storage record codec, plus the IPC client that carries the 16 B message over `hub.sock`. A new session should be able to read this file, plus `CLAUDE.md` and `DESIGN.md`, and pick up where work stopped without re-explanation. **Update the Status section only at the end of the day, when asked.**
+The official plan for Green Thumb's sensor-side pipeline, from the I2C seam up to the 16 B message a sensor process sends to the hub and the 24 B record the hub sends to storage. That covers the BH1750 light-sensor driver and the shared pieces it relies on: sensor health tracking, the log line formatter, the sensor→hub message and the hub→storage record codec, plus the IPC client that carries the 16 B message over `hub.sock`. A new session should be able to read this file, plus `CLAUDE.md` and `DESIGN.md`, and pick up where work stopped without re-explanation.
+
+Since 2026-10-26 the file also holds a second top-level part, *Mechanism D: storage*, with its own Goal, Code map, Decisions, Status, *Not done yet* and Log. So there are two Status sections: **Status** (the sensor pipeline and IPC, Steps 0–24) and **Status (Mechanism D)** (storage). **Update either Status section only at the end of the day, when asked.**
 
 ## Context
 - **Owner:** Lily (DESIGN.md → Ownership map: "Light sensor (driver and process)" and "IPC (data path)").
@@ -17,7 +19,7 @@ The official plan for Green Thumb's sensor-side pipeline, from the I2C seam up t
 - **IPC seam (same idea as the I2C seam):** `src/ipc_sock.c` is the only file that makes socket system calls (`socket`, `connect`, `send`, `close`). The IPC client (`src/ipc_client.c`) talks to the socket only through `gt_sock_ops` (`connect` / `send` / `disconnect` / `destroy`), with the current time passed in as `now_ms`. Tests swap in `tests/fake_sock.h`, so the backoff, ring and GAP logic all run in WSL/CI with no hub and no real waiting.
 
 ### Code map
-How the modules work together to carry a reading from sensor → IPC → hub → storage. Legend: ✅ done · ☐ later. The IPC phase (Steps 10–24) is complete; `hub_listen` stands in for the hub until `hub.c` exists.
+How the modules work together to carry a reading from sensor → IPC → hub → storage. Legend: ✅ done · ☐ later. The IPC phase (Steps 10–24) is complete; `hub_listen` stands in for the hub until `hub.c` exists. The storage process is built (*Mechanism D: storage* at the end of this file has its own, more detailed code map).
 
 ```mermaid
 flowchart LR
@@ -34,12 +36,12 @@ flowchart LR
     subgraph HUB["hub process · hub_listen_main.c ✅ stand-in now, hub_main.c ☐ later"]
         FRM["ipc_msg.c ✅<br/>gt_ipc_frame_decode"]
         DEC["ipc_msg.c ✅<br/>gt_msg_decode"]
-        ACC["hub.c ☐<br/>gt_hub_accept: validate · stamp seq + µs"]
+        ACC["hub.c ☐<br/>gt_hub_accept: validate · stamp µs<br/>(seq + CRC at send, PF-01)"]
         RENC["log_record.c ✅<br/>gt_record_encode + CRC"]
     end
-    subgraph STO["storage process ☐"]
-        RDEC["log_record.c ✅<br/>gt_record_decode"]
-        APP["storage.c ☐<br/>append · flush · fsync"]
+    subgraph STO["storage process · storage_main.c ✅"]
+        RDEC["storage_server.c ✅<br/>gt_storage_serve: rx loop"]
+        APP["storage.c ✅<br/>append (gt_record_decode + seq guard)<br/>flush · fsync · rollover"]
     end
 
     SMP -->|"due? read"| DRV --> BUS
@@ -63,9 +65,11 @@ flowchart LR
 | `ipc_client.c` | `gt_sock_ops` (`ipc_sock.c`, or the fake in tests) | the frame | OK / FULL (`EAGAIN`) / IO (peer gone) |
 | sensor main loop | `gt_log_format` | the event name + `key=value` fields | the log line |
 | hub `recv()` | `gt_ipc_frame_decode` | 17 B buffer + length | `gt_msg`, or CORRUPT / IO |
-| hub | `gt_hub_accept` | `gt_msg` + `now_us` | `gt_record` |
-| hub | `gt_record_encode` | `gt_record` | 24 B → `storage.sock` |
-| storage rx thread | `gt_record_decode` → `gt_storage_append` | 24 B | batch → flush thread → fsync |
+| hub | `gt_hub_accept` | `gt_msg` + `now_us` | `gt_record` with `seq` left 0 (PF-01) |
+| hub sender | `gt_next_seq`, then `gt_record_encode` | the queued record, stamped with `next_seq` just before `send()` | 24 B → `storage.sock` |
+| `storage_main` | `gt_storage_open` (wraps `gt_storage_open_ops` with the Linux file layer) | log directory + `now_us` | `gt_storage` + open info (recovery, last `seq` and its time) |
+| storage rx loop (`gt_storage_serve`) | `gt_storage_append` | the raw 24 B as received + `now_ms` (decoded and checked inside, stored unchanged) | OK / CORRUPT / FULL + event flags |
+| storage flush thread (`gt_flusher_tick`) | `gt_storage_rollover`, then `gt_storage_flush` | `now_us`, `now_ms`, clock synced | write + fsync of the pending batch, event flags |
 
 ### The "electrically alive" ladder
 Each rung can only be checked once the rung below it passes. `light_probe` prints rungs 1–4 as a PASS/FAIL checklist on the Pi.
@@ -615,7 +619,7 @@ _Update at the end of the day, when asked: tick the step table, and add one Log 
 The IPC client is complete (Steps 10–24): send, pump, the 64-slot ring, reconnect backoff, overflow with the GAP message, stats, and the Linux socket layer, with `hub_listen` standing in for the hub. These are what's left before a reading can travel from the light sensor to storage, next item first:
 - **`src/light_sensor_main.c`** (not started, next): the 1000 ms sampler, the health tracker and the IPC client (`send` each reading, `pump` every tick), plus a heartbeat to `sup.sock`. This is also where the log sink (stderr, a file or the monitor process) and wall-clock timestamps for log lines get decided. Its prerequisite, the IPC client, is now done. It unblocks IPC ladder rungs 3–4 on the Pi against `hub_listen`.
 - **`gt_hub_accept`** (no `src/hub.c` yet): its signature was updated in Step 7 to output a `gt_record`, but it isn't implemented. It has to validate the message (including the `reading_invalid` range check), stamp `seq` and the µs receive time, and build the record that `gt_record_encode` turns into bytes for `storage.sock`. The hub process that calls it replaces `hub_listen` (rung 6). It must follow the one-listener-per-socket lock rule (*Decisions*), and that is the point where the lock moves into a shared `src/` helper with `fork()`-based tests.
-- **Hop 2 sender** (not started; see *Later*): the hub's 1024-record queue to `storage.sock`, and reading storage's `seq_resume` reply on connect. **The storage process itself is done:** see *Mechanism D: storage* at the end of this file.
+- **Hop 2 sender** (not started; see *Later*): the hub's 1024-record queue to `storage.sock`, and reading storage's `seq_resume` reply on connect. **The storage process is built** and passes its WSL fault rounds; disk full, the read-only file system, the heartbeat and the on-Pi power pulls are still open. See *Mechanism D: storage* at the end of this file, and its *Not done yet*.
 - **On-Pi `light_probe` run** (not recorded): `make light_probe` on the Pi with the BH1750 attached. Record the rung 1–4 PASS/FAIL results and the jitter numbers in the table above. It needs real I2C, so it can't run in WSL or CI.
 - **On-Pi IPC ladder rungs 3–6** (not run): need the light process (rungs 3–4), Lucas's soil process (rung 5) and the hub (rung 6). See *Verification*.
 

@@ -29,9 +29,9 @@ Adversarial review of branch `Menu-Mechanism-D` (Lucas's Mechanism D storage wor
 | PF-14 | Some log lines are missing their `key=value` fields | DESIGN.md | Low | Open |
 | PF-15 | Doc errors: "lux" range check, wrong decode function | [Both docs] / DESIGN.md | Low | Resolved (2026-10-26) |
 | PF-16 | Socket calls outside `src/ipc_sock.c` | Sensor-Pipeline.md | Low | Open |
-| PF-17 | Lily's Status section edited; "storage is done" overclaims | Sensor-Pipeline.md | Low | Open |
+| PF-17 | Lily's Status section edited; "storage is done" overclaims | Sensor-Pipeline.md | Low | Resolved (2026-10-27) |
 | PF-18 | The log sink was chosen by one side | Sensor-Pipeline.md | Low | Open |
-| PF-19 | The Code map is out of date | Sensor-Pipeline.md | Low | Open |
+| PF-19 | The Code map is out of date | Sensor-Pipeline.md | Low | Resolved (2026-10-27) |
 | PF-20 | Smaller storage edge cases | DESIGN.md | Low | Open |
 
 Resolved since the first pass: `storage_main.c` now exists, `seq_resume` is documented in DESIGN.md, and DESIGN.md's memory budget now matches the single pending buffer (see *What meets the plans*).
@@ -191,6 +191,10 @@ Storage itself was correct: the feed's output file later held `seq_resume: last=
 - **Sensor-Pipeline.md**: "Update the Status section only at the end of the day, when asked." The PR rewrites Lily's *Not done yet* bullet to say "**The storage process itself is done**".
 - Lucas's own *Not done yet (Mechanism D)* still lists disk full, read-only filesystem, the heartbeat, and the fault and power-pull runs.
 - The file's opening paragraph still scopes it to "the 24 B record the hub sends to storage", but it now ends with a second top-level section with its own Status, *Not done yet* and Log, so "update Status" no longer says which one.
+- **Resolution (2026-10-27):**
+  - **The overclaim:** the *Not done yet* bullet now says the storage process "is built and passes its WSL fault rounds". It names what is still open (disk full, read-only, heartbeat, on-Pi power pulls) and points to Mechanism D's own list.
+  - **The opening paragraph:** it now says the file has a second part, *Mechanism D: storage*, and names both Status sections. The rule applies to either: update only at the end of the day, when asked.
+  - **Not settled here:** who owns each section. DESIGN.md's Evaluation plan gives Lily the pipeline "→ storage (Mechanism D)", while this review calls Mechanism D Lucas's work. That's for the two of you to agree.
 
 ### PF-18: The log sink was chosen by one side
 - **Sensor-Pipeline.md** (*Decisions → Log sink deferred*): where log lines go is to be decided together with the light process.
@@ -199,6 +203,9 @@ Storage itself was correct: the feed's output file later held `seq_resume: last=
 ### PF-19: The Code map is out of date
 - The diagram still shows the storage process as not built (☐).
 - The "storage rx thread" row says `gt_record_decode → gt_storage_append(gt_record)`; `gt_storage_append` now takes the raw 24 B and decodes them itself, and `gt_storage_open` has a new signature.
+- **Resolution (2026-10-27):**
+  - **The diagram:** the storage process is marked built (`storage_main.c`, with `gt_storage_serve` as the rx loop, and `storage.c` doing append with decode and the seq guard, flush, fsync and rollover). The hub's `gt_hub_accept` box now says it stamps µs only, with `seq` and CRC added at send (PF-01).
+  - ***Who calls whom*:** new rows for `gt_storage_open` (wrapping `gt_storage_open_ops`), `gt_storage_append` (raw 24 B + `now_ms`, with its OK / CORRUPT / FULL results), the flush thread's rollover-then-flush, and the hub sender's `gt_next_seq` + encode.
 
 ## Smaller storage edge cases
 
@@ -233,5 +240,5 @@ Storage itself was correct: the feed's output file later held `seq_resume: last=
 1. ~~**Decide PF-01 to PF-03 in DESIGN.md:** the hub stamps the timestamp on arrival and `seq` + CRC at send time; the socket seam gains a `recv` op and the sender a "waiting for `seq_resume`" state; a running hub keeps its own `seq` counter. Update Sensor-Pipeline.md's *Decisions* and `include/hub.h` to match.~~ **Done in both documents (2026-10-26).** `include/hub.h` waits for the hub steps.
 2. ~~**Fix PF-04** (and PF-05), then run `storage_faults.sh sigterm 20` and `kill9 50` and record the results.~~ **Done (2026-10-26):** both ran with 0 failed checks; results are in PF-04/05 and the Mechanism D Status table.
 3. ~~**Fix or document PF-06 and PF-07.**~~ **Done (2026-10-26):** both fixed test-first; see their Resolution lines.
-4. ~~**Mark PF-09's rows as planned**~~ (done 2026-10-26) and settle PF-10's heartbeat owner thread.
-5. **Clean up the docs:** ~~PF-15 (restore "raw count")~~ (done 2026-10-26), PF-17 (Status ownership and file scope), PF-19 (Code map).
+4. ~~**Mark PF-09's rows as planned**~~ (done 2026-10-26) and settle PF-10's heartbeat owner thread (Lucas owns the heartbeat and will settle it).
+5. ~~**Clean up the docs:** PF-15 (restore "raw count"), PF-17 (Status ownership and file scope), PF-19 (Code map).~~ **Done** (PF-15 2026-10-26; PF-17 and PF-19 2026-10-27). Who owns each Status section is left to the team (PF-17).
