@@ -148,6 +148,70 @@ static uint64_t wall_us(void)
     return (uint64_t)now.tv_sec * 1000000u + (uint64_t)now.tv_nsec / 1000u;
 }
 
+/* What one pass of the send loop came to. An enum gives names to a small
+ * set of int values, so the caller compares against FEED_STOP rather than
+ * a bare number. */
+typedef enum { FEED_SENT, FEED_RETRY, FEED_STOP } feed_result;
+
+/* Everything the send loop changes as it goes, in one struct so a helper
+ * can update it through a single pointer. */
+typedef struct {
+    int           fd;          /* the connection to storage; -1 if none */
+    uint32_t      own_next;    /* the next seq to send */
+    uint32_t      first_seq;   /* the first seq sent (valid once sent > 0) */
+    unsigned long sent;        /* records sent, over all connections */
+} feed_state;
+
+/* One pass of the send loop: connect first if there is no connection
+ * (only with -r), then send the record with seq state->own_next.
+ *   FEED_SENT:  it went; own_next and sent moved on.
+ *   FEED_RETRY: storage is not up yet or went away (only with -r); the
+ *               next pass reconnects.
+ *   FEED_STOP:  give up: a send failed without -r, or encoding failed. */
+static feed_result send_next(feed_state *state, const char *sock_path, int reconnect)
+{
+    if (state->fd < 0) {
+        state->fd = open_session(sock_path, 1, state->sent > 0, state->own_next,
+                                 &state->own_next);
+        if (state->fd < 0) {
+            const struct timespec retry_wait = { 0, 100000000L }; /* 100 ms */
+            nanosleep(&retry_wait, NULL);
+            return FEED_RETRY;
+        }
+    }
+    const gt_record record = {
+        .type = GT_REC_DATA, .sensor_id = GT_SENSOR_LIGHT,
+        .seq = state->own_next, .timestamp_us = wall_us(),
+        .value = (uint32_t)state->sent,
+    };
+    uint8_t wire[GT_REC_SIZE];
+    if (gt_record_encode(&record, wire) != GT_OK) {
+        fprintf(stderr, "storage_feed: encode seq %lu failed\n", (unsigned long)record.seq);
+        return FEED_STOP;
+    }
+    if (send(state->fd, wire, sizeof wire, MSG_NOSIGNAL) != (ssize_t)sizeof wire) {
+        if (!reconnect) {
+            fprintf(stderr, "storage_feed: send seq %lu: %s\n",
+                    (unsigned long)record.seq, strerror(errno));
+            return FEED_STOP;
+        }
+        if (state->sent > 0) {
+            printf("storage gone after seq %lu\n", (unsigned long)(state->own_next - 1));
+        } else {
+            printf("storage gone before any seq\n");
+        }
+        close(state->fd);
+        state->fd = -1;
+        return FEED_RETRY;
+    }
+    if (state->sent == 0) {
+        state->first_seq = state->own_next;
+    }
+    state->own_next++;
+    state->sent++;
+    return FEED_SENT;
+}
+
 int main(int argc, char **argv)
 {
     /* _IOLBF = line buffering: flush stdout at every '\n', even when it is
@@ -173,75 +237,38 @@ int main(int argc, char **argv)
         return 2;
     }
     const char *sock_path = argv[arg_base];
-    const struct timespec retry_wait = { 0, 100000000L }; /* 100 ms */
 
     struct timespec gap = { 0, 0 };
     if (rate_hz > 0) {
         gap.tv_sec = (time_t)(1 / rate_hz);
         gap.tv_nsec = (long)((1000000000ul / rate_hz) % 1000000000ul);
     }
-    /* own_next is the next seq to send; first_seq is the first one sent. */
-    uint32_t first_seq = 0, own_next = 0;
-    int fd = -1;
+    feed_state state = { .fd = -1, .own_next = 0, .first_seq = 0, .sent = 0 };
     if (!reconnect) {
-        fd = open_session(sock_path, 0, 0, 0, &own_next);
-        if (fd < 0) {
+        state.fd = open_session(sock_path, 0, 0, 0, &state.own_next);
+        if (state.fd < 0) {
             return 1;
         }
     }
-    unsigned long sent = 0;
-    /* invariant: every seq below own_next was sent exactly once; none is reused */
-    while (!stop_requested && ((reconnect && count == 0) || sent < count)) {
-        if (fd < 0) {
-            /* only with -r: storage is not up yet, or went away */
-            fd = open_session(sock_path, 1, sent > 0, own_next, &own_next);
-            if (fd < 0) {
-                nanosleep(&retry_wait, NULL);
-                continue;
-            }
-        }
-        const gt_record record = {
-            .type = GT_REC_DATA, .sensor_id = GT_SENSOR_LIGHT,
-            .seq = own_next, .timestamp_us = wall_us(),
-            .value = (uint32_t)sent,
-        };
-        uint8_t wire[GT_REC_SIZE];
-        if (gt_record_encode(&record, wire) != GT_OK) {
-            fprintf(stderr, "storage_feed: encode seq %lu failed\n", (unsigned long)record.seq);
+    /* invariant: every seq below state.own_next was sent exactly once; none
+     * is reused */
+    while (!stop_requested && ((reconnect && count == 0) || state.sent < count)) {
+        feed_result result = send_next(&state, sock_path, reconnect);
+        if (result == FEED_STOP) {
             break;
         }
-        if (send(fd, wire, sizeof wire, MSG_NOSIGNAL) != (ssize_t)sizeof wire) {
-            if (!reconnect) {
-                fprintf(stderr, "storage_feed: send seq %lu: %s\n",
-                        (unsigned long)record.seq, strerror(errno));
-                break;
-            }
-            if (sent > 0) {
-                printf("storage gone after seq %lu\n", (unsigned long)(own_next - 1));
-            } else {
-                printf("storage gone before any seq\n");
-            }
-            close(fd);
-            fd = -1;
-            continue;
-        }
-        if (sent == 0) {
-            first_seq = own_next;
-        }
-        own_next++;
-        sent++;
-        if (rate_hz > 0) {
+        if (result == FEED_SENT && rate_hz > 0) {
             nanosleep(&gap, NULL);
         }
     }
-    if (sent > 0) {
-        printf("sent %lu records, seq %lu..%lu\n", sent, (unsigned long)first_seq,
-               (unsigned long)(own_next - 1));
+    if (state.sent > 0) {
+        printf("sent %lu records, seq %lu..%lu\n", state.sent, (unsigned long)state.first_seq,
+               (unsigned long)(state.own_next - 1));
     } else {
         printf("sent 0 records\n");
     }
-    if (fd >= 0) {
-        close(fd);
+    if (state.fd >= 0) {
+        close(state.fd);
     }
-    return (sent == count || (reconnect && stop_requested)) ? 0 : 1;
+    return (state.sent == count || (reconnect && stop_requested)) ? 0 : 1;
 }

@@ -288,6 +288,8 @@ This follows the project's policy: protect existing history, and make any unavoi
 - The **flush thread** wakes once a second and commits when either of these comes first:
   - **N = 64 records** pending, or
   - **T = 60 s** since the **oldest** pending record was added (each record keeps its own add time, so a record that arrived during a slow flush still meets the 62 s commit target). At about 1.02 records/s, T is normally the trigger, which gives about 61 records (≈1.5 KB) per batch and about 1,440 fsyncs/day.
+- **N and T are run-time options:** `storage_main -n N -t T_SECONDS` (default 64 and 60 s; N up to the 43,690-record buffer, T up to a day), logged on `storage_start` as `batch_n` / `batch_t_s`. The (N, T) comparison in *Mechanism D* therefore runs on one build.
+- **N is acted on at once:** between its 1 s passes, the flush thread sleeps on a condition variable rather than a plain timer. The append that makes a flush due by count wakes it, so the commit starts straight away, and N = 1 really is one fsync per record. T, rollover and retention are still checked on the 1 s pass. The wake happens only when a flush *becomes* due: after a failed flush the records stay pending, and the thread retries on its next 1 s pass instead of spinning on a broken card.
 - **Commit sequence:**
   1. Lock the mutex and copy every pending record out (nothing is removed yet).
   2. Unlock. The lock is never held during I/O.
@@ -432,7 +434,7 @@ Each step runs for 10 minutes with the load generator, at N = 64 / T = 60 s. We 
 | Stress 2 | 100× (≈100 records/s) | **No backlog growth over 10 min** |
 | Stress 3 | Ramp until the backlog grows | Report the ceiling; aim ≥ 1,000 records/s (informational) |
 
-We also compare fsync count, write latency and CPU at (N, T) = (1, 1 s), (64, 10 s) and (64, 60 s), as committed in *Mechanism D*.
+We also compare fsync count, write latency and CPU at (N, T) = (1, 1 s), (64, 10 s) and (64, 60 s), as committed in *Mechanism D*, by starting `storage_main` with `-n` / `-t` (see *How writes are batched*).
 
 ### CPU usage
 

@@ -1,4 +1,4 @@
-/* Unit tests for daily rollover and retention (src/storage.c):
+/* Unit tests for daily rollover and retention (src/storage_flush.c):
  * gt_storage_rollover.
  *
  * Purpose: prove DESIGN.md "With what retention" and the clock rows of

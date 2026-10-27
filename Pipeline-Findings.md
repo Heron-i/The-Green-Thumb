@@ -23,7 +23,7 @@ Adversarial review of branch `Menu-Mechanism-D` (Lucas's Mechanism D storage wor
 | PF-08 | Commits are not logged and fsync is not timed | DESIGN.md (2 rows) | Medium | Resolved (2026-10-27) |
 | PF-09 | DESIGN.md describes disk-full and read-only handling as done | DESIGN.md | Medium | Resolved in docs (2026-10-26); handling not built |
 | PF-10 | Storage heartbeat: not built, and DESIGN.md disagrees with itself | DESIGN.md | Medium | Proposed in docs (2026-10-27); pending Lucas |
-| PF-11 | The (N, T) batching experiment can't run as specified | DESIGN.md | Low | Open |
+| PF-11 | The (N, T) batching experiment can't run as specified | DESIGN.md | Low | Resolved (2026-10-27); the experiment itself is not run yet |
 | PF-12 | The verifier doesn't compare against the hub's sent `seq`s | DESIGN.md | Low | Resolved (2026-10-27); the hub's sent-range line comes with the hub |
 | PF-13 | `clock_unsynced` / `clock_synced` are never logged | DESIGN.md | Low | Resolved (2026-10-27) |
 | PF-14 | Some log lines are missing their `key=value` fields | DESIGN.md | Low | Resolved (2026-10-27) |
@@ -170,6 +170,22 @@ Storage itself was correct: the feed's output file later held `seq_resume: last=
 ### PF-11: The (N, T) batching experiment can't run as specified
 - **DESIGN.md**, Mechanism D: compare fsync count, latency and CPU at (N, T) = (1, 1 s), (64, 10 s) and (64, 60 s).
 - N and T are compile-time `#define`s, and the flush thread checks only once a second ([src/storage_server.c:26](src/storage_server.c#L26)), so N = 1 can't mean one fsync per record, and the N = 64 trigger can be up to 1 s late.
+- **Resolution (2026-10-27):**
+  - **Run-time N and T:** `storage_main -n N -t T_SECONDS` (N 1..43,690, T 1 s..1 day; default 64 / 60 s) sets them through the new `gt_storage_set_batch` → `gt_pending_set_limits`. `storage_start` logs `batch_n` / `batch_t_s`. The `#define`s stay as the defaults, so no existing test changed.
+  - **The flusher is woken at N:** between its 1 s passes, `gt_flusher_run` waits in the new `gt_storage_wait_due` on a condition variable (`CLOCK_MONOTONIC` on Linux) instead of sleeping. The append that makes a flush due wakes it, so N = 1 is one fsync per record and N = 64 is no longer up to 1 s late. T, rollover and the clock checks stay on the 1 s pass. On stop, `storage_main` calls the new `gt_storage_wake`.
+  - **Two changes from the plan:**
+    - **Signal on "becomes due", used once.** The plan said a wait returns while pending ≥ N. That would make the flusher spin after a failed flush, because the records stay pending. Now the signal fires only when an append turns a flush from not due to due, and each wait uses it up (SWT-03).
+    - **The two cross-thread tests also check timing.** The plan said they would check return values only, but a wait that ignored the wake would still return 1 at its 2 s timeout. SWT-04/05 therefore also check the wait ended in under 1.5 s.
+  - **Tests, written first:**
+    - `PNL` (`tests/test_pending_limits.c`, 5 cases);
+    - `SBT` (`tests/test_storage_batch.c`, 4 cases);
+    - `SWT` (`tests/test_storage_wait.c`, 6 cases, two of them on a real second thread).
+
+    PNL replaced the plan's "defaults equal the `#define`s" case, which PND-05/06 already cover.
+  - **Docs:** DESIGN.md *How writes are batched* (the options and the wake) and the Evaluation plan's (N, T) line; Sensor-Pipeline.md's Mechanism D Code map, a Decisions bullet, the three prefixes and a verification step.
+  - **Still to do:**
+    - The real-process check: `storage_main -n 1 -t 1` with `storage_feed SOCK 50 10` should log about 50 `storage_commit records=1` lines.
+    - The (N, T) experiment itself, on the Pi.
 
 ### PF-12: The verifier doesn't compare against the hub's sent `seq`s
 - **DESIGN.md**, Test tooling: the verifier "then compares the log against the hub's sent-sequence log".

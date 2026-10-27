@@ -1,4 +1,4 @@
-/* Unit tests for segment file names (src/storage.c): gt_segment_name and
+/* Unit tests for segment file names (src/storage_segment.c): gt_segment_name and
  * gt_is_segment_name.
  *
  * Purpose: prove each UTC day maps to exactly one "log-YYYYMMDD.bin"

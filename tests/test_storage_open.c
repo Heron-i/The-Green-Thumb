@@ -1,4 +1,4 @@
-/* Unit tests for opening storage (src/storage.c): gt_storage_open_ops,
+/* Unit tests for opening storage (src/storage_open.c): gt_storage_open_ops,
  * gt_storage_read_stats and gt_storage_close.
  *
  * Purpose: prove open runs recovery before anything else, picks the right

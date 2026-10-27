@@ -109,6 +109,39 @@ static const char *check_order(const stream_state *stream, const gt_record *reco
     return next_in_line || covered_by_gap ? NULL : GT_VERIFY_SEQ_JUMP_UNCOVERED;
 }
 
+/* Decode the record at bytes[offset] into *record_out and check it fits
+ * the stream. Returns NULL if it does, or the failure name: a partial
+ * record at the end, bad bytes, or a seq out of order. */
+static const char *check_record_at(const uint8_t *bytes, size_t len, size_t offset,
+                                   const stream_state *stream, gt_record *record_out)
+{
+    if (len - offset < GT_REC_SIZE) {
+        return GT_VERIFY_PARTIAL_TAIL;
+    }
+    if (gt_record_decode(&bytes[offset], record_out) != GT_OK) {
+        return GT_VERIFY_BAD_RECORD;
+    }
+    return check_order(stream, record_out);
+}
+
+/* Count a good record in the report and make it the stream's newest. */
+static void tally_record(gt_verify_report *report, stream_state *stream, const gt_record *record)
+{
+    if (record->type == GT_REC_GAP) {
+        report->gap_records++;
+        report->gap_readings += record->value;
+    } else {
+        report->data_records++;
+    }
+    if (!report->has_records) {
+        report->has_records = 1;
+        report->first_seq = record->seq;
+    }
+    report->last_seq = record->seq;
+    stream->has_prev = 1;
+    stream->prev = *record;
+}
+
 /* Check one segment's bytes, continuing the stream, and count what it
  * holds. Stops at (and reports) the first problem. */
 static void check_segment(const char *name, const uint8_t *bytes, size_t len,
@@ -124,32 +157,12 @@ static void check_segment(const char *name, const uint8_t *bytes, size_t len,
      * in order with what came before */
     while (offset < len) {
         gt_record record;
-        if (len - offset < GT_REC_SIZE) {
-            fail_at(report, GT_VERIFY_PARTIAL_TAIL, name, offset);
+        const char *failure = check_record_at(bytes, len, offset, stream, &record);
+        if (failure != NULL) {
+            fail_at(report, failure, name, offset);
             return;
         }
-        if (gt_record_decode(&bytes[offset], &record) != GT_OK) {
-            fail_at(report, GT_VERIFY_BAD_RECORD, name, offset);
-            return;
-        }
-        const char *order_failure = check_order(stream, &record);
-        if (order_failure != NULL) {
-            fail_at(report, order_failure, name, offset);
-            return;
-        }
-        if (record.type == GT_REC_GAP) {
-            report->gap_records++;
-            report->gap_readings += record.value;
-        } else {
-            report->data_records++;
-        }
-        if (!report->has_records) {
-            report->has_records = 1;
-            report->first_seq = record.seq;
-        }
-        report->last_seq = record.seq;
-        stream->has_prev = 1;
-        stream->prev = record;
+        tally_record(report, stream, &record);
         offset += GT_REC_SIZE;
     }
 }
@@ -191,6 +204,22 @@ gt_status gt_verify_dir_ops(const gt_file_ops *ops, void *ctx, gt_verify_report 
     return status;
 }
 
+/* How many seqs in sent_first..sent_last the log holds: the size of that
+ * range's overlap with first_seq..last_seq, or 0 if they don't meet. */
+static uint64_t held_count(const gt_verify_report *report, uint32_t sent_first,
+                           uint32_t sent_last)
+{
+    if (!report->has_records) {
+        return 0;
+    }
+    uint32_t overlap_first = report->first_seq > sent_first ? report->first_seq : sent_first;
+    uint32_t overlap_last = report->last_seq < sent_last ? report->last_seq : sent_last;
+    if (overlap_first > overlap_last) {
+        return 0;
+    }
+    return (uint64_t)overlap_last - overlap_first + 1;
+}
+
 /* A passing report covers every seq in first_seq..last_seq, so the sent
  * seqs accounted for are exactly the overlap of that range with A..B, and
  * lost is the rest. All counts are 64-bit, so 0..UINT32_MAX can't wrap. */
@@ -208,15 +237,7 @@ gt_status gt_verify_sent(const gt_verify_report *report, uint32_t sent_first,
         *result_out = result;
         return GT_OK;
     }
-    uint64_t held = 0;
-    if (report->has_records) {
-        uint32_t overlap_first = report->first_seq > sent_first ? report->first_seq : sent_first;
-        uint32_t overlap_last = report->last_seq < sent_last ? report->last_seq : sent_last;
-        if (overlap_first <= overlap_last) {
-            held = (uint64_t)overlap_last - overlap_first + 1;
-        }
-    }
-    result.lost = result.sent - held;
+    result.lost = result.sent - held_count(report, sent_first, sent_last);
     if (report->has_records && report->last_seq > sent_last) {
         result.failure = GT_VERIFY_SEQ_NOT_SENT;
     } else if (result.lost > 0) {

@@ -691,17 +691,21 @@ Every reading the hub forwards reaches the microSD card in a form that survives 
 ## Code map
 - **`include/log_record.h`, `src/log_record.c`:** the 16 B segment header codec (`gt_seg_header_encode` / `_decode`), next to the 24 B record codec.
 - **`include/storage_recover.h`, `src/storage_recover.c`:** `gt_recover_scan` (the longest valid prefix of an in-memory segment) and `gt_storage_recover_ops` (read, scan, then truncate + fsync a torn tail, or rename a bad segment to `.corrupt` + fsync the directory).
-- **`include/storage_pending.h`, `src/storage_pending.c`:** the pending buffer: raw 24 B records plus each one's add time, `due` at N = 64 or T = 60 s after the oldest.
+- **`include/storage_pending.h`, `src/storage_pending.c`:** the pending buffer: raw 24 B records plus each one's add time, `due` at N = 64 or T = 60 s after the oldest (changed with `gt_pending_set_limits`, PF-11).
 - **`include/storage_seq.h`, `src/storage_seq.c`:** the sequence guard (accept / reject / gap) and the GAP record for missing `seq`s.
 - **`include/storage_io.h`:** the `gt_file_ops` seam (the ctx is one directory, handles are fds, reads and writes take an offset). **`tests/fake_file.h`:** an in-memory directory with a current and a synced copy of every file, scripted failures, and `fake_fs_power_cut()`.
-- **`src/storage_file.c`:** the Linux file layer (`gt_file_ops_linux`): `openat` / `renameat` / `unlinkat` inside one open directory, whole-buffer `pread` / `pwrite` loops, `fsync` on the directory.
-- **`include/storage.h`, `src/storage.c`:** the storage object: segment names, open (marker, recovery, picking the active segment), append, flush, rollover + retention, shutdown, stats, `gt_storage_rx` and `gt_storage_resume`.
+- **`src/storage_file.c`, `src/storage_file_io.c`:** the Linux file layer (`gt_file_ops_linux`), sharing its handle ops through **`include/storage_file_internal.h`**. `storage_file.c` is the directory side (`openat` / `renameat` / `unlinkat` inside one open directory, `fsync` on the directory, the ops table); `storage_file_io.c` is the open-file side (whole-buffer `pread` / `pwrite` loops, `fsync`, `ftruncate`).
+- **`include/storage.h`:** the storage object, built from four files that share its struct through **`include/storage_internal.h`**:
+  - **`src/storage.c`:** append, stats, `gt_storage_rx` and `gt_storage_resume`; `gt_storage_set_batch` (N, T) and the flusher's wake, `gt_storage_wait_due` / `gt_storage_wake` (PF-11).
+  - **`src/storage_segment.c`:** segment names and the sorted segment listing.
+  - **`src/storage_open.c`:** open (marker, recovery, picking the active segment) and close.
+  - **`src/storage_flush.c`:** flush, rollover + retention, shutdown.
 - **`include/storage_proto.h`, `src/storage_proto.c`:** the 8 B `seq_resume` reply codec.
 - **`src/storage_event.c`:** the `GT_STORAGE_EV_*` flag → log name / level / reason table.
-- **`include/storage_server.h`, `src/storage_server.c`:** `gt_storage_serve` (the `poll()` rx loop) and the flush thread (`gt_flusher_tick`, `gt_flusher_run`).
+- **`include/storage_server.h`:** the storage process's two loops. **`src/storage_server.c`:** `gt_storage_serve` (the `poll()` rx loop). **`src/storage_flusher.c`:** the flush thread (`gt_flusher_tick`, `gt_flusher_run`).
 - **`include/listen_sock.h`, `src/listen_sock.c`:** the one-listener lock and bind, moved out of `hub_listen_main.c` (Decisions: one listener per socket). `hub_listen` now calls it.
 - **`include/log_verify.h`, `src/log_verify.c`:** the offline verifier, `gt_verify_dir_ops`, and `gt_verify_sent`, which compares a passing report with the sender's range A..B (PF-12).
-- **Process mains:** `src/storage_main.c` (the storage process), `src/storage_feed_main.c` (load generator standing in for the hub: `storage_feed [-r] SOCK COUNT [RATE_HZ]`; with `-r` it keeps running across storage restarts, reconnects, and picks its next `seq` with `gt_next_seq` like a running hub), `src/log_verify_main.c` (the `log_verify` tool: `log_verify [--sent A..B] DIR`). Makefile targets `storage_main`, `storage_feed`, `log_verify`.
+- **Process mains:** `src/storage_main.c` (the storage process: `storage_main [-n N] [-t T_SECONDS] DIR SOCK`), `src/storage_feed_main.c` (load generator standing in for the hub: `storage_feed [-r] SOCK COUNT [RATE_HZ]`; with `-r` it keeps running across storage restarts, reconnects, and picks its next `seq` with `gt_next_seq` like a running hub), `src/log_verify_main.c` (the `log_verify` tool: `log_verify [--sent A..B] DIR`). Makefile targets `storage_main`, `storage_feed`, `log_verify`.
 - **`tools/storage_faults.sh`:** automated `kill9` / `sigterm` rounds against the real process, driven by one `storage_feed -r` for the whole run.
 
 ## Decisions (Mechanism D)
@@ -737,7 +741,11 @@ Every reading the hub forwards reaches the microSD card in a form that survives 
   - `gt_storage_serve`'s `poll()` takes a 1000 ms timeout instead of `-1`, so the beat goes out even when the hub is quiet.
   - The beat carries "flush in progress since t" and the committed-record count, so `gt_storage_stats` gains the time the current flush started.
   - Nothing is built until then.
-- **Test ID prefixes:** `SGH` segment header, `RSC` recovery scan, `PND` pending buffer, `SQG` sequence guard, `SRV` storage recover, `SNM` segment name, `SOP` open, `SAP` append, `SFL` flush, `SFE` flush errors, `SCL` shutdown, `SBL` backlog, `SRO` rollover, `SLB` real-file loopback, `LCK` listen lock, `LBD` listen bind, `RSE` / `RSD` resume encode / decode, `SRX` rx frames, `SEV` event names, `FTK` flusher tick (incl. commit and clock logging), `SSV` serve loopback, `VFY` verifier, `NSQ` next seq (`gt_next_seq`, PF-03), `SLE` storage log events (PF-14), `VSR` verifier sent range (PF-12).
+- **N and T are run-time options, and an append wakes the flusher** (2026-10-27, PF-11). `storage_main -n N -t T_SECONDS` sets them through `gt_storage_set_batch` → `gt_pending_set_limits` (the `#define`s stay as the defaults). Between its 1 s passes, the flush thread waits in `gt_storage_wait_due` on a condition variable (on `CLOCK_MONOTONIC` on Linux), so the append that makes a flush due starts the commit at once.
+  - **The signal fires only when a flush *becomes* due,** and each wait uses it up. Firing "while due" was rejected: after a failed flush the records stay pending, so the flusher would spin retrying a broken card instead of waiting for its 1 s pass (SWT-03).
+  - **`storage_main` calls `gt_storage_wake` after the rx loop returns,** because a signal handler can't safely call `pthread_cond_signal`.
+  - **Rejected:** keeping the 1 s poll and rewording DESIGN.md (then N = 1 would mean "flush every second"), and rebuilding with `-D` for each point.
+- **Test ID prefixes:** `SGH` segment header, `RSC` recovery scan, `PND` pending buffer, `SQG` sequence guard, `SRV` storage recover, `SNM` segment name, `SOP` open, `SAP` append, `SFL` flush, `SFE` flush errors, `SCL` shutdown, `SBL` backlog, `SRO` rollover, `SLB` real-file loopback, `LCK` listen lock, `LBD` listen bind, `RSE` / `RSD` resume encode / decode, `SRX` rx frames, `SEV` event names, `FTK` flusher tick (incl. commit and clock logging), `SSV` serve loopback, `VFY` verifier, `NSQ` next seq (`gt_next_seq`, PF-03), `SLE` storage log events (PF-14), `VSR` verifier sent range (PF-12), `PNL` pending limits, `SBT` storage batch settings, `SWT` storage wait / wake (PF-11).
 
 ## Status (Mechanism D)
 | Step | What | Result |
@@ -783,6 +791,7 @@ Every reading the hub forwards reaches the microSD card in a form that survives 
     6. `log_verify` must pass, and the log may not cover more `seq`s than the feed has sent. In `sigterm` mode it must hold no GAP.
   - **Settle and the final check:** after the last round, start storage once more so the last hole gets its GAP. Then stop the feed, which reports `sent N records, seq A..B`, and stop storage. The check is the Evaluation plan's formula, run as `log_verify --sent A..B` (PF-12): every `seq` in A..B is committed or GAP-covered and nothing past B is stored, i.e. sent − committed − GAP-covered = 0 (`lost=0`). The script also checks N = B − A + 1 (no `seq` reused) and that the log starts at A, since this run's log starts empty.
   - **Negative control (2026-10-26):** a scratch build of the feed that always continued from the reply + 1 passed every per-round check in `kill9 5`, but failed the final check ("1600 records in 0..1165").
+- **(N, T) settings (PF-11):** `build/storage_main -n 1 -t 1 $D/log $S` with `build/storage_feed $S 50 10`. `storage_start` shows `batch_n=1 batch_t_s=1`, and the log holds about 50 `storage_commit records=1` lines: one fsync per record, not one per second.
 - **Power pulls (on the Pi, by hand, 20 times):**
   1. Image the SD card first, so a damaged card can be restored.
   2. Start `storage_main /var/lib/plantpi /run/plantpi/storage.sock` and `storage_feed /run/plantpi/storage.sock 100000 50`.

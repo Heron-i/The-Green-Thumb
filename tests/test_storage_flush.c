@@ -1,4 +1,4 @@
-/* Unit tests for committing records (src/storage.c): gt_storage_flush and
+/* Unit tests for committing records (src/storage_flush.c): gt_storage_flush and
  * gt_storage_flush_due.
  *
  * Purpose: prove a flush writes exactly the accepted bytes, in order, at
