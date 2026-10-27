@@ -9,8 +9,9 @@
  * write or fsync keeps every record pending. flush_due follows the N = 64
  * / T = 60 s rule. Uses tests/fake_file.h; durability is checked in the
  * fake's synced view. A GAP carries the last accepted record's time, also
- * after a restart. Run under make test / asan / memcheck. Implements
- * SFL-01 through SFL-11.
+ * after a restart. Every successful flush is a counted commit, timed when
+ * a clock is set (PF-08). Run under make test / asan / memcheck.
+ * Implements SFL-01 through SFL-15.
  *
  * What these tests cannot prove: a flush racing appends on another thread
  * (these are single-threaded; an append between two flushes stands in),
@@ -317,6 +318,116 @@ static void test_sfl10_null_args(void)
     CHECK_EQ(gt_storage_flush_due(NULL, UINT64_MAX), 0);
 }
 
+/* A scripted monotonic clock for gt_storage_set_clock: each call returns
+ * the next value of clock_script (then keeps returning the last one), and
+ * clock_reads counts the calls. */
+static uint64_t clock_script[3];
+static size_t   clock_reads;
+
+static uint64_t scripted_clock_us(void)
+{
+    size_t script_index = clock_reads < 3 ? clock_reads : 2;
+    clock_reads++;
+    return clock_script[script_index];
+}
+
+/* Read the stats. */
+static gt_storage_stats flush_stats(const gt_storage *storage)
+{
+    gt_storage_stats stats;
+    CHECK_EQ(gt_storage_read_stats(storage, &stats), GT_OK);
+    return stats;
+}
+
+/* ---- SFL-12: each commit is counted with its records ----
+ * A flush of 3 records is commit 1 (3 records); a flush of 1 more is
+ * commit 2 (1 record). An empty flush writes nothing, so it is no commit
+ * (DESIGN.md "Every commit logged with count and duration", PF-08). */
+static void test_sfl12_commits_counted(void)
+{
+    const gt_file_ops *ops = fake_fs_ops(&fs);
+    gt_storage *storage = open_storage(ops, TEST_CAPACITY);
+    CHECK(flush_stats(storage).commits == 0);
+
+    append_ok(storage, 1, 0);
+    append_ok(storage, 2, 0);
+    append_ok(storage, 3, 0);
+    CHECK_EQ(gt_storage_flush(storage, NULL), GT_OK);
+    CHECK(flush_stats(storage).commits == 1);
+    CHECK_EQ(flush_stats(storage).last_commit_records, 3);
+
+    append_ok(storage, 4, 0);
+    CHECK_EQ(gt_storage_flush(storage, NULL), GT_OK);
+    CHECK(flush_stats(storage).commits == 2);
+    CHECK_EQ(flush_stats(storage).last_commit_records, 1);
+
+    CHECK_EQ(gt_storage_flush(storage, NULL), GT_OK);
+    CHECK(flush_stats(storage).commits == 2);
+    gt_storage_close(storage);
+}
+
+/* ---- SFL-13: a clock times the commit and the fsync ----
+ * The clock reads 1000 before the write, 1500 before the fsync and 4500
+ * after it: the commit took 3500 us, the fsync alone 3000 us. Exactly
+ * three reads, so the timing costs nothing more. */
+static void test_sfl13_commit_timed(void)
+{
+    const gt_file_ops *ops = fake_fs_ops(&fs);
+    gt_storage *storage = open_storage(ops, TEST_CAPACITY);
+    clock_script[0] = 1000;
+    clock_script[1] = 1500;
+    clock_script[2] = 4500;
+    clock_reads = 0;
+    gt_storage_set_clock(storage, scripted_clock_us);
+
+    append_ok(storage, 1, 0);
+    CHECK_EQ(gt_storage_flush(storage, NULL), GT_OK);
+    gt_storage_stats stats = flush_stats(storage);
+    CHECK(stats.last_commit_us == 3500);   /* u64: too big for CHECK_EQ's long long */
+    CHECK(stats.last_fsync_us == 3000);
+    CHECK_EQ(clock_reads, 3);
+    gt_storage_close(storage);
+}
+
+/* ---- SFL-14: with no clock, durations are 0 ----
+ * The commit is still counted; only its times are unknown. */
+static void test_sfl14_no_clock_zero_durations(void)
+{
+    const gt_file_ops *ops = fake_fs_ops(&fs);
+    gt_storage *storage = open_storage(ops, TEST_CAPACITY);
+    gt_storage_set_clock(storage, NULL);
+
+    append_ok(storage, 1, 0);
+    CHECK_EQ(gt_storage_flush(storage, NULL), GT_OK);
+    gt_storage_stats stats = flush_stats(storage);
+    CHECK(stats.commits == 1);
+    CHECK(stats.last_commit_us == 0);
+    CHECK(stats.last_fsync_us == 0);
+    gt_storage_close(storage);
+}
+
+/* ---- SFL-15: a failed flush is not a commit ----
+ * A failed write and then a failed fsync count nothing; the retry that
+ * succeeds is commit 1, with both records. */
+static void test_sfl15_failed_flush_not_counted(void)
+{
+    const gt_file_ops *ops = fake_fs_ops(&fs);
+    gt_storage *storage = open_storage(ops, TEST_CAPACITY);
+    append_ok(storage, 1, 0);
+    append_ok(storage, 2, 0);
+
+    fs.fail_pwrite_call = fs.pwrite_calls + 1;
+    CHECK_EQ(gt_storage_flush(storage, NULL), GT_ERR_IO);
+    fs.fail_fsync_call = fs.fsync_calls + 1;
+    CHECK_EQ(gt_storage_flush(storage, NULL), GT_ERR_IO);
+    CHECK(flush_stats(storage).commits == 0);
+
+    CHECK_EQ(gt_storage_flush(storage, NULL), GT_OK);
+    CHECK(flush_stats(storage).commits == 1);
+    CHECK_EQ(flush_stats(storage).last_commit_records, 2);
+    gt_storage_close(storage);
+}
+
 static const test_case_t tests[] = {
     {"SFL-01", "flushed records are on disk", test_sfl01_flushed_records_durable},
     {"SFL-02", "nothing is written before a flush", test_sfl02_nothing_before_flush},
@@ -329,6 +440,10 @@ static const test_case_t tests[] = {
     {"SFL-09", "flush_due follows N and T", test_sfl09_flush_due_rules},
     {"SFL-10", "NULL storage is rejected", test_sfl10_null_args},
     {"SFL-11", "a GAP after a restart has the last time", test_sfl11_gap_after_restart},
+    {"SFL-12", "each commit is counted with its records", test_sfl12_commits_counted},
+    {"SFL-13", "a clock times the commit and the fsync", test_sfl13_commit_timed},
+    {"SFL-14", "with no clock, durations are 0", test_sfl14_no_clock_zero_durations},
+    {"SFL-15", "a failed flush is not a commit", test_sfl15_failed_flush_not_counted},
 };
 
 int main(void)

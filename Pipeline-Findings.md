@@ -20,12 +20,12 @@ Adversarial review of branch `Menu-Mechanism-D` (Lucas's Mechanism D storage wor
 | PF-05 | `kill9` rounds verify the log before recovery has run | Tooling (plausible) | Medium | Resolved (2026-10-26) |
 | PF-06 | Records from the end of a day go into the next day's segment | DESIGN.md | Medium | Resolved (2026-10-26) |
 | PF-07 | A storage-made GAP record carries the gap's end time | DESIGN.md | Medium | Resolved (2026-10-26) |
-| PF-08 | Commits are not logged and fsync is not timed | DESIGN.md (2 rows) | Medium | Open |
+| PF-08 | Commits are not logged and fsync is not timed | DESIGN.md (2 rows) | Medium | Resolved (2026-10-27) |
 | PF-09 | DESIGN.md describes disk-full and read-only handling as done | DESIGN.md | Medium | Resolved in docs (2026-10-26); handling not built |
 | PF-10 | Storage heartbeat: not built, and DESIGN.md disagrees with itself | DESIGN.md | Medium | Open |
 | PF-11 | The (N, T) batching experiment can't run as specified | DESIGN.md | Low | Open |
 | PF-12 | The verifier doesn't compare against the hub's sent `seq`s | DESIGN.md | Low | Open |
-| PF-13 | `clock_unsynced` / `clock_synced` are never logged | DESIGN.md | Low | Open |
+| PF-13 | `clock_unsynced` / `clock_synced` are never logged | DESIGN.md | Low | Resolved (2026-10-27) |
 | PF-14 | Some log lines are missing their `key=value` fields | DESIGN.md | Low | Open |
 | PF-15 | Doc errors: "lux" range check, wrong decode function | [Both docs] / DESIGN.md | Low | Resolved (2026-10-26) |
 | PF-16 | Socket calls outside `src/ipc_sock.c` | Sensor-Pipeline.md | Low | Open |
@@ -141,6 +141,12 @@ Storage itself was correct: the feed's output file later held `seq_resume: last=
 ### PF-08: Commits are not logged and fsync is not timed
 - **DESIGN.md**, Mechanism D: "Every commit logged with count and duration; report fsync p50/p99". The `fsync_slow` row: "fsync duration measured on every commit; log any fsync over 1 s".
 - `gt_storage_flush` reports no event on success and doesn't time the fsync, so neither row can be measured.
+- **Resolution (2026-10-27):**
+  - **Timing inside storage:** an optional monotonic clock (`gt_storage_set_clock`) times every commit, write + fsync (`commit_us`) and the fsync alone (`fsync_us`). That includes the rollover pre-flush and the shutdown flush. `gt_storage_stats` gains `commits`, `last_commit_records`, `last_commit_us` and `last_fsync_us`.
+  - **Logging:** `gt_storage_log_commit` logs `storage_commit records=N commit_us=T fsync_us=F` at INFO, then `fsync_slow fsync_us=F records=N` at WARN for an fsync over 1 s. The flush thread calls it once per pass, and `storage_main` around the final shutdown.
+  - **p50/p99:** worked out offline from the `storage_commit` lines (decided 2026-10-27), so no state is kept in the process.
+  - **Tests:** SFL-12 to SFL-15, FTK-07 and FTK-08 are new. FTK-02 was changed with approval: it asserted that a healthy flush logs nothing. All were seen red, then green.
+  - **WSL check:** a 3 s run at 200 Hz logged four commits (fsync 4.6–7.7 ms) whose records add up to the 612 committed.
 
 ### PF-09: DESIGN.md describes disk-full and read-only handling as done
 - The `storage_disk_full` row (`ENOSPC`, `statvfs`, the 64 KB reserve) and the `storage_readonly` row (`EROFS`) read as built. Nothing in `src/` mentions `statvfs`, `ENOSPC` or `EROFS`; a full card shows up only as `storage_write_error` + `storage_degraded`.
@@ -167,6 +173,9 @@ Storage itself was correct: the feed's output file later held `seq_resume: last=
 ### PF-13: `clock_unsynced` / `clock_synced` are never logged
 - **DESIGN.md**, System clock row: log the unsynced period with `clock_unsynced` / `clock_synced`.
 - `storage_main`'s `clock_synced()` is sound (a 2026-10-01 floor plus `adjtimex`, which returned TIME_OK in WSL), but only `retention_skipped` is logged, once per unsynced spell.
+- **Resolution (2026-10-27):**
+  - **The events:** the flush thread now logs `clock_unsynced` at WARN on the first unsynced pass of a spell (including the very first pass), and `clock_synced unsynced_ms=N` at INFO on the first synced pass after it. N comes from the monotonic clock. A clock that is synced from the start logs neither. `retention_skipped` is unchanged.
+  - **Tests:** FTK-09, FTK-10 and FTK-11 are new. FTK-09 and FTK-10 were seen red, then green. FTK-11 is the "stays quiet" guard, so it passed from the start.
 
 ### PF-14: Some log lines are missing their `key=value` fields
 - `storage_stop` lacks the segment and last `seq` that DESIGN.md's new text says it carries.

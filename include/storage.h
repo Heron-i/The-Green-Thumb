@@ -73,7 +73,18 @@ typedef struct {
     unsigned backlog_percent;      /* highest threshold reached now: 0, 50, 75 or 90 */
     uint64_t refused;              /* readings refused because the buffer was full */
     uint64_t segments_deleted;     /* old segments removed by retention since open */
+    /* Commits (DESIGN.md "Every commit logged with count and duration";
+     * PF-08). Durations are 0 when no clock was set (gt_storage_set_clock). */
+    uint64_t commits;              /* successful flushes since open */
+    size_t   last_commit_records;  /* records in the latest commit */
+    uint64_t last_commit_us;       /* latest commit: write (and any cut) + fsync, in us */
+    uint64_t last_fsync_us;        /* latest commit: the fsync alone, in us */
 } gt_storage_stats;
+
+/* A clock function: a pointer to a function that takes nothing and
+ * returns a monotonic time in microseconds (storage_main passes one
+ * reading CLOCK_MONOTONIC; tests pass a scripted one). */
+typedef uint64_t (*gt_clock_us_fn)(void);
 
 /* Open storage over the directory behind ops/ctx, running recovery before
  * anything else (DESIGN.md "recovery runs before storage.sock accepts any
@@ -117,6 +128,14 @@ gt_status   gt_storage_open_ops(const gt_file_ops *ops, void *ctx, uint64_t now_
 
 /* Copy the counters into *stats_out. GT_ERR_INVAL for NULL args. */
 gt_status   gt_storage_read_stats(const gt_storage *storage, gt_storage_stats *stats_out);
+
+/* Give storage a monotonic clock so every commit is timed (PF-08). It is
+ * read three times per flush that writes: just before the write (or the
+ * cut back of a degraded segment), just before the fsync, and just after
+ * it. last_commit_us is the first to the third, last_fsync_us the second
+ * to the third. Call it right after open, before the flush thread starts.
+ * NULL clock_us turns timing off (durations 0); NULL storage is a no-op. */
+void        gt_storage_set_clock(gt_storage *storage, gt_clock_us_fn clock_us);
 
 /* gt_storage_open_ops over the real directory `dir`, through
  * gt_file_ops_linux, with the default 1 MB pending buffer. What storage_main

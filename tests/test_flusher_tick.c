@@ -5,8 +5,12 @@
  * due, rolls over to a new day's segment, and reports every event through
  * the log callback with the names DESIGN.md uses, while logging
  * retention_skipped once per unsynced spell rather than once a second.
- * Times are passed in, so nothing sleeps; uses tests/fake_file.h. Run
- * under make test / asan / memcheck. Implements FTK-01 through FTK-06.
+ * Every commit is logged with its count and durations (storage_commit),
+ * and an fsync over 1 s also as fsync_slow (PF-08). An unsynced clock is
+ * logged once per spell (clock_unsynced), and its end with the spell's
+ * length (clock_synced unsynced_ms=..., PF-13). Times are passed in, so
+ * nothing sleeps; uses tests/fake_file.h. Run under make test / asan /
+ * memcheck. Implements FTK-01 through FTK-11.
  *
  * What these tests cannot prove: the real one-second loop and stopping it
  * (gt_flusher_run, checked in the WSL smoke run of storage_main). */
@@ -113,8 +117,11 @@ static void test_ftk01_nothing_due(void)
     gt_storage_close(storage);
 }
 
-/* ---- FTK-02: a due pass commits quietly ----
- * At 60 s the record is committed; a healthy flush logs nothing. */
+/* ---- FTK-02: a due pass commits and logs it ----
+ * At 60 s the record is committed, and the commit is logged with its
+ * count and durations (DESIGN.md "Every commit logged with count and
+ * duration", PF-08): one storage_commit line at INFO, and nothing else.
+ * No clock is set, so both durations are 0. */
 static void test_ftk02_due_pass_commits(void)
 {
     gt_flusher flusher;
@@ -123,7 +130,10 @@ static void test_ftk02_due_pass_commits(void)
 
     gt_flusher_tick(&flusher, TODAY_US, AGE_LIMIT_MS, 1);
     CHECK(committed(storage) == 1);
-    CHECK_EQ(book.count, 0);
+    CHECK_EQ(book.count, 1);
+    CHECK_EQ(logged("storage_commit"), 1);
+    CHECK_EQ(book.levels[0], GT_LOG_INFO);
+    CHECK(strcmp(book.fields[0], "records=1 commit_us=0 fsync_us=0") == 0);
     gt_storage_close(storage);
 }
 
@@ -196,13 +206,139 @@ static void test_ftk06_null_safe(void)
     gt_flusher_tick(NULL, TODAY_US, 0, 1);
 }
 
+/* A storage clock whose fsync takes 1.5 s: it reads 1000 us before the
+ * write, 1000 before the fsync and 1 501 000 after it. */
+static uint64_t slow_fsync_reads;
+
+static uint64_t slow_fsync_clock_us(void)
+{
+    static const uint64_t script[] = { 1000, 1000, 1501000 };
+    size_t script_index = slow_fsync_reads < 3 ? slow_fsync_reads : 2;
+    slow_fsync_reads++;
+    return script[script_index];
+}
+
+/* ---- FTK-07: an fsync over 1 s logs fsync_slow ----
+ * DESIGN.md fsync_slow row: "log any fsync over 1 s". The commit is
+ * logged as usual, and fsync_slow follows at WARN with the fsync time and
+ * the batch size. */
+static void test_ftk07_slow_fsync_logged(void)
+{
+    gt_flusher flusher;
+    gt_storage *storage = open_with_flusher(&flusher);
+    slow_fsync_reads = 0;
+    gt_storage_set_clock(storage, slow_fsync_clock_us);
+    append_at(storage, 1, 0);
+
+    gt_flusher_tick(&flusher, TODAY_US, AGE_LIMIT_MS, 1);
+    CHECK_EQ(logged("storage_commit"), 1);
+    CHECK_EQ(logged("fsync_slow"), 1);
+    for (size_t log_index = 0; log_index < book.count; log_index++) {
+        if (strcmp(book.events[log_index], "fsync_slow") == 0) {
+            CHECK_EQ(book.levels[log_index], GT_LOG_WARN);
+            CHECK(strcmp(book.fields[log_index], "fsync_us=1500000 records=1") == 0);
+        }
+    }
+    gt_storage_close(storage);
+}
+
+/* ---- FTK-08: a commit at rollover is logged once ----
+ * The record pending at midnight is committed inside the rollover
+ * (PF-06), so the pass logs segment_rollover and one storage_commit, and
+ * the flush after the rollover, with nothing left, logs no second one. */
+static void test_ftk08_rollover_commit_logged_once(void)
+{
+    gt_flusher flusher;
+    gt_storage *storage = open_with_flusher(&flusher);
+    append_at(storage, 1, 0);
+
+    gt_flusher_tick(&flusher, TOMORROW_US, AGE_LIMIT_MS, 1);
+    CHECK_EQ(logged("segment_rollover"), 1);
+    CHECK_EQ(logged("storage_commit"), 1);
+    CHECK_EQ(logged("fsync_slow"), 0);
+    gt_storage_close(storage);
+}
+
+/* The level of the first logged event called `event`; -1 if none. */
+static int level_of(const char *event)
+{
+    for (size_t log_index = 0; log_index < book.count; log_index++) {
+        if (strcmp(book.events[log_index], event) == 0) {
+            return (int)book.levels[log_index];
+        }
+    }
+    return -1;
+}
+
+/* ---- FTK-09: an unsynced clock is logged once ----
+ * DESIGN.md System clock row: "log the unsynced period" (PF-13). Three
+ * unsynced passes, starting with the first: one clock_unsynced at WARN. */
+static void test_ftk09_unsynced_logged_once(void)
+{
+    gt_flusher flusher;
+    gt_storage *storage = open_with_flusher(&flusher);
+
+    gt_flusher_tick(&flusher, TODAY_US, 0, 0);
+    gt_flusher_tick(&flusher, TODAY_US, 1000, 0);
+    gt_flusher_tick(&flusher, TODAY_US, 2000, 0);
+    CHECK_EQ(logged("clock_unsynced"), 1);
+    CHECK_EQ(level_of("clock_unsynced"), GT_LOG_WARN);
+    CHECK_EQ(logged("clock_synced"), 0);
+    gt_storage_close(storage);
+}
+
+/* ---- FTK-10: the end of an unsynced spell is logged ----
+ * Unsynced from 0 ms, synced at 2000 ms: one clock_synced at INFO with
+ * unsynced_ms=2000, the length of the period. A later synced pass logs
+ * nothing more; the clock turning unsynced again starts a new spell. */
+static void test_ftk10_synced_logs_period(void)
+{
+    gt_flusher flusher;
+    gt_storage *storage = open_with_flusher(&flusher);
+
+    gt_flusher_tick(&flusher, TODAY_US, 0, 0);
+    gt_flusher_tick(&flusher, TODAY_US, 1000, 0);
+    gt_flusher_tick(&flusher, TODAY_US, 2000, 1);
+    gt_flusher_tick(&flusher, TODAY_US, 3000, 1);
+    CHECK_EQ(logged("clock_synced"), 1);
+    CHECK_EQ(level_of("clock_synced"), GT_LOG_INFO);
+    for (size_t log_index = 0; log_index < book.count; log_index++) {
+        if (strcmp(book.events[log_index], "clock_synced") == 0) {
+            CHECK(strcmp(book.fields[log_index], "unsynced_ms=2000") == 0);
+        }
+    }
+
+    gt_flusher_tick(&flusher, TODAY_US, 4000, 0);
+    CHECK_EQ(logged("clock_unsynced"), 2);
+    gt_storage_close(storage);
+}
+
+/* ---- FTK-11: a clock synced from the start logs nothing ----
+ * The normal case: no clock event at all. */
+static void test_ftk11_synced_from_start_quiet(void)
+{
+    gt_flusher flusher;
+    gt_storage *storage = open_with_flusher(&flusher);
+
+    gt_flusher_tick(&flusher, TODAY_US, 0, 1);
+    gt_flusher_tick(&flusher, TODAY_US, 1000, 1);
+    CHECK_EQ(logged("clock_unsynced"), 0);
+    CHECK_EQ(logged("clock_synced"), 0);
+    gt_storage_close(storage);
+}
+
 static const test_case_t tests[] = {
     {"FTK-01", "a pass with nothing due does nothing", test_ftk01_nothing_due},
-    {"FTK-02", "a due pass commits quietly", test_ftk02_due_pass_commits},
+    {"FTK-02", "a due pass commits and logs it", test_ftk02_due_pass_commits},
     {"FTK-03", "a failed flush is logged", test_ftk03_failed_flush_logged},
     {"FTK-04", "unsynced is logged once per spell", test_ftk04_unsynced_once_per_spell},
     {"FTK-05", "a new day is logged; old records stay", test_ftk05_new_day_keeps_old_records},
     {"FTK-06", "NULL is a safe no-op", test_ftk06_null_safe},
+    {"FTK-07", "an fsync over 1 s logs fsync_slow", test_ftk07_slow_fsync_logged},
+    {"FTK-08", "a commit at rollover is logged once", test_ftk08_rollover_commit_logged_once},
+    {"FTK-09", "an unsynced clock is logged once", test_ftk09_unsynced_logged_once},
+    {"FTK-10", "the end of an unsynced spell is logged", test_ftk10_synced_logs_period},
+    {"FTK-11", "a clock synced from the start is quiet", test_ftk11_synced_from_start_quiet},
 };
 
 int main(void)

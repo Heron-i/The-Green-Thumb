@@ -152,6 +152,12 @@ struct gt_storage {
     uint64_t           refused;             /* readings refused because the buffer was full */
     int                full_episode;        /* 1 from a full refusal until a record is accepted */
     uint64_t           segments_deleted;    /* by retention, since open */
+
+    gt_clock_us_fn     clock_us;            /* NULL: commits are not timed (PF-08) */
+    uint64_t           commits;             /* successful flushes since open */
+    size_t             last_commit_records;
+    uint64_t           last_commit_us;      /* write (and any cut) + fsync */
+    uint64_t           last_fsync_us;       /* the fsync alone */
 };
 
 /* Close the active segment, free everything and destroy ctx: the one
@@ -508,15 +514,26 @@ int gt_storage_flush_due(gt_storage *storage, uint64_t now_ms)
     return due;
 }
 
+/* The storage clock in us, or 0 when none was set. */
+static uint64_t read_clock(const gt_storage *storage)
+{
+    return storage->clock_us != NULL ? storage->clock_us() : 0;
+}
+
 /* Step 2 of flush: put byte_count bytes of the flush buffer on the card.
  * After a failed flush (degraded), the file may end in torn bytes past
  * the committed offset, or hold a full copy that was never fsynced, so
  * it is first cut back to the committed offset. Writing on top of torn
  * bytes is never allowed: if the cut fails, nothing is written. Returns
- * GT_OK, or GT_ERR_IO with WRITE_ERROR or FSYNC_ERROR added to *events. */
-static gt_status write_batch(gt_storage *storage, size_t byte_count, unsigned *events)
+ * GT_OK, or GT_ERR_IO with WRITE_ERROR or FSYNC_ERROR added to *events.
+ * On GT_OK, *commit_us_out is the whole step's time and *fsync_us_out the
+ * fsync's (PF-08); the clock is read before the cut/write, before the
+ * fsync and after it. */
+static gt_status write_batch(gt_storage *storage, size_t byte_count, unsigned *events,
+                             uint64_t *commit_us_out, uint64_t *fsync_us_out)
 {
     const gt_file_ops *ops = storage->ops;
+    uint64_t start_us = read_clock(storage);
 
     if (storage->degraded
         && ops->ftruncate(storage->ctx, storage->handle, storage->committed_offset) != GT_OK) {
@@ -528,10 +545,14 @@ static gt_status write_batch(gt_storage *storage, size_t byte_count, unsigned *e
         *events |= GT_STORAGE_EV_WRITE_ERROR;
         return GT_ERR_IO;
     }
+    uint64_t fsync_start_us = read_clock(storage);
     if (ops->fsync(storage->ctx, storage->handle) != GT_OK) {
         *events |= GT_STORAGE_EV_FSYNC_ERROR;
         return GT_ERR_IO;
     }
+    uint64_t end_us = read_clock(storage);
+    *commit_us_out = end_us - start_us;
+    *fsync_us_out = end_us - fsync_start_us;
     return GT_OK;
 }
 
@@ -563,7 +584,8 @@ gt_status gt_storage_flush(gt_storage *storage, unsigned *events_out)
 
     /* 2. Write and fsync with no lock held, so append never waits on the card. */
     size_t byte_count = record_count * GT_REC_SIZE;
-    if (write_batch(storage, byte_count, &events) != GT_OK) {
+    uint64_t commit_us = 0, fsync_us = 0;
+    if (write_batch(storage, byte_count, &events, &commit_us, &fsync_us) != GT_OK) {
         /* The records are still pending; mark degraded (reported once). */
         pthread_mutex_lock(&storage->lock);
         if (!storage->degraded) {
@@ -590,6 +612,10 @@ gt_status gt_storage_flush(gt_storage *storage, unsigned *events_out)
                                              storage->capacity);
     storage->committed_offset += byte_count;
     storage->committed_records += record_count;
+    storage->commits++;
+    storage->last_commit_records = record_count;
+    storage->last_commit_us = commit_us;
+    storage->last_fsync_us = fsync_us;
     if (decoded == GT_OK) {
         storage->has_last_committed = 1;
         storage->last_committed_seq = last_record.seq;
@@ -791,6 +817,16 @@ gt_status gt_storage_resume(const gt_storage *storage, gt_resume *resume_out)
     return GT_OK;
 }
 
+/* No lock: this is called before the flush thread starts (see storage.h),
+ * and only the flushing thread reads clock_us. */
+void gt_storage_set_clock(gt_storage *storage, gt_clock_us_fn clock_us)
+{
+    if (storage == NULL) {
+        return;
+    }
+    storage->clock_us = clock_us;
+}
+
 /* stats_out is filled under the lock so its fields all come from the same
  * moment. The lock is changed by locking, so the `const` is cast away for
  * that one call; the storage itself was never defined const, so this is
@@ -812,6 +848,10 @@ gt_status gt_storage_read_stats(const gt_storage *storage, gt_storage_stats *sta
     stats_out->backlog_percent = storage->backlog_percent;
     stats_out->refused = storage->refused;
     stats_out->segments_deleted = storage->segments_deleted;
+    stats_out->commits = storage->commits;
+    stats_out->last_commit_records = storage->last_commit_records;
+    stats_out->last_commit_us = storage->last_commit_us;
+    stats_out->last_fsync_us = storage->last_fsync_us;
     pthread_mutex_unlock(lock);
     return GT_OK;
 }
