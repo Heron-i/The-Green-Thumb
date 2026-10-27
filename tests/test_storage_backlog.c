@@ -151,6 +151,7 @@ static void test_sbl03_gap_covers_refused(void)
     CHECK_EQ(gap.type, GT_REC_GAP);
     CHECK_EQ(gap.seq, 21);
     CHECK(gap.value == read_stats(storage).refused);
+    CHECK(gap.timestamp_us == 8000 + TEST_CAPACITY);   /* seq 20's time: the gap started after it (PF-07) */
     CHECK_EQ(gt_record_decode(&file->synced_data[RECORD_OFFSET(TEST_CAPACITY + 1)], &after),
              GT_OK);
     CHECK_EQ(after.seq, 24);

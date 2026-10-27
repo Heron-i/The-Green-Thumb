@@ -26,6 +26,20 @@ typedef void (*gt_storage_log_fn)(void *log_ctx, gt_log_level level, const char 
  * shutdown. NULL log is a no-op. */
 void gt_storage_log_events(gt_storage_log_fn log, void *log_ctx, unsigned events);
 
+/* An fsync longer than this is logged as fsync_slow (DESIGN.md fsync_slow
+ * row: "log any fsync over 1 s"). */
+#define GT_FSYNC_SLOW_US 1000000u
+
+/* Log the latest commit if storage has made one since `commits_before`
+ * (a gt_storage_stats.commits value read earlier): storage_commit at INFO
+ * with "records=N commit_us=T fsync_us=F", then fsync_slow at WARN with
+ * "fsync_us=F records=N" if F > GT_FSYNC_SLOW_US (PF-08). Callers read
+ * commits_before, do at most one commit, then call this: the flush thread
+ * around each pass, storage_main around its final shutdown. NULL log or
+ * storage is a no-op. */
+void gt_storage_log_commit(gt_storage_log_fn log, void *log_ctx, const gt_storage *storage,
+                           uint64_t commits_before);
+
 /* The rx loop, run on the process's main thread. poll() waits on three
  * things at once: the listening socket, the hub's connection (one at a
  * time) and stop_fd.
@@ -51,6 +65,8 @@ typedef struct {
     gt_storage_log_fn  log;
     void              *log_ctx;
     int                logged_unsynced;  /* 1 while retention_skipped has been logged */
+    int                clock_unsynced;   /* 1 during an unsynced spell (PF-13) */
+    uint64_t           unsynced_since_ms;  /* now_ms of the spell's first pass */
 } gt_flusher;
 
 void gt_flusher_init(gt_flusher *flusher, gt_storage *storage, unsigned retention_days,
@@ -60,7 +76,11 @@ void gt_flusher_init(gt_flusher *flusher, gt_storage *storage, unsigned retentio
  * if gt_storage_flush_due says so, logging every event. retention_skipped
  * is logged only when the clock turns unsynced, not on every pass (an
  * unsynced Pi would otherwise log it once a second); it is logged again
- * after the clock has been synced in between. now_us is the wall clock;
+ * after the clock has been synced in between. The unsynced period itself
+ * is logged too (DESIGN.md System clock row, PF-13): clock_unsynced at
+ * WARN on the first unsynced pass of a spell, and clock_synced at INFO
+ * with "unsynced_ms=N" (from now_ms) on the first synced pass after it.
+ * A clock synced from the start logs neither. now_us is the wall clock;
  * now_ms the same monotonic clock appends use. NULL flusher is a no-op. */
 void gt_flusher_tick(gt_flusher *flusher, uint64_t now_us, uint64_t now_ms, int clock_synced);
 

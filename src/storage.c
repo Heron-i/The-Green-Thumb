@@ -144,6 +144,7 @@ struct gt_storage {
     uint64_t           committed_records;
     int                has_last_accepted;
     uint32_t           last_accepted_seq;
+    uint64_t           last_accepted_us;    /* that record's timestamp: a GAP's start (PF-07) */
     int                has_last_committed;
     uint32_t           last_committed_seq;
     int                degraded;            /* 1 from a failed flush until one succeeds */
@@ -151,6 +152,12 @@ struct gt_storage {
     uint64_t           refused;             /* readings refused because the buffer was full */
     int                full_episode;        /* 1 from a full refusal until a record is accepted */
     uint64_t           segments_deleted;    /* by retention, since open */
+
+    gt_clock_us_fn     clock_us;            /* NULL: commits are not timed (PF-08) */
+    uint64_t           commits;             /* successful flushes since open */
+    size_t             last_commit_records;
+    uint64_t           last_commit_us;      /* write (and any cut) + fsync */
+    uint64_t           last_fsync_us;       /* the fsync alone */
 };
 
 /* Close the active segment, free everything and destroy ctx: the one
@@ -271,6 +278,7 @@ static gt_status find_newest(gt_storage *storage,
         if (report.has_records) {
             info->has_last = 1;
             info->last_seq = report.last_seq;
+            info->last_timestamp_us = report.last_timestamp_us;
             break;
         }
     }
@@ -386,6 +394,7 @@ gt_status gt_storage_open_ops(const gt_file_ops *ops, void *ctx, uint64_t now_us
     memcpy(info.active_name, storage->active_name, GT_FILE_NAME_MAX);
     storage->has_last_accepted = storage->has_last_committed = info.has_last;
     storage->last_accepted_seq = storage->last_committed_seq = info.last_seq;
+    storage->last_accepted_us = info.last_timestamp_us;
     if (info_out != NULL) {
         *info_out = info;
     }
@@ -445,7 +454,8 @@ static gt_status append_locked(gt_storage *storage, const uint8_t record[GT_REC_
     if (verdict == GT_SEQ_GAP) {
         gt_record gap;
         uint8_t gap_wire[GT_REC_SIZE];
-        if (gt_seq_gap_record(storage->last_accepted_seq, decoded, &gap) != GT_OK
+        if (gt_seq_gap_record(storage->last_accepted_seq, storage->last_accepted_us, decoded,
+                              &gap) != GT_OK
             || gt_record_encode(&gap, gap_wire) != GT_OK
             || gt_pending_add(storage->pending, gap_wire, now_ms) != GT_OK) {
             return refuse_full(storage, events);   /* can't happen after the room check */
@@ -458,6 +468,7 @@ static gt_status append_locked(gt_storage *storage, const uint8_t record[GT_REC_
 
     storage->has_last_accepted = 1;
     storage->last_accepted_seq = decoded->seq;
+    storage->last_accepted_us = decoded->timestamp_us;
     storage->full_episode = 0;
 
     unsigned level = backlog_level(gt_pending_count(storage->pending), storage->capacity);
@@ -503,15 +514,26 @@ int gt_storage_flush_due(gt_storage *storage, uint64_t now_ms)
     return due;
 }
 
+/* The storage clock in us, or 0 when none was set. */
+static uint64_t read_clock(const gt_storage *storage)
+{
+    return storage->clock_us != NULL ? storage->clock_us() : 0;
+}
+
 /* Step 2 of flush: put byte_count bytes of the flush buffer on the card.
  * After a failed flush (degraded), the file may end in torn bytes past
  * the committed offset, or hold a full copy that was never fsynced, so
  * it is first cut back to the committed offset. Writing on top of torn
  * bytes is never allowed: if the cut fails, nothing is written. Returns
- * GT_OK, or GT_ERR_IO with WRITE_ERROR or FSYNC_ERROR added to *events. */
-static gt_status write_batch(gt_storage *storage, size_t byte_count, unsigned *events)
+ * GT_OK, or GT_ERR_IO with WRITE_ERROR or FSYNC_ERROR added to *events.
+ * On GT_OK, *commit_us_out is the whole step's time and *fsync_us_out the
+ * fsync's (PF-08); the clock is read before the cut/write, before the
+ * fsync and after it. */
+static gt_status write_batch(gt_storage *storage, size_t byte_count, unsigned *events,
+                             uint64_t *commit_us_out, uint64_t *fsync_us_out)
 {
     const gt_file_ops *ops = storage->ops;
+    uint64_t start_us = read_clock(storage);
 
     if (storage->degraded
         && ops->ftruncate(storage->ctx, storage->handle, storage->committed_offset) != GT_OK) {
@@ -523,10 +545,14 @@ static gt_status write_batch(gt_storage *storage, size_t byte_count, unsigned *e
         *events |= GT_STORAGE_EV_WRITE_ERROR;
         return GT_ERR_IO;
     }
+    uint64_t fsync_start_us = read_clock(storage);
     if (ops->fsync(storage->ctx, storage->handle) != GT_OK) {
         *events |= GT_STORAGE_EV_FSYNC_ERROR;
         return GT_ERR_IO;
     }
+    uint64_t end_us = read_clock(storage);
+    *commit_us_out = end_us - start_us;
+    *fsync_us_out = end_us - fsync_start_us;
     return GT_OK;
 }
 
@@ -558,7 +584,8 @@ gt_status gt_storage_flush(gt_storage *storage, unsigned *events_out)
 
     /* 2. Write and fsync with no lock held, so append never waits on the card. */
     size_t byte_count = record_count * GT_REC_SIZE;
-    if (write_batch(storage, byte_count, &events) != GT_OK) {
+    uint64_t commit_us = 0, fsync_us = 0;
+    if (write_batch(storage, byte_count, &events, &commit_us, &fsync_us) != GT_OK) {
         /* The records are still pending; mark degraded (reported once). */
         pthread_mutex_lock(&storage->lock);
         if (!storage->degraded) {
@@ -585,6 +612,10 @@ gt_status gt_storage_flush(gt_storage *storage, unsigned *events_out)
                                              storage->capacity);
     storage->committed_offset += byte_count;
     storage->committed_records += record_count;
+    storage->commits++;
+    storage->last_commit_records = record_count;
+    storage->last_commit_us = commit_us;
+    storage->last_fsync_us = fsync_us;
     if (decoded == GT_OK) {
         storage->has_last_committed = 1;
         storage->last_committed_seq = last_record.seq;
@@ -654,6 +685,13 @@ gt_status gt_storage_rollover(gt_storage *storage, uint64_t now_us, int clock_sy
     } else if (!clock_synced) {
         events |= GT_STORAGE_EV_RETENTION_SKIPPED;
     } else if (strcmp(today, storage->active_name) > 0) {
+        /* Records received before midnight belong in the old day's segment
+         * (PF-06), so flush them there first. If this flush fails, storage
+         * is degraded and the tail cut below runs as usual; the records stay
+         * pending and go into the new segment. */
+        unsigned flush_events = 0;
+        gt_storage_flush(storage, &flush_events);
+        events |= flush_events;
         int new_handle = -1;
         if (storage->degraded
             && (storage->ops->ftruncate(storage->ctx, storage->handle,
@@ -779,6 +817,16 @@ gt_status gt_storage_resume(const gt_storage *storage, gt_resume *resume_out)
     return GT_OK;
 }
 
+/* No lock: this is called before the flush thread starts (see storage.h),
+ * and only the flushing thread reads clock_us. */
+void gt_storage_set_clock(gt_storage *storage, gt_clock_us_fn clock_us)
+{
+    if (storage == NULL) {
+        return;
+    }
+    storage->clock_us = clock_us;
+}
+
 /* stats_out is filled under the lock so its fields all come from the same
  * moment. The lock is changed by locking, so the `const` is cast away for
  * that one call; the storage itself was never defined const, so this is
@@ -800,6 +848,10 @@ gt_status gt_storage_read_stats(const gt_storage *storage, gt_storage_stats *sta
     stats_out->backlog_percent = storage->backlog_percent;
     stats_out->refused = storage->refused;
     stats_out->segments_deleted = storage->segments_deleted;
+    stats_out->commits = storage->commits;
+    stats_out->last_commit_records = storage->last_commit_records;
+    stats_out->last_commit_us = storage->last_commit_us;
+    stats_out->last_fsync_us = storage->last_fsync_us;
     pthread_mutex_unlock(lock);
     return GT_OK;
 }

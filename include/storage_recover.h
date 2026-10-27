@@ -18,6 +18,7 @@ typedef struct {
     size_t   records_removed;  /* 24 B slots after good_len; a partial tail counts as 1 */
     int      has_records;      /* 1 if records_kept > 0, so last_seq means something */
     uint32_t last_seq;         /* seq of the last kept record; 0 if none */
+    uint64_t last_timestamp_us;  /* timestamp of the last kept record; 0 if none */
 } gt_scan_result;
 
 /* Scan `len` bytes of one segment file. The scan stops at the first record
@@ -49,6 +50,7 @@ typedef struct {
     size_t   records_kept;     /* valid records left in the file; 0 if RENAMED */
     int      has_records;      /* 1 if records_kept > 0 */
     uint32_t last_seq;         /* seq of the last kept record; 0 if none */
+    uint64_t last_timestamp_us;  /* timestamp of the last kept record; 0 if none */
 } gt_recover_report;
 
 /* Recover the segment `segment_name` in the directory behind ops/ctx

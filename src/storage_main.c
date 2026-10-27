@@ -64,6 +64,16 @@ static uint64_t wall_us(void)
     return (uint64_t)now.tv_sec * 1000000u + (uint64_t)now.tv_nsec / 1000u;
 }
 
+/* Monotonic time in us, for timing commits (gt_storage_set_clock, PF-08).
+ * CLOCK_MONOTONIC never jumps when the wall clock is set, so a duration is
+ * never negative or inflated by an NTP step. */
+static uint64_t monotonic_us(void)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (uint64_t)now.tv_sec * 1000000u + (uint64_t)now.tv_nsec / 1000u;
+}
+
 /* The log callback: one gt_log_format line on stderr. */
 static void log_line(void *log_ctx, gt_log_level level, const char *event, const char *fields)
 {
@@ -218,6 +228,7 @@ int main(int argc, char **argv)
         return 1;
     }
     log_open_info(&info);
+    gt_storage_set_clock(storage, monotonic_us);   /* before the flush thread starts */
 
     /* 3. Bind storage.sock, and make the stop pipe. */
     int listen_fd = -1;
@@ -253,9 +264,12 @@ int main(int argc, char **argv)
         pthread_join(flush_thread, NULL);
     }
     unsigned events = 0;
+    gt_storage_stats stats;
+    gt_storage_read_stats(storage, &stats);
+    uint64_t commits_before = stats.commits;
     gt_status shutdown_status = gt_storage_shutdown(storage, &events);
     gt_storage_log_events(log_line, NULL, events);
-    gt_storage_stats stats;
+    gt_storage_log_commit(log_line, NULL, storage, commits_before);   /* the final flush */
     gt_storage_read_stats(storage, &stats);
     char fields[96];
     snprintf(fields, sizeof fields, "clean=%d committed=%llu refused=%llu",

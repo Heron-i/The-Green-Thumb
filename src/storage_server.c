@@ -199,15 +199,66 @@ void gt_flusher_init(gt_flusher *flusher, gt_storage *storage, unsigned retentio
     flusher->log = log;
     flusher->log_ctx = log_ctx;
     flusher->logged_unsynced = 0;
+    flusher->clock_unsynced = 0;
+    flusher->unsynced_since_ms = 0;
 }
 
 /* Records keep flowing while the clock is unsynced (only rollover and
  * retention wait), so the flush runs either way. */
+void gt_storage_log_commit(gt_storage_log_fn log, void *log_ctx, const gt_storage *storage,
+                           uint64_t commits_before)
+{
+    gt_storage_stats stats;
+    if (log == NULL || gt_storage_read_stats(storage, &stats) != GT_OK
+        || stats.commits == commits_before) {
+        return;
+    }
+    char fields[96];
+    snprintf(fields, sizeof fields, "records=%lu commit_us=%llu fsync_us=%llu",
+             (unsigned long)stats.last_commit_records,
+             (unsigned long long)stats.last_commit_us, (unsigned long long)stats.last_fsync_us);
+    log(log_ctx, GT_LOG_INFO, "storage_commit", fields);
+    if (stats.last_fsync_us > GT_FSYNC_SLOW_US) {
+        snprintf(fields, sizeof fields, "fsync_us=%llu records=%lu",
+                 (unsigned long long)stats.last_fsync_us,
+                 (unsigned long)stats.last_commit_records);
+        log(log_ctx, GT_LOG_WARN, "fsync_slow", fields);
+    }
+}
+
+/* Log the start of an unsynced spell (clock_unsynced) and its end with its
+ * length (clock_synced unsynced_ms=N), once each (PF-13). */
+static void log_clock_change(gt_flusher *flusher, uint64_t now_ms, int clock_synced)
+{
+    if (!clock_synced && !flusher->clock_unsynced) {
+        flusher->clock_unsynced = 1;
+        flusher->unsynced_since_ms = now_ms;
+        if (flusher->log != NULL) {
+            flusher->log(flusher->log_ctx, GT_LOG_WARN, "clock_unsynced", NULL);
+        }
+    } else if (clock_synced && flusher->clock_unsynced) {
+        flusher->clock_unsynced = 0;
+        if (flusher->log != NULL) {
+            char fields[48];
+            snprintf(fields, sizeof fields, "unsynced_ms=%llu",
+                     (unsigned long long)(now_ms - flusher->unsynced_since_ms));
+            flusher->log(flusher->log_ctx, GT_LOG_INFO, "clock_synced", fields);
+        }
+    }
+}
+
+/* A pass commits at most once: either the rollover's pre-flush (PF-06),
+ * which leaves nothing pending, or the due flush after it. So comparing
+ * the commit count before and after finds that one commit (PF-08). */
 void gt_flusher_tick(gt_flusher *flusher, uint64_t now_us, uint64_t now_ms, int clock_synced)
 {
     if (flusher == NULL || flusher->storage == NULL) {
         return;
     }
+    gt_storage_stats before;
+    uint64_t commits_before = gt_storage_read_stats(flusher->storage, &before) == GT_OK
+                                  ? before.commits : 0;
+    log_clock_change(flusher, now_ms, clock_synced);
     unsigned events = 0;
     gt_storage_rollover(flusher->storage, now_us, clock_synced, flusher->retention_days,
                         &events);
@@ -226,6 +277,7 @@ void gt_flusher_tick(gt_flusher *flusher, uint64_t now_us, uint64_t now_ms, int 
         gt_storage_flush(flusher->storage, &flush_events);
         gt_storage_log_events(flusher->log, flusher->log_ctx, flush_events);
     }
+    gt_storage_log_commit(flusher->log, flusher->log_ctx, flusher->storage, commits_before);
 }
 
 /* The sleep is cut into FLUSHER_STEP_MS pieces so a stop is noticed
