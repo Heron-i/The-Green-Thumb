@@ -62,7 +62,8 @@ static void test_sev02_names_loggable(void)
         gt_storage_event event;
         char line[GT_LOG_LINE_MAX];
         CHECK_EQ(gt_storage_event_describe(EXPECTED[event_index].flag, &event), GT_OK);
-        CHECK_EQ(gt_log_format(line, sizeof line, 1, event.level, "storage", event.name, NULL),
+        CHECK_EQ(gt_log_format(line, sizeof line,
+                               &(gt_log_entry){ 1, event.level, "storage", event.name, NULL }),
                  GT_OK);
     }
 }

@@ -14,13 +14,21 @@ typedef enum { GT_LOG_DEBUG, GT_LOG_INFO, GT_LOG_WARN, GT_LOG_ERROR } gt_log_lev
 
 #define GT_LOG_LINE_MAX 256   /* caller buffer size that fits any normal line */
 
-/* Write one line into line_out (always NUL-terminated when line_size > 0).
- * fields: caller-built "key=value key=value", or NULL/"" for none.
- * GT_ERR_INVAL: NULL line_out/component/event, line_size 0, unknown level,
- * or a space in component/event (it would break parsing).
+/* What one log line says, before it is formatted. A struct groups related
+ * values under one name so they travel together as one argument. */
+typedef struct {
+    uint64_t timestamp_us;    /* µs since the Unix epoch */
+    gt_log_level level;
+    const char *component;    /* e.g. "storage"; no spaces */
+    const char *event;        /* e.g. "sensor_offline"; no spaces */
+    const char *fields;       /* caller-built "key=value key=value", or NULL/"" for none */
+} gt_log_entry;
+
+/* Write one line for *entry into line_out (always NUL-terminated when
+ * line_size > 0).
+ * GT_ERR_INVAL: NULL line_out/entry/component/event, line_size 0, unknown
+ * level, or a space in component/event (it would break parsing).
  * GT_ERR_FULL: the line did not fit. */
-gt_status gt_log_format(char *line_out, size_t line_size, uint64_t timestamp_us,
-                        gt_log_level level, const char *component,
-                        const char *event, const char *fields);
+gt_status gt_log_format(char *line_out, size_t line_size, const gt_log_entry *entry);
 
 #endif

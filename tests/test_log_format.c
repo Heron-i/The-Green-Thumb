@@ -5,7 +5,11 @@
  * "timestamp level component event key=value", that a line that does not
  * fit is reported instead of silently cut, and that input which would make
  * a line unparseable is rejected. Pure formatting: no clock, no file.
- * Run under make test / asan / memcheck. Implements LGF-01 through LGF-08.
+ * Run under make test / asan / memcheck. Implements LGF-01 through LGF-09.
+ *
+ * Each call passes its entry as a compound literal: `&(gt_log_entry){ ... }`
+ * makes an unnamed gt_log_entry in place, with the values in field order
+ * (timestamp_us, level, component, event, fields), and takes its address.
  *
  * What these tests cannot prove: where lines end up (stderr, a file or the
  * monitor). That is decided with the light_sensor process. */
@@ -23,8 +27,8 @@
 static void test_lgf01_full_line(void)
 {
     char line[GT_LOG_LINE_MAX];
-    CHECK_EQ(gt_log_format(line, sizeof line, SAMPLE_TIME_US, GT_LOG_WARN,
-                           "light_sensor", "sensor_offline", "fails=10"), GT_OK);
+    CHECK_EQ(gt_log_format(line, sizeof line, &(gt_log_entry){ SAMPLE_TIME_US, GT_LOG_WARN,
+                           "light_sensor", "sensor_offline", "fails=10" }), GT_OK);
     CHECK(strcmp(line, "1700000000000000 WARN light_sensor sensor_offline fails=10") == 0);
 }
 
@@ -35,11 +39,11 @@ static void test_lgf02_no_fields_no_trailing_space(void)
     char line[GT_LOG_LINE_MAX];
     const char *expected_line = "1700000000000000 INFO light_sensor sensor_online";
 
-    CHECK_EQ(gt_log_format(line, sizeof line, SAMPLE_TIME_US, GT_LOG_INFO,
-                           "light_sensor", "sensor_online", NULL), GT_OK);
+    CHECK_EQ(gt_log_format(line, sizeof line, &(gt_log_entry){ SAMPLE_TIME_US, GT_LOG_INFO,
+                           "light_sensor", "sensor_online", NULL }), GT_OK);
     CHECK(strcmp(line, expected_line) == 0);
-    CHECK_EQ(gt_log_format(line, sizeof line, SAMPLE_TIME_US, GT_LOG_INFO,
-                           "light_sensor", "sensor_online", ""), GT_OK);
+    CHECK_EQ(gt_log_format(line, sizeof line, &(gt_log_entry){ SAMPLE_TIME_US, GT_LOG_INFO,
+                           "light_sensor", "sensor_online", "" }), GT_OK);
     CHECK(strcmp(line, expected_line) == 0);
 }
 
@@ -52,7 +56,8 @@ static void test_lgf03_level_names(void)
     char line[GT_LOG_LINE_MAX];
 
     for (size_t level_index = 0; level_index < level_count; level_index++) {
-        CHECK_EQ(gt_log_format(line, sizeof line, 0, levels[level_index], "c", "e", NULL),
+        CHECK_EQ(gt_log_format(line, sizeof line,
+                               &(gt_log_entry){ 0, levels[level_index], "c", "e", NULL }),
                  GT_OK);
         CHECK(strcmp(line, expected_lines[level_index]) == 0);
     }
@@ -64,9 +69,11 @@ static void test_lgf04_timestamp_range(void)
 {
     char line[GT_LOG_LINE_MAX];
 
-    CHECK_EQ(gt_log_format(line, sizeof line, 0, GT_LOG_INFO, "c", "e", NULL), GT_OK);
+    CHECK_EQ(gt_log_format(line, sizeof line, &(gt_log_entry){ 0, GT_LOG_INFO, "c", "e", NULL }),
+             GT_OK);
     CHECK(strcmp(line, "0 INFO c e") == 0);
-    CHECK_EQ(gt_log_format(line, sizeof line, UINT64_MAX, GT_LOG_INFO, "c", "e", NULL), GT_OK);
+    CHECK_EQ(gt_log_format(line, sizeof line,
+                           &(gt_log_entry){ UINT64_MAX, GT_LOG_INFO, "c", "e", NULL }), GT_OK);
     CHECK(strcmp(line, "18446744073709551615 INFO c e") == 0);
 }
 
@@ -77,8 +84,8 @@ static void test_lgf04_timestamp_range(void)
 static void test_lgf05_too_small_is_full(void)
 {
     char small_line[8];
-    CHECK_EQ(gt_log_format(small_line, sizeof small_line, SAMPLE_TIME_US, GT_LOG_WARN,
-                           "light_sensor", "sensor_offline", NULL), GT_ERR_FULL);
+    CHECK_EQ(gt_log_format(small_line, sizeof small_line, &(gt_log_entry){ SAMPLE_TIME_US,
+                           GT_LOG_WARN, "light_sensor", "sensor_offline", NULL }), GT_ERR_FULL);
     CHECK(memchr(small_line, '\0', sizeof small_line) != NULL);
 }
 
@@ -89,10 +96,14 @@ static void test_lgf06_missing_args(void)
 {
     char line[GT_LOG_LINE_MAX];
 
-    CHECK_EQ(gt_log_format(NULL, sizeof line, 0, GT_LOG_INFO, "c", "e", NULL), GT_ERR_INVAL);
-    CHECK_EQ(gt_log_format(line, 0, 0, GT_LOG_INFO, "c", "e", NULL), GT_ERR_INVAL);
-    CHECK_EQ(gt_log_format(line, sizeof line, 0, GT_LOG_INFO, NULL, "e", NULL), GT_ERR_INVAL);
-    CHECK_EQ(gt_log_format(line, sizeof line, 0, GT_LOG_INFO, "c", NULL, NULL), GT_ERR_INVAL);
+    CHECK_EQ(gt_log_format(NULL, sizeof line, &(gt_log_entry){ 0, GT_LOG_INFO, "c", "e", NULL }),
+             GT_ERR_INVAL);
+    CHECK_EQ(gt_log_format(line, 0, &(gt_log_entry){ 0, GT_LOG_INFO, "c", "e", NULL }),
+             GT_ERR_INVAL);
+    CHECK_EQ(gt_log_format(line, sizeof line, &(gt_log_entry){ 0, GT_LOG_INFO, NULL, "e", NULL }),
+             GT_ERR_INVAL);
+    CHECK_EQ(gt_log_format(line, sizeof line, &(gt_log_entry){ 0, GT_LOG_INFO, "c", NULL, NULL }),
+             GT_ERR_INVAL);
 }
 
 /* ---- LGF-07: a space in component or event is rejected ----
@@ -102,11 +113,14 @@ static void test_lgf07_space_in_name_rejected(void)
 {
     char line[GT_LOG_LINE_MAX];
 
-    CHECK_EQ(gt_log_format(line, sizeof line, 0, GT_LOG_INFO, "light sensor", "e", NULL),
+    CHECK_EQ(gt_log_format(line, sizeof line,
+                           &(gt_log_entry){ 0, GT_LOG_INFO, "light sensor", "e", NULL }),
              GT_ERR_INVAL);
-    CHECK_EQ(gt_log_format(line, sizeof line, 0, GT_LOG_INFO, "c", "sensor offline", NULL),
+    CHECK_EQ(gt_log_format(line, sizeof line,
+                           &(gt_log_entry){ 0, GT_LOG_INFO, "c", "sensor offline", NULL }),
              GT_ERR_INVAL);
-    CHECK_EQ(gt_log_format(line, sizeof line, 0, GT_LOG_INFO, "c", "e", "a=1 b=2"), GT_OK);
+    CHECK_EQ(gt_log_format(line, sizeof line,
+                           &(gt_log_entry){ 0, GT_LOG_INFO, "c", "e", "a=1 b=2" }), GT_OK);
 }
 
 /* ---- LGF-08: an unknown level is rejected ----
@@ -115,8 +129,18 @@ static void test_lgf07_space_in_name_rejected(void)
 static void test_lgf08_unknown_level(void)
 {
     char line[GT_LOG_LINE_MAX];
-    CHECK_EQ(gt_log_format(line, sizeof line, 0, (gt_log_level)99, "c", "e", NULL),
+    CHECK_EQ(gt_log_format(line, sizeof line,
+                           &(gt_log_entry){ 0, (gt_log_level)99, "c", "e", NULL }),
              GT_ERR_INVAL);
+}
+
+/* ---- LGF-09: a NULL entry is rejected ----
+ * With no entry there is nothing to format, so it is refused before any
+ * field is read. */
+static void test_lgf09_null_entry(void)
+{
+    char line[GT_LOG_LINE_MAX];
+    CHECK_EQ(gt_log_format(line, sizeof line, NULL), GT_ERR_INVAL);
 }
 
 static const test_case_t tests[] = {
@@ -128,6 +152,7 @@ static const test_case_t tests[] = {
     {"LGF-06", "missing arguments are rejected", test_lgf06_missing_args},
     {"LGF-07", "a space in component or event is rejected", test_lgf07_space_in_name_rejected},
     {"LGF-08", "an unknown level is rejected", test_lgf08_unknown_level},
+    {"LGF-09", "a NULL entry is rejected", test_lgf09_null_entry},
 };
 
 int main(void)

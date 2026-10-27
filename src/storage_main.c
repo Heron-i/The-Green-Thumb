@@ -99,7 +99,10 @@ static void log_line(void *log_ctx, gt_log_level level, const char *event, const
 {
     (void)log_ctx;
     char line[GT_LOG_LINE_MAX];
-    if (gt_log_format(line, sizeof line, wall_us(), level, "storage", event, fields) == GT_OK) {
+    /* Designated initializers: each field is set by name. */
+    gt_log_entry entry = { .timestamp_us = wall_us(), .level = level, .component = "storage",
+                           .event = event, .fields = fields };
+    if (gt_log_format(line, sizeof line, &entry) == GT_OK) {
         fprintf(stderr, "%s\n", line);
     }
 }
