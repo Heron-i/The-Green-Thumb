@@ -155,8 +155,8 @@ Log format for every component: `timestamp level component event key=value`. `ti
 | Storage | Malformed message on `storage.sock` | `gt_record_decode()` fails | Discard it and close the connection; the hub reconnects | `ipc_bad_message` |
 | Storage (planned) | Filesystem remounted read-only (ext4 after SD errors) | `open()` / `write()` returns EROFS | Mark degraded and queue in memory (1 MB); this needs a reboot or fsck, so log it as an error. **Not built yet:** today EROFS shows as `storage_write_error` (or `segment_create_error` at rollover) + `storage_degraded`, with the records kept in memory | `storage_readonly`, `storage_degraded` |
 | Storage | `fsync()` stalls for seconds (consumer SD) | fsync duration measured on every commit | Log any fsync over 1 s. Storage's heartbeat is sent by the rx thread, which never blocks on disk, and carries "flush in progress since t" plus the committed-record count. The supervisor allows up to 30 s while a flush is in progress, and still kills storage if the committed count stops advancing past that | `fsync_slow` |
-| Storage | New day's segment cannot be created, or the directory fsync fails | Return value of `open(O_CREAT)` / `fsync()` on the directory | Keep the batch queued and retry every cycle | `segment_create_error` |
-| Storage | Retention deletes good data because the clock is wrong (boot without an RTC gives 1970 or an old date) | `clock_unsynced`, or a timestamp earlier than the build date | Skip retention deletion and day rollover while the clock is unsynced; keep appending to the current segment | `retention_skipped` |
+| Storage | New day's segment cannot be created, or the directory fsync fails | Return value of `open(O_CREAT)` / `fsync()` on the directory | Keep the batch queued and retry every cycle; log the failure once per spell, not on every retry | `segment_create_error` |
+| Storage | Retention deletes good data because the clock is wrong (boot without an RTC gives 1970 or an old date) | `clock_unsynced`, or a timestamp earlier than the build date | Skip retention deletion and day rollover while the clock is unsynced; keep appending to the current segment. On an **empty** log, storage waits up to 120 s for the clock before naming its first segment, so it doesn't start `log-19700101.bin`; if the clock is still unsynced it starts anyway | `retention_skipped`, `clock_wait`, `clock_wait_done` |
 | Storage | Retention delete fails | `unlink()` returns -1 | Log it and keep going; history is never at risk | `retention_error` |
 | Supervisor | Child fails to start (binary missing, `exec` error, exits at once) | `waitpid()` status 127, or exit within 1 s of fork | Restart with backoff 1 → 2 → 4 … max 30 s | `child_start_failed` |
 | Supervisor | Restart storm: a child keeps crashing | Restart count over a sliding window | Backoff 1 → 2 → 4 … capped at 30 s; the failure count resets once a child stays healthy for 60 s. After 10 consecutive failed starts, mark the child persistently degraded (shown in the CLI) and keep retrying once every 5 min, so no manual step is ever needed | `child_backoff`, `child_degraded` |
@@ -299,7 +299,7 @@ This follows the project's policy: protect existing history, and make any unavoi
 - **If `write()` or `fsync()` fails:**
   - The batch stays in memory and storage is marked degraded immediately.
   - On the next cycle, storage truncates the file back to the last committed offset, then rewrites and fsyncs the batch, so no duplicate or partial records reach the log.
-  - While the disk is unavailable, records keep queueing in the pending buffer, up to 1 MB (about 11 h). Storage logs `storage_backlog` once at each of 50%, 75% and 90% going up.
+  - While the disk is unavailable, records keep queueing in the pending buffer, up to 1 MB (about 11 h). Storage logs `storage_backlog` once at each of 50%, 75% and 90% going up, with the threshold and the fill (`percent=N pending=P`).
   - When the buffer is full, storage refuses and counts new readings (`storage_degraded reason=queue_full`, once per full spell). The next accepted reading skips their `seq`s, so a GAP whose `seq` is the first refused reading and whose count is the number refused goes in just before it. The GAP is stamped with the time of the last reading storage accepted before the refusals.
 
 See *Mechanism D* (batching, durability point and outage rows) and *Failure-mode table → Storage*.
@@ -311,14 +311,14 @@ See *Mechanism D* (batching, durability point and outage rows) and *Failure-mode
 On every start, **recovery runs before `storage.sock` accepts any data**. This is the same path after a power cut and after a supervisor restart or `kill -9`. Storage first takes the one-listener lock (`storage.sock.lock`), so no second storage process can be recovering or appending at the same time.
 
 1. If the clean-shutdown marker `clean_shutdown` is missing and at least one segment exists, log `unclean_shutdown` (a fresh install has nothing to recover, so it is not reported). A marker that is there is deleted and the directory fsynced at once, so it can't survive into a run that later crashes.
-2. Check the **newest** segment's header (only the segment being appended to can have a damaged tail). If it is invalid or the file is shorter than 16 B, rename it to `.corrupt`, log `segment_corrupt`, and start a fresh segment.
+2. Check the **newest** segment's header (only the segment being appended to can have a damaged tail). If it is invalid or the file is shorter than 16 B, rename it to `.corrupt`, log `segment_corrupt`, and start a fresh segment. An earlier `.corrupt` copy of the same segment is never replaced: the next copy becomes `<name>.2.corrupt`, then `.3.corrupt`, and so on. `.corrupt` files are evidence and are never deleted. Known limit: storage reads at most 128 directory names, so a directory holding more (about 90 `.corrupt` files beside 30 segments) stops storage at start with `storage_open_error` until old `.corrupt` files are cleared by hand.
 3. Scan the records from the start of the segment. Stop at the **first** record that has any of these problems:
    - bad magic, unknown `record_type` or wrong version
    - CRC mismatch
    - `seq` that does not increase
    - a partial (fewer than 24 B) trailing record
 4. `ftruncate()` the file at that offset, `fsync()` it, and log `recovery_event` with the bytes and records removed.
-5. If the newest segment holds no records (header-only, or renamed `.corrupt`), read older segments, newest first, until one gives the last `seq` on disk.
+5. If the newest segment holds no records (header-only, or renamed `.corrupt`), read older segments, newest first, until one gives the last `seq` on disk. Each older segment is recovered the same way, and every one that is cut or renamed is logged too (`recovery_event` / `segment_corrupt`, with its name).
 6. Open `storage.sock` and resume normal operation.
 
 Records are fixed-size, so the scan is simple offset arithmetic. The target is under 1 s for a full day's segment.

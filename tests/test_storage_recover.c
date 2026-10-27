@@ -8,7 +8,7 @@
  * bad header is renamed to .corrupt and the directory fsynced. Failures of
  * any file op are reported, never hidden, and no handle or memory is
  * leaked on any path. Uses tests/fake_file.h, so no disk is touched. Run
- * under make test / asan / memcheck. Implements SRV-01 through SRV-11.
+ * under make test / asan / memcheck. Implements SRV-01 through SRV-12.
  *
  * What these tests cannot prove: that real ext4 behaves like the fake
  * (Mechanism D Step 12a's loopback tests and the on-Pi power pulls do),
@@ -298,6 +298,44 @@ static void test_srv11_report_last_timestamp(void)
     CHECK(report.last_timestamp_us == 2001);   /* u64: too big for CHECK_EQ's long long */
 }
 
+/* Put a segment with a bad header (first byte 'X') as SEGMENT_NAME. */
+static void put_bad_header_segment(void)
+{
+    const uint32_t seqs[] = { 1 };
+    uint8_t segment[SEGMENT_BUF_SIZE];
+    size_t len = build_segment(segment, seqs, 1);
+    segment[0] = 'X';
+    CHECK_EQ(fake_fs_put(&fs, SEGMENT_NAME, segment, len), GT_OK);
+}
+
+/* ---- SRV-12: a second corrupt segment never replaces the first ----
+ * The same day's segment goes bad twice (it was renamed, a fresh one made,
+ * and that went bad too). The first .corrupt file is evidence and must
+ * survive, so the second becomes <name>.2.corrupt, and a third
+ * <name>.3.corrupt (PF-20). Every name still ends in .corrupt, which is
+ * what log_verify counts. */
+static void test_srv12_corrupt_names_unique(void)
+{
+    const gt_file_ops *ops = fake_fs_ops(&fs);
+    const uint8_t first_evidence[] = { 'f', 'i', 'r', 's', 't' };
+    CHECK_EQ(fake_fs_put(&fs, CORRUPT_NAME, first_evidence, sizeof first_evidence), GT_OK);
+    put_bad_header_segment();
+    gt_recover_report report;
+
+    recover_expect(ops, GT_OK, &report);
+    CHECK_EQ(report.outcome, GT_RECOVER_RENAMED);
+    const fake_file *first = fake_fs_file(&fs, CORRUPT_NAME);
+    CHECK(first != NULL && first->len == sizeof first_evidence
+          && memcmp(first->data, first_evidence, sizeof first_evidence) == 0);
+    CHECK(fake_fs_file(&fs, SEGMENT_NAME ".2.corrupt") != NULL);
+    CHECK(fake_fs_file(&fs, SEGMENT_NAME) == NULL);
+
+    put_bad_header_segment();
+    recover_expect(ops, GT_OK, &report);
+    CHECK(fake_fs_file(&fs, SEGMENT_NAME ".3.corrupt") != NULL);
+    CHECK(fake_fs_file(&fs, SEGMENT_NAME ".2.corrupt") != NULL);
+}
+
 static const test_case_t tests[] = {
     {"SRV-01", "a clean segment is left alone", test_srv01_clean_left_alone},
     {"SRV-02", "a header-only segment is clean", test_srv02_header_only_clean},
@@ -310,6 +348,7 @@ static const test_case_t tests[] = {
     {"SRV-09", "a failed rename or fsync_dir is reported", test_srv09_rename_failures},
     {"SRV-10", "bad arguments are rejected", test_srv10_bad_args},
     {"SRV-11", "the report carries the last record's time", test_srv11_report_last_timestamp},
+    {"SRV-12", "a second corrupt never replaces the first", test_srv12_corrupt_names_unique},
 };
 
 int main(void)

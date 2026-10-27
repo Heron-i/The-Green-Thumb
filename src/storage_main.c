@@ -10,6 +10,8 @@
  *      with "already running" and touches nothing.
  *   2. Open storage. Recovery runs here, before any data can arrive
  *      (DESIGN.md "recovery runs before storage.sock accepts any data").
+ *      On an empty log with an unsynced clock it first waits up to 120 s
+ *      for the clock, so the first segment isn't named 1970 (PF-20).
  *   3. Bind storage.sock: only now can the hub connect.
  *   4. Start the flush thread, then run the rx loop on this thread.
  * On SIGTERM or SIGINT the handler only sets a flag and writes one byte to
@@ -49,6 +51,10 @@
  * network time and no RTC (DESIGN.md: "a timestamp earlier than the build
  * date"). */
 #define EARLIEST_VALID_S 1790812800
+
+/* How long an empty log waits for the clock before the first segment is
+ * named (wait_for_clock_if_empty, PF-20). */
+#define CLOCK_WAIT_MAX_S 120
 
 /* Set by the signal handler, read by both threads. */
 static atomic_int stop_requested;
@@ -104,6 +110,35 @@ static int clock_synced(void)
     return 1;
 }
 
+/* On an empty log, wait up to CLOCK_WAIT_MAX_S for the clock before open
+ * names the first segment, so a Pi that booted without network time
+ * doesn't start log-19700101.bin (PF-20). A log that already holds a
+ * segment needs no wait: open reuses the newest, and rollover is skipped
+ * while the clock is unsynced. The hub's 1024-record queue (about 17 min
+ * at 1 Hz) holds readings meanwhile. If the clock is still unsynced at the
+ * end, open goes ahead with the time it has (logged at WARN). Signals are
+ * not installed yet, so a SIGTERM here simply ends the process. */
+static void wait_for_clock_if_empty(const char *log_dir)
+{
+    int empty = 0;
+    if (gt_storage_log_empty(log_dir, &empty) != GT_OK || !empty || clock_synced()) {
+        return;
+    }
+    char fields[48];
+    snprintf(fields, sizeof fields, "max_s=%d", CLOCK_WAIT_MAX_S);
+    log_line(NULL, GT_LOG_WARN, "clock_wait", fields);
+    const struct timespec one_second = { 1, 0 };
+    int waited_s = 0;
+    /* invariant: the clock was unsynced at every one of the waited_s checks */
+    while (waited_s < CLOCK_WAIT_MAX_S && !clock_synced()) {
+        nanosleep(&one_second, NULL);
+        waited_s++;
+    }
+    int synced = clock_synced();
+    snprintf(fields, sizeof fields, "waited_s=%d synced=%d", waited_s, synced);
+    log_line(NULL, synced ? GT_LOG_INFO : GT_LOG_WARN, "clock_wait_done", fields);
+}
+
 /* SIGTERM / SIGINT: set the flag and wake the rx loop's poll(). errno is
  * saved and restored, because write() may change it under the code the
  * signal interrupted. */
@@ -127,6 +162,25 @@ static void *flusher_thread(void *arg)
     return NULL;
 }
 
+/* Log what recovery did to one segment: segment_corrupt if it was renamed
+ * to .corrupt, otherwise recovery_event with what was cut (WARN if
+ * anything was). */
+static void log_recovery(const char *name, const gt_recover_report *report)
+{
+    char fields[160];
+    if (report->outcome == GT_RECOVER_RENAMED) {
+        snprintf(fields, sizeof fields, "segment=%s bytes=%llu", name,
+                 (unsigned long long)report->bytes_removed);
+        log_line(NULL, GT_LOG_ERROR, "segment_corrupt", fields);
+    } else {
+        snprintf(fields, sizeof fields, "segment=%s bytes_removed=%llu records_removed=%lu",
+                 name, (unsigned long long)report->bytes_removed,
+                 (unsigned long)report->records_removed);
+        log_line(NULL, report->records_removed > 0 ? GT_LOG_WARN : GT_LOG_INFO,
+                 "recovery_event", fields);
+    }
+}
+
 /* Log what open found: whether the last run ended cleanly, and what
  * recovery did to the newest segment (DESIGN.md: unclean_shutdown,
  * recovery_event, segment_corrupt). */
@@ -136,16 +190,16 @@ static void log_open_info(const gt_storage_open_info *info)
     if (info->unclean_shutdown) {
         log_line(NULL, GT_LOG_WARN, "unclean_shutdown", NULL);
     }
-    if (info->recovered && info->recovery.outcome == GT_RECOVER_RENAMED) {
-        snprintf(fields, sizeof fields, "segment=%s bytes=%llu", info->recovered_name,
-                 (unsigned long long)info->recovery.bytes_removed);
-        log_line(NULL, GT_LOG_ERROR, "segment_corrupt", fields);
-    } else if (info->recovered) {
-        snprintf(fields, sizeof fields, "segment=%s bytes_removed=%llu records_removed=%lu",
-                 info->recovered_name, (unsigned long long)info->recovery.bytes_removed,
-                 (unsigned long)info->recovery.records_removed);
-        log_line(NULL, info->recovery.records_removed > 0 ? GT_LOG_WARN : GT_LOG_INFO,
-                 "recovery_event", fields);
+    if (info->recovered) {
+        log_recovery(info->recovered_name, &info->recovery);
+    }
+    /* Older segments the walk back for the last seq changed (PF-14). */
+    for (size_t older_index = 0; older_index < info->older_count; older_index++) {
+        log_recovery(info->older[older_index].name, &info->older[older_index].report);
+    }
+    if (info->older_unlisted > 0) {
+        snprintf(fields, sizeof fields, "segments=%lu", (unsigned long)info->older_unlisted);
+        log_line(NULL, GT_LOG_WARN, "recovery_unlisted", fields);
     }
     if (info->has_last) {
         snprintf(fields, sizeof fields, "segment=%s created=%d last_seq=%lu",
@@ -217,6 +271,7 @@ int main(int argc, char **argv)
         gt_listen_release(sock_path, -1, lock_fd);
         return 1;
     }
+    wait_for_clock_if_empty(log_dir);
     gt_storage *storage = NULL;
     gt_storage_open_info info;
     gt_status status = gt_storage_open(log_dir, wall_us(), &storage, &info);
@@ -271,10 +326,19 @@ int main(int argc, char **argv)
     gt_storage_log_events(log_line, NULL, events);
     gt_storage_log_commit(log_line, NULL, storage, commits_before);   /* the final flush */
     gt_storage_read_stats(storage, &stats);
-    char fields[96];
-    snprintf(fields, sizeof fields, "clean=%d committed=%llu refused=%llu",
-             shutdown_status == GT_OK, (unsigned long long)stats.committed_records,
-             (unsigned long long)stats.refused);
+    /* The segment and last committed seq say where the log ended (PF-14),
+     * matching storage_start's fields. The flush thread has been joined,
+     * so reading the active segment's name is safe. */
+    char last_seq[16] = "none";
+    if (stats.has_last_committed) {
+        snprintf(last_seq, sizeof last_seq, "%lu", (unsigned long)stats.last_committed_seq);
+    }
+    char segment[GT_FILE_NAME_MAX] = "none";
+    gt_storage_active_segment(storage, segment);
+    char fields[160];
+    snprintf(fields, sizeof fields, "clean=%d segment=%s last_seq=%s committed=%llu refused=%llu",
+             shutdown_status == GT_OK, segment, last_seq,
+             (unsigned long long)stats.committed_records, (unsigned long long)stats.refused);
     log_line(NULL, shutdown_status == GT_OK ? GT_LOG_INFO : GT_LOG_ERROR, "storage_stop", fields);
 
     gt_storage_close(storage);

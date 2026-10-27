@@ -65,6 +65,28 @@ void gt_storage_log_events(gt_storage_log_fn log, void *log_ctx, unsigned events
     }
 }
 
+/* The backlog bit is taken out and logged here with its fields; the rest
+ * go through gt_storage_log_events unchanged. Append updates
+ * backlog_percent under the same call that set the bit, so the stats read
+ * here describe that crossing. */
+void gt_storage_log_rx_events(gt_storage_log_fn log, void *log_ctx, const gt_storage *storage,
+                              unsigned events)
+{
+    gt_storage_stats stats;
+    if (log != NULL && (events & GT_STORAGE_EV_BACKLOG) && storage != NULL
+        && gt_storage_read_stats(storage, &stats) == GT_OK) {
+        char fields[48];
+        snprintf(fields, sizeof fields, "percent=%u pending=%lu", stats.backlog_percent,
+                 (unsigned long)stats.pending);
+        gt_storage_event event;
+        if (gt_storage_event_describe(GT_STORAGE_EV_BACKLOG, &event) == GT_OK) {
+            log(log_ctx, event.level, event.name, fields);
+            events &= ~GT_STORAGE_EV_BACKLOG;
+        }
+    }
+    gt_storage_log_events(log, log_ctx, events);
+}
+
 /* What reading one frame from the hub's connection came to. */
 typedef enum { FRAME_KEEP, FRAME_CLOSE, FRAME_NONE } frame_result;
 
@@ -82,7 +104,7 @@ static frame_result read_frame(gt_storage *storage, int conn_fd, gt_storage_log_
     }
     unsigned events = 0;
     gt_rx_action action = gt_storage_rx(storage, buf, (long)len, monotonic_ms(), &events);
-    gt_storage_log_events(log, log_ctx, events);
+    gt_storage_log_rx_events(log, log_ctx, storage, events);
     return action == GT_RX_KEEP ? FRAME_KEEP : FRAME_CLOSE;
 }
 
@@ -199,6 +221,7 @@ void gt_flusher_init(gt_flusher *flusher, gt_storage *storage, unsigned retentio
     flusher->log = log;
     flusher->log_ctx = log_ctx;
     flusher->logged_unsynced = 0;
+    flusher->logged_create_error = 0;
     flusher->clock_unsynced = 0;
     flusher->unsynced_since_ms = 0;
 }
@@ -269,6 +292,14 @@ void gt_flusher_tick(gt_flusher *flusher, uint64_t now_us, uint64_t now_ms, int 
         flusher->logged_unsynced = 1;
     } else if (clock_synced) {
         flusher->logged_unsynced = 0;
+    }
+    if (events & GT_STORAGE_EV_SEGMENT_CREATE_ERROR) {
+        if (flusher->logged_create_error) {
+            events &= ~GT_STORAGE_EV_SEGMENT_CREATE_ERROR;   /* already logged this spell */
+        }
+        flusher->logged_create_error = 1;
+    } else if (events & GT_STORAGE_EV_ROLLOVER) {
+        flusher->logged_create_error = 0;
     }
     gt_storage_log_events(flusher->log, flusher->log_ctx, events);
 

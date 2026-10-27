@@ -58,16 +58,19 @@ typedef struct {
  * read the whole file into memory, scan it with gt_recover_scan, then
  *   - nothing to cut: change nothing (no write, no fsync);
  *   - a damaged tail: ftruncate to good_len, then fsync;
- *   - a bad or short header: rename to "<segment_name>.corrupt" (replacing
- *     an older one with that name), then fsync_dir so the rename survives
- *     a power cut. The caller starts a fresh segment.
+ *   - a bad or short header: rename to "<segment_name>.corrupt", or, if
+ *     that name is taken by an earlier copy, to the first free one of
+ *     "<segment_name>.2.corrupt" .. ".99.corrupt" (an earlier copy is never
+ *     replaced, PF-20), then fsync_dir so the rename survives a power cut.
+ *     The caller starts a fresh segment.
  * Every handle is closed and all memory freed before it returns.
  *   GT_OK         *report_out says what happened
  *   GT_ERR_IO     the file is missing, or any file op failed; *report_out
  *                 is untouched and the caller retries or reports it
  *   GT_ERR_NOMEM  the file could not be read into memory
- *   GT_ERR_INVAL  NULL args, or segment_name + ".corrupt" doesn't fit
- *                 GT_FILE_NAME_MAX */
+ *   GT_ERR_INVAL  NULL args, or segment_name + ".99.corrupt" doesn't fit
+ *                 GT_FILE_NAME_MAX
+ * All 99 .corrupt names taken is GT_ERR_IO, like a failed rename. */
 gt_status gt_storage_recover_ops(const gt_file_ops *ops, void *ctx,
                                  const char *segment_name, gt_recover_report *report_out);
 

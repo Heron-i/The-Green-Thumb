@@ -8,7 +8,7 @@
  * ignores every file that isn't a segment. On any failure it returns an
  * error, leaves *storage_out alone, calls destroy exactly once and leaves
  * no handle open. Uses tests/fake_file.h, so no disk is touched. Run under
- * make test / asan / memcheck. Implements SOP-01 through SOP-13.
+ * make test / asan / memcheck. Implements SOP-01 through SOP-16.
  *
  * What these tests cannot prove: append, flush and the clean-shutdown
  * marker (Mechanism D Steps 7c, 7d and 9), or real ext4 (Step 12a). */
@@ -405,6 +405,94 @@ static void test_sop13_last_timestamp_reported(void)
     close_and_check(storage);
 }
 
+/* ---- SOP-14: an older segment cut in the walk back is reported ----
+ * Today's segment is header-only, so open looks back to yesterday's,
+ * which ends in 10 torn bytes. Recovery cuts them, and open now says so:
+ * one older entry, yesterday, TRUNCATED, 1 record removed (PF-14). Before,
+ * only today's (clean) recovery was reported. */
+static void test_sop14_older_cut_reported(void)
+{
+    const gt_file_ops *ops = fake_fs_ops(&fs);
+    const uint32_t seqs[] = { 1, 2 };
+    uint8_t segment[SEGMENT_BUF_SIZE];
+    size_t good_len = build_segment(segment, seqs, 2);
+    memset(&segment[good_len], 0xA7, 10);
+    CHECK_EQ(fake_fs_put(&fs, YESTERDAY, segment, good_len + 10), GT_OK);
+    put_segment(TODAY_NAME, NULL, 0);
+    gt_storage_open_info info;
+    gt_storage *storage = open_ok(ops, TODAY_US, &info);
+
+    CHECK_EQ(info.recovery.outcome, GT_RECOVER_CLEAN);
+    CHECK_EQ(info.last_seq, 2);
+    CHECK_EQ(info.older_count, 1);
+    CHECK_EQ(info.older_unlisted, 0);
+    CHECK(strcmp(info.older[0].name, YESTERDAY) == 0);
+    CHECK_EQ(info.older[0].report.outcome, GT_RECOVER_TRUNCATED);
+    CHECK_EQ(info.older[0].report.records_removed, 1);
+    close_and_check(storage);
+}
+
+/* ---- SOP-15: a renamed older segment is reported, clean ones not ----
+ * Today's is header-only, yesterday's has a bad header (renamed to
+ * .corrupt), and the day before holds 3 good records. The walk back
+ * reports yesterday as RENAMED and lists nothing for the clean one. */
+static void test_sop15_older_renamed_reported(void)
+{
+    const gt_file_ops *ops = fake_fs_ops(&fs);
+    const uint32_t seqs[] = { 1, 2, 3 };
+    uint8_t segment[SEGMENT_BUF_SIZE];
+    put_segment("log-20261024.bin", seqs, 3);
+    size_t len = build_segment(segment, seqs, 1);
+    segment[0] = 'X';
+    CHECK_EQ(fake_fs_put(&fs, YESTERDAY, segment, len), GT_OK);
+    put_segment(TODAY_NAME, NULL, 0);
+    gt_storage_open_info info;
+    gt_storage *storage = open_ok(ops, TODAY_US, &info);
+
+    CHECK_EQ(info.last_seq, 3);
+    CHECK_EQ(info.older_count, 1);
+    CHECK(strcmp(info.older[0].name, YESTERDAY) == 0);
+    CHECK_EQ(info.older[0].report.outcome, GT_RECOVER_RENAMED);
+    CHECK(fake_fs_file(&fs, YESTERDAY ".corrupt") != NULL);
+    close_and_check(storage);
+}
+
+/* ---- SOP-16: an empty log is told apart from a used one ----
+ * Before open names a segment from the clock, storage_main asks whether
+ * the log is empty, so an unsynced Pi can wait instead of starting
+ * log-19700101.bin (PF-20). No files, or only a .corrupt file and the
+ * marker: empty. One segment: not empty. Nothing is opened or changed. A
+ * failed listing is GT_ERR_IO and NULL arguments GT_ERR_INVAL, with the
+ * output left alone. */
+static void test_sop16_empty_log_detected(void)
+{
+    const gt_file_ops *ops = fake_fs_ops(&fs);
+    const uint8_t junk[] = { 'x' };
+    int empty = -1;
+
+    CHECK_EQ(gt_storage_log_empty_ops(ops, &fs, &empty), GT_OK);
+    CHECK_EQ(empty, 1);
+
+    CHECK_EQ(fake_fs_put(&fs, TODAY_NAME ".corrupt", junk, sizeof junk), GT_OK);
+    CHECK_EQ(fake_fs_put(&fs, GT_STORAGE_MARKER_NAME, junk, 0), GT_OK);   /* empty file */
+    CHECK_EQ(gt_storage_log_empty_ops(ops, &fs, &empty), GT_OK);
+    CHECK_EQ(empty, 1);
+
+    put_segment(YESTERDAY, NULL, 0);
+    CHECK_EQ(gt_storage_log_empty_ops(ops, &fs, &empty), GT_OK);
+    CHECK_EQ(empty, 0);
+    CHECK_EQ(fs.open_calls, 0);
+    CHECK_EQ(fs.unlink_calls, 0);
+
+    empty = -1;
+    fs.fail_list_call = fs.list_calls + 1;
+    CHECK_EQ(gt_storage_log_empty_ops(ops, &fs, &empty), GT_ERR_IO);
+    CHECK_EQ(empty, -1);
+    CHECK_EQ(gt_storage_log_empty_ops(NULL, &fs, &empty), GT_ERR_INVAL);
+    CHECK_EQ(gt_storage_log_empty_ops(ops, &fs, NULL), GT_ERR_INVAL);
+    CHECK_EQ(empty, -1);
+}
+
 static const test_case_t tests[] = {
     {"SOP-01", "an empty directory gets today's segment", test_sop01_empty_dir_creates_today},
     {"SOP-02", "today's clean segment is reused", test_sop02_today_reused},
@@ -419,6 +507,9 @@ static const test_case_t tests[] = {
     {"SOP-11", "close cleans up; info may be NULL", test_sop11_close_and_null_info},
     {"SOP-12", "bad arguments are rejected", test_sop12_bad_args},
     {"SOP-13", "open reports the newest record's time", test_sop13_last_timestamp_reported},
+    {"SOP-14", "an older segment cut in the walk back", test_sop14_older_cut_reported},
+    {"SOP-15", "a renamed older segment is reported", test_sop15_older_renamed_reported},
+    {"SOP-16", "an empty log is told apart from a used one", test_sop16_empty_log_detected},
 };
 
 int main(void)
