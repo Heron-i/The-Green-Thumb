@@ -35,7 +35,7 @@ flowchart TB
 
         subgraph STOP["storage process (D)"]
             RX["rx thread<br/>append to batch"]
-            BUF[["in-memory batch<br/>≤ 64 × 24 B records"]]
+            BUF[["pending buffer<br/>≤ 1 MB of 24 B records"]]
             FL["flush thread<br/>flush on N = 64 or T = 60 s"]
             REC["startup recovery<br/>scan tail · truncate bad CRC"]
         end
@@ -70,7 +70,7 @@ flowchart TB
     LT -.->|"heartbeat 1 Hz"| SUPSOCK
     ST -.->|"heartbeat 1 Hz"| SUPSOCK
     HT -.->|"heartbeat 1 Hz"| SUPSOCK
-    FL -.->|"heartbeat 1 Hz"| SUPSOCK
+    RX -.->|"heartbeat 1 Hz"| SUPSOCK
     SUPSOCK -.->|"heartbeat 1 Hz, timeout 5 s (4 msg/s total)"| SUP
     SIG -.->|"event: SIGCHLD"| SUP
     SUP -.->|"event: restart, backoff 1→2→4… max 30 s"| LP
@@ -93,12 +93,12 @@ flowchart TB
 |---|---|---|---|---|
 | Plant care needs an unbroken multi-day history | Append-only log; daily segments; 30-day retention | storage process, flush thread | Soil moisture changes over hours and watering trends over days, so the value is in the history. About 2.1 MB/day means 30 days is about 63 MB, which fits easily | 72 h soak: records committed = records sent by the hub (0 sequence gaps) |
 | Keep write overhead and SD wear low | Batching: flush at N = 64 records or T = 60 s; single buffer copied out under the lock, no lock held during I/O | rx thread + flush thread | Fsyncing every record would mean about 88k fsyncs/day; batching cuts that to about 1,440/day. Soil changes slowly, so a 60 s commit delay costs nothing | Compare fsync count, write latency and CPU at (N,T) = (1, 1 s), (64, 10 s) and (64, 60 s) |
-| A precise, provable durability point | fsync per batch; directory fsync when a new segment is created | flush thread | Without fsync, "written" only means the data reached the page cache. The directory fsync stops a new day's file from vanishing | Every commit logged with count and duration; report fsync p50/p99 |
+| A precise, provable durability point | fsync per batch; directory fsync when a new segment is created | flush thread | Without fsync, "written" only means the data reached the page cache. The directory fsync stops a new day's file from vanishing | Every commit logged with count and duration (`storage_commit records=N commit_us=T fsync_us=F`); fsync p50/p99 are computed offline from those lines |
 | Survive being unplugged mid-write | 24 B records with CRC32; startup scan truncates at the first bad record before accepting data | storage startup recovery | A household Pi has no UPS and gets unplugged routinely. Fixed-size records make recovery a short arithmetic scan | 20 real power pulls mid-batch: 0 corrupt records accepted, loss ≤ 1 batch (60 s), recovery < 1 s |
 | No loss on a normal shutdown or restart | Flush and fsync on SIGTERM | flush thread | Supervisor restarts and user shutdowns shouldn't cost a batch | 20 SIGTERM restarts: 0 records lost |
 | Never fail silently | Check every write/fsync; on any detected failure, keep the batch in memory and mark storage degraded; on the next cycle, truncate to the last committed offset, rewrite and fsync | flush thread | A silent hole would undermine the history claim, which is D's selling point | Inject write/fsync errors: 100% logged as `storage_write_error` / `fsync_error` + `storage_degraded`, 0 silent losses |
 | Preserve history through a storage outage | 1 MB queue (about 11 h); `storage_backlog` at 50/75/90%; when full, an explicit degraded state that refuses and counts new readings, then writes a gap record on recovery | storage process | Better a marked gap than a silent one. Storage keeps reading its socket, so the hub and sensors never block and E's heartbeats are unaffected | Outage longer than the queue (with a small test cap): 0 accepted readings lost, and the gap record's count equals the refused count |
-| Restarts must not corrupt the log (D meets E) | Recovery runs before `storage.sock` accepts data | storage startup recovery + supervisor | The supervisor can kill storage at any instant, so a kill is just a power cut without the reboot | 50 random `kill -9`s on storage: 0 corrupt records |
+| Restarts must not corrupt the log (D meets E) | Storage takes the one-listener lock on `storage.sock.lock` before recovery, so two storage processes can never repair or append to one segment; recovery runs before `storage.sock` accepts data | storage startup recovery + supervisor | The supervisor can kill storage at any instant, so a kill is just a power cut without the reboot | 50 random `kill -9`s on storage: 0 corrupt records |
 
 ## **Mechanism E — Splitting the System into Smaller Processes**
 
@@ -123,7 +123,7 @@ flowchart TB
 
 ## Failure-mode table
 
-Log format for every component: `timestamp level component event key=value`. `timestamp` is µs since the Unix epoch, written as an integer (the same unit as the on-disk record, so log lines and records can be joined), and `level` is one of `DEBUG`, `INFO`, `WARN` or `ERROR`. Every component builds its lines with the shared `gt_log_format` (`src/gt_log.c`). Rule: whichever component refuses a reading records the gap (start, end, count), so no reading is ever lost silently.
+Log format for every component: `timestamp level component event key=value`. `timestamp` is µs since the Unix epoch, written as an integer (the same unit as the on-disk record, so log lines and records can be joined), and `level` is one of `DEBUG`, `INFO`, `WARN` or `ERROR`. Every component builds its lines with the shared `gt_log_format` (`src/gt_log.c`) and writes them to stderr; children inherit the supervisor's stderr, so under systemd every line reaches the journal. Rule: whichever component refuses a reading records the gap (start, end, count), so no reading is ever lost silently. Besides the events in the table, storage logs `storage_start` / `storage_stop` (with segment, last `seq`, committed and refused counts), `segment_rollover`, and `hub_connected` / `hub_disconnected` / `hub_duplicate_client` for its one hub connection; `storage_degraded` carries `reason=write_failed` or `reason=queue_full`. The flag-to-name table is `src/storage_event.c`.
 
 | Component | Failure | Detection | Response | Log |
 |---|---|---|---|---|
@@ -140,23 +140,23 @@ Log format for every component: `timestamp level component event key=value`. `ti
 | IPC (all sockets) | `/run/plantpi` missing at boot (tmpfs) | `bind()` / `connect()` returns ENOENT | Supervisor creates the directory with fixed permissions before starting any child | `rundir_created` |
 | Hub | Malformed, lost or out-of-order message | Length/magic/version check; gap in the sensor-side counter | Discard a malformed message and close the connection so the sensor resyncs; report counter gaps | `ipc_bad_message`, `sensor_seq_gap` |
 | Hub | Sensor goes quiet | Last-seen timer: 3 s for light, 180 s for soil | Mark the sensor stale and keep running on the other sensor | `sensor_timeout`, `sensor_resumed` |
-| Hub | Out-of-range reading | Range check (light 0–65535 lux; soil within the seesaw's raw range) | Reject and count; invalid data is not stored | `reading_invalid` |
+| Hub | Out-of-range reading | Range check (light raw count 0–65535; soil within the seesaw's raw range) | Reject and count; invalid data is not stored | `reading_invalid` |
 | Hub | Duplicate reading after a sensor resends | Sensor counter ≤ the last counter seen on this connection | Drop the duplicate | `ipc_duplicate` |
 | Hub | Two clients claim the same sensor ID (an old instance not yet reaped) | A second connection for a sensor ID that is already connected | Keep the newest connection and close the old one | `sensor_duplicate_client` |
-| Hub | Hub restarts and its `seq` starts over, so storage recovery would see "`seq` does not increase" and truncate good data | On startup, the hub has no last `seq` | On connect, storage replies with its last committed `seq` (known from its recovery scan) and the hub continues from the next value; as a safety net, storage rejects any `seq` ≤ last committed | `seq_resume`, `seq_rejected` |
+| Hub | Hub (re)connects to storage and must pick its next `seq`. A restarted hub that started over would make storage reject everything ("`seq` does not increase"); a running hub that went back to storage's reply would reuse the `seq`s storage lost | On every connect, before sending | Storage replies with its last **accepted** `seq` (8 B `seq_resume`, see *In what format*), pending records included. The hub's next `seq` is the **larger** of its own next `seq` and the reply + 1 (0 for an empty log). A freshly started hub has no counter of its own, so it continues from the reply + 1. A hub that is still running keeps its counter (1 + the last `seq` whose `send()` succeeded), so `seq`s that storage lost leave a hole and storage writes a GAP for them (*Storage killed* row). The reply is the last accepted, not the last committed: if 41–60 are pending and the reply said 40, a fresh hub would reuse 41–60 and storage would reject them. As a safety net, storage rejects any `seq` ≤ last accepted | `seq_resume`, `seq_rejected` |
 | Hub | Process crashes or hangs | SIGCHLD, or no heartbeat for 5 s | Supervisor restarts it with backoff (SIGKILL first if hung); sensor rings cover the downtime | `child_exit` / `heartbeat_timeout`, `hub_start` |
-| Hub → storage | Storage restarting, recovering or slow | `send` returns EPIPE, ECONNREFUSED or EAGAIN | Hold up to 1024 records (about 17 min), reconnect, and drain in order | `storage_unreachable`, `storage_reconnected` |
-| Hub → storage | Hub queue full | Queue depth | Refuse and count new readings; send one gap record to storage before draining | `hub_queue_full` |
-| Storage | `write()` or `fsync()` fails | Return value check | Keep the batch in memory and mark degraded; on the next cycle, truncate the log back to the last committed offset, then rewrite the batch and fsync, so no duplicate or partial records reach the log | `storage_write_error` / `fsync_error`, `storage_degraded` |
-| Storage | Disk full, or backlog fills during an outage | ENOSPC / `statvfs`; queue depth (1 MB, about 11 h) | Log the backlog at 50/75/90%; never delete history early; when full, refuse and count new readings and write a gap record on recovery | `storage_disk_full`, `storage_backlog`, `storage_degraded`, `storage_recovered` |
+| Hub → storage | Storage restarting, recovering or slow | `send` returns EPIPE, ECONNREFUSED or EAGAIN; no `seq_resume` reply within 2 s of connecting | Hold up to 1024 records (about 17 min). Each already carries its receive time but gets its `seq` and CRC only when it is sent, because the next `seq` isn't known until storage replies (hub-restart row). Reconnect, wait for `seq_resume`, then drain in order; a send that fails uses no `seq` | `storage_unreachable`, `storage_reconnected` |
+| Hub → storage | Hub queue full | Queue depth | Refuse and count new readings; queue one gap record (sensor 0, the first refused reading's receive time, the refused count) after the records already held and before the next new one. It gets its `seq` when sent, like any record | `hub_queue_full` |
+| Storage | `write()` or `fsync()` fails | Return value check | Keep the batch in memory and mark degraded; on the next cycle, truncate the log back to the last committed offset, then rewrite the batch and fsync, so no duplicate or partial records reach the log. If the day rolls over while degraded, the old segment's torn tail is cut and fsynced first (recovery only ever repairs the newest segment); if that cut fails, the rollover waits a cycle | `storage_write_error` / `fsync_error`, `storage_degraded` (`reason=write_failed`) |
+| Storage | Disk full, or backlog fills during an outage | Queue depth (1 MB, about 11 h). **Planned:** ENOSPC / `statvfs`. Until then a full card shows only as `storage_write_error` (or `fsync_error`) + `storage_degraded` | Log the backlog at 50/75/90%; never delete history early; when full, refuse and count new readings and write a gap record on recovery | `storage_backlog`, `storage_degraded`, `storage_recovered`; planned: `storage_disk_full` |
 | Storage | Corrupt tail or bad segment header after a crash | Startup scan: bad magic, CRC or header, backwards seq, partial record | Truncate at the first bad record (or rename a bad segment to `.corrupt`) and fsync, then accept data | `recovery_event`, `segment_corrupt` |
 | Storage | Process crashes or hangs | SIGCHLD, or no heartbeat for 5 s | Supervisor restarts it; recovery runs before the socket accepts data | `child_exit` / `heartbeat_timeout`, `recovery_event` |
-| Storage | Killed (`kill -9` or OOM) with an unsynced batch, losing up to 60 s with no GAP record | After restart, the first incoming `seq` is greater than last committed + 1 | Loss is limited to the unsynced batch (≤ 60 s, the same bound as a power cut) and made explicit: storage writes one GAP record covering the missing range (count = the difference). Relies on the `seq` hand-off in the hub-restart row | `recovery_gap` |
-| Storage | Malformed message on `storage.sock` | `gt_msg_decode()` fails | Discard it and close the connection; the hub reconnects | `ipc_bad_message` |
-| Storage | Filesystem remounted read-only (ext4 after SD errors) | `open()` / `write()` returns EROFS | Mark degraded and queue in memory (1 MB); this needs a reboot or fsck, so log it as an error | `storage_readonly`, `storage_degraded` |
+| Storage | Killed (`kill -9` or OOM) with an unsynced batch, or with records the hub sent still unread in `storage.sock` | After restart, the running hub's first `seq` is greater than storage's last accepted + 1 | Loss is limited to the unsynced batch plus the socket's unread records (≤ 60 s, the same bound as a power cut) and is made explicit: storage writes one GAP record (`sensor_id` 0, `seq` = last accepted + 1, count = the missing `seq`s, timestamp = the last accepted record's time) before the hub's record. This relies on the hub keeping its counter across the reconnect (hub row above). If the hub restarted too, it has no counter, no hole appears, and the loss shows only as `unclean_shutdown` (*Power* row). An empty log (`has_last` = 0) accepts any first `seq`, so wiping the log is not reported as a gap | `recovery_gap` |
+| Storage | Malformed message on `storage.sock` | `gt_record_decode()` fails | Discard it and close the connection; the hub reconnects | `ipc_bad_message` |
+| Storage (planned) | Filesystem remounted read-only (ext4 after SD errors) | `open()` / `write()` returns EROFS | Mark degraded and queue in memory (1 MB); this needs a reboot or fsck, so log it as an error. **Not built yet:** today EROFS shows as `storage_write_error` (or `segment_create_error` at rollover) + `storage_degraded`, with the records kept in memory | `storage_readonly`, `storage_degraded` |
 | Storage | `fsync()` stalls for seconds (consumer SD) | fsync duration measured on every commit | Log any fsync over 1 s. Storage's heartbeat is sent by the rx thread, which never blocks on disk, and carries "flush in progress since t" plus the committed-record count. The supervisor allows up to 30 s while a flush is in progress, and still kills storage if the committed count stops advancing past that | `fsync_slow` |
-| Storage | New day's segment cannot be created, or the directory fsync fails | Return value of `open(O_CREAT)` / `fsync()` on the directory | Keep the batch queued and retry every cycle | `segment_create_error` |
-| Storage | Retention deletes good data because the clock is wrong (boot without an RTC gives 1970 or an old date) | `clock_unsynced`, or a timestamp earlier than the build date | Skip retention deletion and day rollover while the clock is unsynced; keep appending to the current segment | `retention_skipped` |
+| Storage | New day's segment cannot be created, or the directory fsync fails | Return value of `open(O_CREAT)` / `fsync()` on the directory | Keep the batch queued and retry every cycle; log the failure once per spell, not on every retry | `segment_create_error` |
+| Storage | Retention deletes good data because the clock is wrong (boot without an RTC gives 1970 or an old date) | `clock_unsynced`, or a timestamp earlier than the build date | Skip retention deletion and day rollover while the clock is unsynced; keep appending to the current segment. On an **empty** log, storage waits up to 120 s for the clock before naming its first segment, so it doesn't start `log-19700101.bin`; if the clock is still unsynced it starts anyway | `retention_skipped`, `clock_wait`, `clock_wait_done` |
 | Storage | Retention delete fails | `unlink()` returns -1 | Log it and keep going; history is never at risk | `retention_error` |
 | Supervisor | Child fails to start (binary missing, `exec` error, exits at once) | `waitpid()` status 127, or exit within 1 s of fork | Restart with backoff 1 → 2 → 4 … max 30 s | `child_start_failed` |
 | Supervisor | Restart storm: a child keeps crashing | Restart count over a sliding window | Backoff 1 → 2 → 4 … capped at 30 s; the failure count resets once a child stays healthy for 60 s. After 10 consecutive failed starts, mark the child persistently degraded (shown in the CLI) and keep retrying once every 5 min, so no manual step is ever needed | `child_backoff`, `child_degraded` |
@@ -203,7 +203,7 @@ The timestamp is applied by the hub when it receives the reading. If the Pi boot
 | Soil | 1 per 60 s | 1,440 |
 | **Total into storage** | **≈1.02 records/s (≈25 B/s)** | **87,840 ≈ 2.1 MB/day** |
 
-On the wire, each reading travels sensor → hub as a 16 B socket message (layout under *In what format*). Hub → storage carries the 24 B record itself, laid out exactly as on disk with the CRC included: the hub stamps `seq` and the timestamp, and storage checks the magic, version, type, sensor and CRC before appending it. On disk, each reading is one 24 B record. Gap records only appear during failures and add negligible volume. See the *Architecture Diagram* data path labels.
+On the wire, each reading travels sensor → hub as a 16 B socket message (layout under *In what format*). Hub → storage carries the 24 B record itself, laid out exactly as on disk with the CRC included: the hub stamps the timestamp when the reading arrives and `seq` + CRC when it sends the record, and storage checks the magic, version, type, sensor and CRC before appending it. On disk, each reading is one 24 B record. Gap records only appear during failures and add negligible volume. See the *Architecture Diagram* data path labels.
 
 ### In what format
 
@@ -234,8 +234,20 @@ The log is an **append-only binary log** of fixed 24 B records, packed and littl
 - A gap ends at the timestamp of the next DATA record for the same sensor, so it needs no separate end field.
 - Every record has a `seq`, and `seq` is strictly increasing across the log:
   - Gaps created by a sensor or by the hub receive a hub-assigned `seq`.
-  - Gaps created by storage use the `seq` of the first refused reading.
+  - Gaps created by storage use the `seq` of the first refused reading. Their timestamp is that of the last record storage accepted before the gap: the earliest moment the gap could have started, since the missing readings' own times are lost with them. After a restart, recovery supplies it from the newest record on disk. A storage gap (`sensor_id` 0) ends at the next record of any sensor.
 - Any record with an unknown `record_type` is treated as corrupt.
+
+**Storage → hub `seq_resume` reply** (8 B, little-endian, defined in `include/storage_proto.h`), sent once as soon as the hub connects to `storage.sock`:
+
+| Offset | Size | Field | Value |
+|---|---|---|---|
+| 0 | 1 B | magic | `0xA8` (distinct from the message's `0xA6` and the record's `0xA7`) |
+| 1 | 1 B | version | 1 |
+| 2 | 1 B | type | `0x10` seq_resume |
+| 3 | 1 B | has_last | 0 = storage holds nothing yet (a fresh hub starts at 0; a running hub keeps its counter); 1 = `seq` is valid |
+| 4 | 4 B | seq | the last accepted `seq` (0 when `has_last` is 0) |
+
+- No CRC: the local socket keeps each message whole and does not corrupt it in transit; the record's CRC guards the SD card.
 
 **Sensor → hub message** (16 B, packed and little-endian, defined in `include/ipc.h`):
 
@@ -255,39 +267,40 @@ The log is an **append-only binary log** of fixed 24 B records, packed and littl
 ### How records are organized
 
 - There is one segment file per UTC day: `/var/lib/plantpi/log-YYYYMMDD.bin`.
+  - At midnight, storage first flushes the records it is holding into the old day's file, then creates the new one. A record goes into the previous day's file only if it arrived between midnight and the flush thread's next pass (≤ 1 s).
 - Records are appended in `seq` order. Only the current day's file is open for writing, so only its tail can ever need recovery.
 - When a new segment is created, storage fsyncs the directory as well, so the new file cannot disappear after a power cut.
 
 ### With what retention
 
-- Segments are kept for **30 days**, about 63 MB. When a new day's segment is created, segments older than 30 days are deleted.
-- **Nothing inside the 30-day window is ever deleted to make room.** If the card fills before 30 days:
+- Segments are kept for **30 days** (today and the 29 days before it), about 63 MB. When a new day's segment is created, a segment is deleted only if **both** its date is before that window **and** it is not one of the newest 30 segments. The second rule means a clock that jumps years ahead can't wipe out the history: retention only ever trims beyond 30 files. Rollover and retention are skipped while the clock is unsynced (`retention_skipped`, logged once per unsynced spell).
+- **Nothing inside the 30-day window is ever deleted to make room.** If the card fills before 30 days (**planned**; until then a full card shows as `storage_write_error` (or `fsync_error`) + `storage_degraded`, with the records kept in memory):
   - Storage logs `storage_disk_full`.
   - It refuses and counts new readings.
   - It writes a GAP record once space is available again.
-- A 64 KB reserve (checked with `statvfs`) is always kept free, so a GAP record can always be written.
+- **Planned:** a 64 KB reserve (checked with `statvfs`) is always kept free, so a GAP record can always be written.
 
 This follows the project's policy: protect existing history, and make any unavoidable loss explicit. See *Failure-mode table → Storage (disk full)*.
 
 ### How writes are batched and when data is flushed
 
-- The **rx thread** reads records from `storage.sock` and appends them to a single in-memory batch buffer (≤ 64 × 24 B) under a mutex.
-- The **flush thread** commits a batch when either of these comes first:
-  - **N = 64 records**, or
-  - **T = 60 s** since the last commit. At about 1.02 records/s, T is normally the trigger, which gives about 61 records (≈1.5 KB) per batch and about 1,440 fsyncs/day.
+- The **rx thread** reads records from `storage.sock` and appends them, as the raw 24 B it received, to one **pending buffer** (up to 1 MB, about 43,690 records) under a mutex. The same buffer is the batch in normal operation and the outage queue when flushes fail, because records stay in it until a flush succeeds.
+- The **flush thread** wakes once a second and commits when either of these comes first:
+  - **N = 64 records** pending, or
+  - **T = 60 s** since the **oldest** pending record was added (each record keeps its own add time, so a record that arrived during a slow flush still meets the 62 s commit target). At about 1.02 records/s, T is normally the trigger, which gives about 61 records (≈1.5 KB) per batch and about 1,440 fsyncs/day.
 - **Commit sequence:**
-  1. Lock the mutex, copy the batch out and clear the buffer.
+  1. Lock the mutex and copy every pending record out (nothing is removed yet).
   2. Unlock. The lock is never held during I/O.
-  3. `write()` the batch.
+  3. `write()` them.
   4. `fsync()` the segment.
-  5. Record the new committed offset.
-- **On SIGTERM**, the flush thread commits whatever is buffered, then writes a clean-shutdown marker.
+  5. Lock, drop the committed records from the buffer, record the new committed offset, unlock.
+- **On SIGTERM**, storage commits whatever is pending, then creates the clean-shutdown marker `clean_shutdown` and fsyncs the directory. The marker is written only if that final flush succeeded.
 - **A record is committed once `fsync()` returns.** Before then, it may be lost but is never reported as stored.
 - **If `write()` or `fsync()` fails:**
   - The batch stays in memory and storage is marked degraded immediately.
   - On the next cycle, storage truncates the file back to the last committed offset, then rewrites and fsyncs the batch, so no duplicate or partial records reach the log.
-  - While the disk is unavailable, records keep queueing, up to 1 MB (about 11 h). Storage logs `storage_backlog` at 50%, 75% and 90%.
-  - When the queue is full, storage refuses and counts new readings, and writes a GAP record on recovery.
+  - While the disk is unavailable, records keep queueing in the pending buffer, up to 1 MB (about 11 h). Storage logs `storage_backlog` once at each of 50%, 75% and 90% going up, with the threshold and the fill (`percent=N pending=P`).
+  - When the buffer is full, storage refuses and counts new readings (`storage_degraded reason=queue_full`, once per full spell). The next accepted reading skips their `seq`s, so a GAP whose `seq` is the first refused reading and whose count is the number refused goes in just before it. The GAP is stamped with the time of the last reading storage accepted before the refusals.
 
 See *Mechanism D* (batching, durability point and outage rows) and *Failure-mode table → Storage*.
 
@@ -295,17 +308,18 @@ See *Mechanism D* (batching, durability point and outage rows) and *Failure-mode
 
 **Guarantee:** a power cut loses at most one unsynced batch (≤ 60 s), plus any backlog held in memory during a storage outage. It never leaves a corrupt record readable.
 
-On every start, **recovery runs before `storage.sock` accepts any data**. This is the same path after a power cut and after a supervisor restart or `kill -9`.
+On every start, **recovery runs before `storage.sock` accepts any data**. This is the same path after a power cut and after a supervisor restart or `kill -9`. Storage first takes the one-listener lock (`storage.sock.lock`), so no second storage process can be recovering or appending at the same time.
 
-1. If the clean-shutdown marker is missing, log `unclean_shutdown`, then remove the marker.
-2. Check the current segment's header. If it is invalid, rename the file to `.corrupt`, log `segment_corrupt`, and start a fresh segment.
+1. If the clean-shutdown marker `clean_shutdown` is missing and at least one segment exists, log `unclean_shutdown` (a fresh install has nothing to recover, so it is not reported). A marker that is there is deleted and the directory fsynced at once, so it can't survive into a run that later crashes.
+2. Check the **newest** segment's header (only the segment being appended to can have a damaged tail). If it is invalid or the file is shorter than 16 B, rename it to `.corrupt`, log `segment_corrupt`, and start a fresh segment. An earlier `.corrupt` copy of the same segment is never replaced: the next copy becomes `<name>.2.corrupt`, then `.3.corrupt`, and so on. `.corrupt` files are evidence and are never deleted. Known limit: storage reads at most 128 directory names, so a directory holding more (about 90 `.corrupt` files beside 30 segments) stops storage at start with `storage_open_error` until old `.corrupt` files are cleared by hand.
 3. Scan the records from the start of the segment. Stop at the **first** record that has any of these problems:
    - bad magic, unknown `record_type` or wrong version
    - CRC mismatch
    - `seq` that does not increase
    - a partial (fewer than 24 B) trailing record
 4. `ftruncate()` the file at that offset, `fsync()` it, and log `recovery_event` with the bytes and records removed.
-5. Open `storage.sock` and resume normal operation.
+5. If the newest segment holds no records (header-only, or renamed `.corrupt`), read older segments, newest first, until one gives the last `seq` on disk. Each older segment is recovered the same way, and every one that is cut or renamed is logged too (`recovery_event` / `segment_corrupt`, with its name).
+6. Open `storage.sock` and resume normal operation.
 
 Records are fixed-size, so the scan is simple offset arithmetic. The target is under 1 s for a full day's segment.
 
@@ -327,9 +341,9 @@ This section covers compute, storage and IPC. The budget, environment (power, pl
 | Component | Bounded buffer | Size |
 |---|---|---|
 | Sensor ring (each) | 64 readings × 16 B | ≈1 KB |
-| Hub queue | 1024 records × 24 B | ≈24 KB |
-| Storage batch | 64 × 24 B | ≈1.5 KB |
-| Storage outage queue | 1 MB (≈11 h) | 1 MB |
+| Hub queue | 1024 records × 24 B, held without `seq` or CRC until each is sent | ≈24 KB |
+| Storage pending buffer (batch + outage queue) | 43,690 × 24 B (≈11 h), plus an 8 B add time each | 1 MB + ≈350 KB |
+| Storage flush copy | same size, allocated once at open | 1 MB |
 
 The main memory cost is process isolation itself. There are five processes, each with its own C runtime and stack (about 1–2 MB resident each, estimated). That is acceptable on any Pi 4 RAM size, and it buys Mechanism E's fault isolation.
 
@@ -348,7 +362,7 @@ The main memory cost is process isolation itself. There are five processes, each
 | | |
 |---|---|
 | **Ideal build** | A shared-memory ring between processes (zero-copy, as in Figure 1), or a single process with no IPC at all. |
-| **Actual build** | Unix domain sockets (`hub.sock`, `storage.sock`, `sup.sock`), with 16 B messages sensor → hub and 24 B records hub → storage, plus 1 Hz heartbeats from each child to the supervisor. `hub.sock` is `SOCK_SEQPACKET`, so the kernel keeps message boundaries: each `send()` is one whole 16 B message and each `recv()` returns exactly one, with no reassembly code in the hub. |
+| **Actual build** | Unix domain sockets (`hub.sock`, `storage.sock`, `sup.sock`), with 16 B messages sensor → hub and 24 B records hub → storage, plus 1 Hz heartbeats from each child to the supervisor. `hub.sock` and `storage.sock` are `SOCK_SEQPACKET`, so the kernel keeps message boundaries: each `send()` is one whole message (16 B or 24 B) and each `recv()` returns exactly one, with no reassembly code in the receiver. The receiver reads into a buffer one byte bigger than the message, so an oversized message shows up as too long instead of being silently cut. |
 | **What the gap costs** | Each message costs a `send()` and a `recv()` system call and two kernel copies per hop. We estimate tens of µs per hop on a Pi 4, to be measured in the Evaluation plan. At ≈1.02 data messages/s plus 4 heartbeats/s, that is negligible. **What we gain:** the kernel buffers messages for us, a dead peer is reported immediately (`EPIPE` / `ECONNREFUSED`), and no process can corrupt another's memory. A shared-memory ring would give none of that, and Mechanism E depends on all of it. **Claims narrowed:** we make no high-throughput IPC claim. We claim only that IPC adds a negligible share of the sensor-to-storage latency, with a number committed in the Evaluation plan. |
 
 ### Operating and test conditions
@@ -387,7 +401,7 @@ Each measurement below has a method and a target. Unless a row says otherwise, m
 
 **Test tooling**
 - **Load generator:** writes synthetic records into `storage.sock` at a set rate.
-- **Verifier:** reads the log offline and checks every record's CRC, that `seq` strictly increases, and that every missing `seq` is covered by a GAP record. It then compares the log against the hub's sent-sequence log.
+- **Verifier:** reads the log offline and checks every record's CRC, that `seq` strictly increases, and that every missing `seq` is covered by a GAP record. It then compares the log against the range of `seq`s the hub sent (`log_verify --sent A..B`): within one hub run the sent `seq`s are one unbroken range A..B, because a `seq` is used only when `send()` succeeds. Every `seq` in A..B must be stored or covered by a GAP, and nothing after B may be in the log. `seq`s before A belong to earlier hub runs. The `seq`s it reports as lost are the *Lost readings* formula below.
 - **Timing:** latency is measured with `CLOCK_MONOTONIC` timestamps, logged at each stage and keyed by sensor counter and hub `seq`, then joined offline.
 - **Fault injector:** a script that picks a target process and a random time, then sends `SIGKILL` (crash), `SIGSTOP` (hang) or closes its socket (disconnect). It logs each injection with a `CLOCK_MONOTONIC` timestamp so it can be joined with the supervisor's `child_exit`, `heartbeat_timeout` and restart events.
 - **Fake I2C bus:** `tests/fake_i2c.h` fails the Nth bus operation, so retry, skip and offline logic is tested on a dev machine without hardware (runs in CI under `make test`, `make asan` and `make memcheck`).
@@ -435,11 +449,11 @@ The goal is to show the system stays stable over the 72 h soak, not to hit an ab
 |---|---|---|
 | Leaks | Valgrind memcheck on short runs of each process | 0 bytes definitely or indirectly lost |
 | Growth | Sample `VmRSS` / `VmHWM` from `/proc/<pid>/status` every 60 s over 72 h | Flat after warm-up; no upward trend in any process |
-| Buffer bounds | Each buffer logs its high-water mark; a forced storage outage fills the storage queue | No buffer ever exceeds its cap (sensor ring 64, hub queue 1024, storage batch 64, storage queue 1 MB). On a full queue, storage refuses new readings and logs `storage_degraded` |
+| Buffer bounds | Each buffer logs its high-water mark; a forced storage outage fills the storage pending buffer | No buffer ever exceeds its cap (sensor ring 64, hub queue 1024, storage pending buffer 1 MB). On a full buffer, storage refuses new readings and logs `storage_degraded reason=queue_full` |
 
 ### Data loss and corruption 
 
-**Lost readings** = seqs the hub sent − seqs committed − seqs covered by a GAP record. The verifier checks every test below.
+**Lost readings** = seqs the hub sent − seqs committed − seqs covered by a GAP record. Within one hub run, every lost `seq` is covered by a GAP record, so the formula is exact. When the hub restarts as well (a power pull), the new hub continues from storage's reply and the lost batch has no `seq`; those tests use the "loss ≤ 1 batch" target, measured from the hub's sent log against the last committed `seq` instead. The verifier checks every test below.
 
 | Test | Target |
 |---|---|

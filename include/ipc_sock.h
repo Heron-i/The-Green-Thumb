@@ -10,7 +10,9 @@
  * The client (src/ipc_client.c) talks to hub.sock only through these ops,
  * so tests can swap in tests/fake_sock.h and run every reconnect, backoff
  * and overflow path with no hub and no real waiting. src/ipc_sock.c is the
- * only file that makes socket system calls.
+ * only file that makes client-side socket system calls; servers
+ * (listen_sock.c, storage_server.c) make their own and are tested over
+ * real sockets (Sensor-Pipeline.md Decisions, PF-16).
  *
  * The socket is AF_UNIX SOCK_SEQPACKET: the kernel keeps message
  * boundaries, so one send() is one whole 16 B message. Every op is
