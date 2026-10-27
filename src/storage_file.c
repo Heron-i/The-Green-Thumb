@@ -1,11 +1,15 @@
-/* Linux implementation of the gt_file_ops seam (see storage_io.h).
+/* Linux implementation of the gt_file_ops seam (see storage_io.h), part
+ * 2: the directory, and the ops table.
  *
- * Purpose: this file is the only place storage makes file system calls.
- * It turns each op into one POSIX call (or a loop of them) on a file
- * inside the log directory, and what the kernel says into a gt_status. It
- * knows nothing about segments, batches or recovery: that policy lives in
- * storage.c and storage_recover.c, which reach this file only through the
- * ops table, so tests can swap in tests/fake_file.h.
+ * Purpose: storage_file.c and storage_file_io.c are the only places
+ * storage makes file system calls. They turn each op into one POSIX call
+ * (or a loop of them) on a file inside the log directory, and what the
+ * kernel says into a gt_status. They know nothing about segments, batches
+ * or recovery: that policy lives in storage*.c and storage_recover.c,
+ * which reach them only through the ops table, so tests can swap in
+ * tests/fake_file.h. This file holds the ops that use names (open,
+ * rename, unlink, list) and the directory itself; the ops on an open
+ * file's handle are in storage_file_io.c.
  *
  * Linux model: the directory is opened once (O_DIRECTORY) and every name
  * is resolved relative to that open directory with the *at() calls
@@ -14,12 +18,9 @@
  * descriptor is what makes a create, rename or delete durable on ext4.
  * Every descriptor is opened with O_CLOEXEC, so it closes automatically if
  * this process ever exec()s another program and can't leak into it.
- * How errno maps to a gt_status:
- *   EINTR (a signal arrived mid-call)  -> the call is simply tried again
- *   anything else                       -> GT_ERR_IO
- * A read that ends early (end of file) is GT_ERR_IO too: the seam promises
- * whole reads. */
-#include "storage_io.h"
+ * EINTR (a signal arrived mid-call) is retried; any other error is
+ * GT_ERR_IO. */
+#include "storage_file_internal.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -27,7 +28,6 @@
 #include <stdio.h>    /* renameat: POSIX puts it here, next to rename */
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
 #include <unistd.h>
 
 /* The ctx: the log directory, open for as long as storage is. */
@@ -42,19 +42,6 @@ static int name_ok(const char *name)
 {
     return name != NULL && name[0] != '\0' && strlen(name) < GT_FILE_NAME_MAX
            && strchr(name, '/') == NULL && strcmp(name, ".") != 0 && strcmp(name, "..") != 0;
-}
-
-/* Convert a byte offset to off_t, the type the kernel calls use. off_t is
- * signed and, on a 32-bit build, only 32 bits, so the value is checked to
- * survive the conversion unchanged. Returns 1 if it fits. */
-static int to_off_t(uint64_t value, off_t *out)
-{
-    off_t converted = (off_t)value;
-    if (converted < 0 || (uint64_t)converted != value) {
-        return 0;
-    }
-    *out = converted;
-    return 1;
 }
 
 static gt_status file_open(void *ctx, const char *name, unsigned flags, int *handle_out)
@@ -76,116 +63,10 @@ static gt_status file_open(void *ctx, const char *name, unsigned flags, int *han
     return GT_OK;
 }
 
-/* fstat fills a `struct stat` with facts about an open file; st_size is
- * its length in bytes. */
-static gt_status file_size(void *ctx, int handle, uint64_t *size_out)
-{
-    (void)ctx;
-    struct stat info;
-    if (size_out == NULL) {
-        return GT_ERR_INVAL;
-    }
-    if (fstat(handle, &info) != 0 || info.st_size < 0) {
-        return GT_ERR_IO;
-    }
-    *size_out = (uint64_t)info.st_size;
-    return GT_OK;
-}
-
-/* pread may return fewer bytes than asked for, so it is called until all
- * `len` bytes are in. 0 bytes back means the end of the file came first. */
-static gt_status file_pread(void *ctx, int handle, uint64_t offset, uint8_t *buf, size_t len)
-{
-    (void)ctx;
-    if (buf == NULL) {
-        return GT_ERR_INVAL;
-    }
-    size_t done = 0;
-    /* invariant: buf[0 .. done - 1] holds the file's bytes from offset on */
-    while (done < len) {
-        off_t position;
-        if (!to_off_t(offset + done, &position)) {
-            return GT_ERR_IO;
-        }
-        ssize_t got = pread(handle, &buf[done], len - done, position);
-        if (got < 0 && errno == EINTR) {
-            continue;
-        }
-        if (got <= 0) {
-            return GT_ERR_IO;   /* an error, or the end of the file: a short read */
-        }
-        done += (size_t)got;
-    }
-    return GT_OK;
-}
-
-/* pwrite may write fewer bytes than asked for (a "short write"), so it is
- * called until all `len` bytes are out. A failure part-way leaves the
- * bytes already written in the file: the torn write storage truncates. */
-static gt_status file_pwrite(void *ctx, int handle, uint64_t offset, const uint8_t *buf,
-                             size_t len)
-{
-    (void)ctx;
-    if (buf == NULL) {
-        return GT_ERR_INVAL;
-    }
-    size_t done = 0;
-    /* invariant: buf[0 .. done - 1] is in the file from offset on */
-    while (done < len) {
-        off_t position;
-        if (!to_off_t(offset + done, &position)) {
-            return GT_ERR_IO;
-        }
-        ssize_t wrote = pwrite(handle, &buf[done], len - done, position);
-        if (wrote < 0 && errno == EINTR) {
-            continue;
-        }
-        if (wrote <= 0) {
-            return GT_ERR_IO;   /* 0 would loop forever, so it counts as a failure */
-        }
-        done += (size_t)wrote;
-    }
-    return GT_OK;
-}
-
-static gt_status file_fsync(void *ctx, int handle)
-{
-    (void)ctx;
-    int result;
-    /* Repeat only while a signal interrupted the call. */
-    do {
-        result = fsync(handle);
-    } while (result != 0 && errno == EINTR);
-    return result == 0 ? GT_OK : GT_ERR_IO;
-}
-
-static gt_status file_ftruncate(void *ctx, int handle, uint64_t len)
-{
-    (void)ctx;
-    off_t length;
-    if (!to_off_t(len, &length)) {
-        return GT_ERR_IO;
-    }
-    int result;
-    /* Repeat only while a signal interrupted the call. */
-    do {
-        result = ftruncate(handle, length);
-    } while (result != 0 && errno == EINTR);
-    return result == 0 ? GT_OK : GT_ERR_IO;
-}
-
-/* Not retried on EINTR: on Linux the descriptor is already closed by
- * then, and closing it again could close a different file. */
-static void file_close(void *ctx, int handle)
-{
-    (void)ctx;
-    close(handle);
-}
-
 static gt_status file_fsync_dir(void *ctx)
 {
     linux_dir *dir = ctx;
-    return file_fsync(ctx, dir->dir_fd);
+    return gt_file_fsync_linux(ctx, dir->dir_fd);
 }
 
 static gt_status file_rename(void *ctx, const char *old_name, const char *new_name)
@@ -275,12 +156,12 @@ gt_status gt_file_ops_linux(const char *dir, const gt_file_ops **ops_out, void *
 {
     static const gt_file_ops ops = {
         .open      = file_open,
-        .size      = file_size,
-        .pread     = file_pread,
-        .pwrite    = file_pwrite,
-        .fsync     = file_fsync,
-        .ftruncate = file_ftruncate,
-        .close     = file_close,
+        .size      = gt_file_size_linux,
+        .pread     = gt_file_pread_linux,
+        .pwrite    = gt_file_pwrite_linux,
+        .fsync     = gt_file_fsync_linux,
+        .ftruncate = gt_file_ftruncate_linux,
+        .close     = gt_file_close_linux,
         .fsync_dir = file_fsync_dir,
         .rename    = file_rename,
         .unlink    = file_unlink,

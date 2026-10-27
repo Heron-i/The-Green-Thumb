@@ -694,7 +694,7 @@ Every reading the hub forwards reaches the microSD card in a form that survives 
 - **`include/storage_pending.h`, `src/storage_pending.c`:** the pending buffer: raw 24 B records plus each one's add time, `due` at N = 64 or T = 60 s after the oldest (changed with `gt_pending_set_limits`, PF-11).
 - **`include/storage_seq.h`, `src/storage_seq.c`:** the sequence guard (accept / reject / gap) and the GAP record for missing `seq`s.
 - **`include/storage_io.h`:** the `gt_file_ops` seam (the ctx is one directory, handles are fds, reads and writes take an offset). **`tests/fake_file.h`:** an in-memory directory with a current and a synced copy of every file, scripted failures, and `fake_fs_power_cut()`.
-- **`src/storage_file.c`:** the Linux file layer (`gt_file_ops_linux`): `openat` / `renameat` / `unlinkat` inside one open directory, whole-buffer `pread` / `pwrite` loops, `fsync` on the directory.
+- **`src/storage_file.c`, `src/storage_file_io.c`:** the Linux file layer (`gt_file_ops_linux`), sharing its handle ops through **`include/storage_file_internal.h`**. `storage_file.c` is the directory side (`openat` / `renameat` / `unlinkat` inside one open directory, `fsync` on the directory, the ops table); `storage_file_io.c` is the open-file side (whole-buffer `pread` / `pwrite` loops, `fsync`, `ftruncate`).
 - **`include/storage.h`:** the storage object, built from four files that share its struct through **`include/storage_internal.h`**:
   - **`src/storage.c`:** append, stats, `gt_storage_rx` and `gt_storage_resume`; `gt_storage_set_batch` (N, T) and the flusher's wake, `gt_storage_wait_due` / `gt_storage_wake` (PF-11).
   - **`src/storage_segment.c`:** segment names and the sorted segment listing.

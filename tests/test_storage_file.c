@@ -1,6 +1,6 @@
 /* Loopback tests for storage over real files: gt_file_ops_linux (the
- * Linux file layer, src/storage_file.c) and gt_storage_open, in a
- * directory the test makes itself.
+ * Linux file layer, src/storage_file.c and src/storage_file_io.c) and
+ * gt_storage_open, in a directory the test makes itself.
  *
  * Purpose: prove what tests/fake_file.h can't, namely that the real file
  * system behaves as the seam promises (storage_io.h). Files are created,
