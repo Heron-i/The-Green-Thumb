@@ -143,15 +143,15 @@ Log format for every component: `timestamp level component event key=value`. `ti
 | Hub | Out-of-range reading | Range check (light 0–65535 lux; soil within the seesaw's raw range) | Reject and count; invalid data is not stored | `reading_invalid` |
 | Hub | Duplicate reading after a sensor resends | Sensor counter ≤ the last counter seen on this connection | Drop the duplicate | `ipc_duplicate` |
 | Hub | Two clients claim the same sensor ID (an old instance not yet reaped) | A second connection for a sensor ID that is already connected | Keep the newest connection and close the old one | `sensor_duplicate_client` |
-| Hub | Hub restarts and its `seq` starts over, so storage recovery would see "`seq` does not increase" and truncate good data | On startup, the hub has no last `seq` | On connect, storage replies with its last **accepted** `seq` (8 B `seq_resume`, see *In what format*), including records still pending, and the hub continues from the next value. Not the last committed: if 41–60 are pending and the reply said 40, the hub would reuse 41–60 and storage would reject them. After a storage restart the two are the same. As a safety net, storage rejects any `seq` ≤ last accepted | `seq_resume`, `seq_rejected` |
+| Hub | Hub (re)connects to storage and must pick its next `seq`. A restarted hub that started over would make storage reject everything ("`seq` does not increase"); a running hub that went back to storage's reply would reuse the `seq`s storage lost | On every connect, before sending | Storage replies with its last **accepted** `seq` (8 B `seq_resume`, see *In what format*), pending records included. The hub's next `seq` is the **larger** of its own next `seq` and the reply + 1 (0 for an empty log). A freshly started hub has no counter of its own, so it continues from the reply + 1. A hub that is still running keeps its counter (1 + the last `seq` whose `send()` succeeded), so `seq`s that storage lost leave a hole and storage writes a GAP for them (*Storage killed* row). The reply is the last accepted, not the last committed: if 41–60 are pending and the reply said 40, a fresh hub would reuse 41–60 and storage would reject them. As a safety net, storage rejects any `seq` ≤ last accepted | `seq_resume`, `seq_rejected` |
 | Hub | Process crashes or hangs | SIGCHLD, or no heartbeat for 5 s | Supervisor restarts it with backoff (SIGKILL first if hung); sensor rings cover the downtime | `child_exit` / `heartbeat_timeout`, `hub_start` |
-| Hub → storage | Storage restarting, recovering or slow | `send` returns EPIPE, ECONNREFUSED or EAGAIN | Hold up to 1024 records (about 17 min), reconnect, and drain in order | `storage_unreachable`, `storage_reconnected` |
-| Hub → storage | Hub queue full | Queue depth | Refuse and count new readings; send one gap record to storage before draining | `hub_queue_full` |
+| Hub → storage | Storage restarting, recovering or slow | `send` returns EPIPE, ECONNREFUSED or EAGAIN; no `seq_resume` reply within 2 s of connecting | Hold up to 1024 records (about 17 min). Each already carries its receive time but gets its `seq` and CRC only when it is sent, because the next `seq` isn't known until storage replies (hub-restart row). Reconnect, wait for `seq_resume`, then drain in order; a send that fails uses no `seq` | `storage_unreachable`, `storage_reconnected` |
+| Hub → storage | Hub queue full | Queue depth | Refuse and count new readings; queue one gap record (sensor 0, the first refused reading's receive time, the refused count) after the records already held and before the next new one. It gets its `seq` when sent, like any record | `hub_queue_full` |
 | Storage | `write()` or `fsync()` fails | Return value check | Keep the batch in memory and mark degraded; on the next cycle, truncate the log back to the last committed offset, then rewrite the batch and fsync, so no duplicate or partial records reach the log. If the day rolls over while degraded, the old segment's torn tail is cut and fsynced first (recovery only ever repairs the newest segment); if that cut fails, the rollover waits a cycle | `storage_write_error` / `fsync_error`, `storage_degraded` (`reason=write_failed`) |
 | Storage | Disk full, or backlog fills during an outage | ENOSPC / `statvfs`; queue depth (1 MB, about 11 h) | Log the backlog at 50/75/90%; never delete history early; when full, refuse and count new readings and write a gap record on recovery | `storage_disk_full`, `storage_backlog`, `storage_degraded`, `storage_recovered` |
 | Storage | Corrupt tail or bad segment header after a crash | Startup scan: bad magic, CRC or header, backwards seq, partial record | Truncate at the first bad record (or rename a bad segment to `.corrupt`) and fsync, then accept data | `recovery_event`, `segment_corrupt` |
 | Storage | Process crashes or hangs | SIGCHLD, or no heartbeat for 5 s | Supervisor restarts it; recovery runs before the socket accepts data | `child_exit` / `heartbeat_timeout`, `recovery_event` |
-| Storage | Killed (`kill -9` or OOM) with an unsynced batch, losing up to 60 s with no GAP record | After restart, the first incoming `seq` is greater than last committed + 1 | Loss is limited to the unsynced batch (≤ 60 s, the same bound as a power cut) and made explicit: storage writes one GAP record covering the missing range (count = the difference). Relies on the `seq` hand-off in the hub-restart row | `recovery_gap` |
+| Storage | Killed (`kill -9` or OOM) with an unsynced batch, or with records the hub sent still unread in `storage.sock` | After restart, the running hub's first `seq` is greater than storage's last accepted + 1 | Loss is limited to the unsynced batch plus the socket's unread records (≤ 60 s, the same bound as a power cut) and is made explicit: storage writes one GAP record (`sensor_id` 0, `seq` = last accepted + 1, count = the missing `seq`s) before the hub's record. This relies on the hub keeping its counter across the reconnect (hub row above). If the hub restarted too, it has no counter, no hole appears, and the loss shows only as `unclean_shutdown` (*Power* row). An empty log (`has_last` = 0) accepts any first `seq`, so wiping the log is not reported as a gap | `recovery_gap` |
 | Storage | Malformed message on `storage.sock` | `gt_msg_decode()` fails | Discard it and close the connection; the hub reconnects | `ipc_bad_message` |
 | Storage | Filesystem remounted read-only (ext4 after SD errors) | `open()` / `write()` returns EROFS | Mark degraded and queue in memory (1 MB); this needs a reboot or fsck, so log it as an error | `storage_readonly`, `storage_degraded` |
 | Storage | `fsync()` stalls for seconds (consumer SD) | fsync duration measured on every commit | Log any fsync over 1 s. Storage's heartbeat is sent by the rx thread, which never blocks on disk, and carries "flush in progress since t" plus the committed-record count. The supervisor allows up to 30 s while a flush is in progress, and still kills storage if the committed count stops advancing past that | `fsync_slow` |
@@ -203,7 +203,7 @@ The timestamp is applied by the hub when it receives the reading. If the Pi boot
 | Soil | 1 per 60 s | 1,440 |
 | **Total into storage** | **≈1.02 records/s (≈25 B/s)** | **87,840 ≈ 2.1 MB/day** |
 
-On the wire, each reading travels sensor → hub as a 16 B socket message (layout under *In what format*). Hub → storage carries the 24 B record itself, laid out exactly as on disk with the CRC included: the hub stamps `seq` and the timestamp, and storage checks the magic, version, type, sensor and CRC before appending it. On disk, each reading is one 24 B record. Gap records only appear during failures and add negligible volume. See the *Architecture Diagram* data path labels.
+On the wire, each reading travels sensor → hub as a 16 B socket message (layout under *In what format*). Hub → storage carries the 24 B record itself, laid out exactly as on disk with the CRC included: the hub stamps the timestamp when the reading arrives and `seq` + CRC when it sends the record, and storage checks the magic, version, type, sensor and CRC before appending it. On disk, each reading is one 24 B record. Gap records only appear during failures and add negligible volume. See the *Architecture Diagram* data path labels.
 
 ### In what format
 
@@ -244,7 +244,7 @@ The log is an **append-only binary log** of fixed 24 B records, packed and littl
 | 0 | 1 B | magic | `0xA8` (distinct from the message's `0xA6` and the record's `0xA7`) |
 | 1 | 1 B | version | 1 |
 | 2 | 1 B | type | `0x10` seq_resume |
-| 3 | 1 B | has_last | 0 = storage holds nothing yet (the hub starts at 0); 1 = `seq` is valid |
+| 3 | 1 B | has_last | 0 = storage holds nothing yet (a fresh hub starts at 0; a running hub keeps its counter); 1 = `seq` is valid |
 | 4 | 4 B | seq | the last accepted `seq` (0 when `has_last` is 0) |
 
 - No CRC: the local socket keeps each message whole and does not corrupt it in transit; the record's CRC guards the SD card.
@@ -340,7 +340,7 @@ This section covers compute, storage and IPC. The budget, environment (power, pl
 | Component | Bounded buffer | Size |
 |---|---|---|
 | Sensor ring (each) | 64 readings × 16 B | ≈1 KB |
-| Hub queue | 1024 records × 24 B | ≈24 KB |
+| Hub queue | 1024 records × 24 B, held without `seq` or CRC until each is sent | ≈24 KB |
 | Storage pending buffer (batch + outage queue) | 43,690 × 24 B (≈11 h), plus an 8 B add time each | 1 MB + ≈350 KB |
 | Storage flush copy | same size, allocated once at open | 1 MB |
 
@@ -452,7 +452,7 @@ The goal is to show the system stays stable over the 72 h soak, not to hit an ab
 
 ### Data loss and corruption 
 
-**Lost readings** = seqs the hub sent − seqs committed − seqs covered by a GAP record. The verifier checks every test below.
+**Lost readings** = seqs the hub sent − seqs committed − seqs covered by a GAP record. Within one hub run, every lost `seq` is covered by a GAP record, so the formula is exact. When the hub restarts as well (a power pull), the new hub continues from storage's reply and the lost batch has no `seq`; those tests use the "loss ≤ 1 batch" target, measured from the hub's sent log against the last committed `seq` instead. The verifier checks every test below.
 
 | Test | Target |
 |---|---|

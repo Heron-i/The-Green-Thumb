@@ -5,10 +5,11 @@
 #include "ipc.h"
 
 /* storage -> hub reply on storage.sock: seq_resume (DESIGN.md failure-mode
- * table, Hub "seq starts over" row). Storage sends it once, as soon as the
- * hub connects, so a restarted hub carries on numbering after the last
+ * table, Hub (re)connect row). Storage sends it once, as soon as the
+ * hub connects. A freshly started hub carries on numbering after the last
  * seq storage already holds instead of starting over at 0 (which storage
- * would reject as old).
+ * would reject as old); a hub that is still running keeps its own counter
+ * when that is ahead (gt_next_seq below).
  *
  * The seq is the last one storage ACCEPTED, which may still be pending,
  * not the last committed: if storage holds 41-60 unflushed and the hub
@@ -20,7 +21,8 @@
  *   off 0  magic     GT_RESUME_MAGIC (distinct from 0xA6 and 0xA7)
  *   off 1  version   GT_RESUME_VERSION
  *   off 2  type      GT_RESUME_TYPE
- *   off 3  has_last  0: storage holds nothing yet (the hub starts at 0);
+ *   off 3  has_last  0: storage holds nothing yet (a fresh hub starts at 0;
+ *                    a running hub keeps its counter);
  *                    1: seq is valid
  *   off 4  seq       u32; must be 0 when has_last is 0
  * No CRC: the local socket keeps each message whole, and the kernel does
@@ -44,5 +46,17 @@ gt_status gt_resume_encode(const gt_resume *resume, uint8_t out[GT_RESUME_SIZE])
  * has_last other than 0 or 1, or a non-zero seq with has_last 0;
  * GT_ERR_INVAL for NULL args. `resume` is untouched on failure. */
 gt_status gt_resume_decode(const uint8_t in[GT_RESUME_SIZE], gt_resume *resume);
+
+/* Pick the sender's next seq after a seq_resume reply (PF-03):
+ * max(own_next, resume->seq + 1). has_own is 0 for a sender that has not
+ * sent anything yet in this process; own_next is then ignored and the
+ * result is resume->seq + 1, or 0 when resume->has_last is 0. A sender
+ * that is still running keeps its own counter, so seqs storage lost in a
+ * kill -9 leave a hole that storage covers with a GAP (recovery_gap).
+ * GT_ERR_INVAL for NULL args; GT_ERR_FULL when resume->seq is UINT32_MAX
+ * (no next seq exists; wrapping isn't handled, see storage_seq.h).
+ * *next_out is untouched on failure. */
+gt_status gt_next_seq(int has_own, uint32_t own_next, const gt_resume *resume,
+                      uint32_t *next_out);
 
 #endif

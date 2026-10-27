@@ -46,3 +46,19 @@ gt_status gt_resume_decode(const uint8_t in[GT_RESUME_SIZE], gt_resume *resume)
     resume->seq = seq;
     return GT_OK;
 }
+
+/* after_reply is the first seq storage doesn't hold yet. The UINT32_MAX
+ * check comes before the + 1, so it can never wrap around to 0. */
+gt_status gt_next_seq(int has_own, uint32_t own_next, const gt_resume *resume,
+                      uint32_t *next_out)
+{
+    if (resume == NULL || next_out == NULL) {
+        return GT_ERR_INVAL;
+    }
+    if (resume->has_last && resume->seq == UINT32_MAX) {
+        return GT_ERR_FULL;
+    }
+    uint32_t after_reply = resume->has_last ? resume->seq + 1 : 0;
+    *next_out = (has_own && own_next > after_reply) ? own_next : after_reply;
+    return GT_OK;
+}

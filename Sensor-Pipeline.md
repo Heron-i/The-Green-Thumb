@@ -100,7 +100,9 @@ In the worst case a read makes 1 try + 3 retries with 3 × 10 ms gaps, so it wai
 - **Log ownership:** the light sensor's events (`i2c_read_error`, `sensor_offline`, `sensor_online`) are Lily's, as the light process's read-failure handling. The shared formatter (`gt_log_format`) has no owner in the Ownership map because every component uses it, so it counts as **Joint → Architecture integration**. Lily writes it first, as its first caller; give Lucas a heads-up so his components reuse it.
 - **Log line:** `<timestamp_us> <LEVEL> <component> <event>[ key=value ...]`. The timestamp is µs since the Unix epoch, as a plain integer, the same unit as the on-disk record, so logs and records can be joined. The levels are `DEBUG` / `INFO` / `WARN` / `ERROR`. The light process logs `sensor_offline` as WARN and `sensor_online` as INFO.
 - **Log sink deferred:** the formatter only fills a caller-provided buffer. Where lines go (stderr, a file or the monitor process) and reading the wall clock are decided with the light process. DESIGN.md doesn't specify either.
-- **Hop 2 (hub→storage) carries the 24 B on-disk record** (decided 2026-10-23). The hub stamps `seq` and the µs timestamp, builds the record (CRC included), and storage checks it with `gt_record_decode`, then appends it unchanged. There are two reasons. First, DESIGN.md already has the hub stamping the time and storage reading *records* from `storage.sock`. Second, a record that waits in the hub's 1024-record queue during a storage outage (up to about 17 min) keeps its real receive time. If storage stamped the time instead, the timestamp would be off by however long the record waited.
+- **Hop 2 (hub→storage) carries the 24 B on-disk record** (decided 2026-10-23). The hub stamps `seq` and the µs timestamp, builds the record (CRC included), and storage checks it (amended 2026-10-26, PF-01: the timestamp is stamped on arrival, `seq` + CRC at send time; see *Hub contract (hop 2)*) with `gt_record_decode`, then appends it unchanged. There are two reasons. First, DESIGN.md already has the hub stamping the time and storage reading *records* from `storage.sock`. Second, a record that waits in the hub's 1024-record queue during a storage outage (up to about 17 min) keeps its real receive time. If storage stamped the time instead, the timestamp would be off by however long the record waited.
+- **The hub's next `seq` after connecting to storage is max(own next, `seq_resume` + 1)** (decided 2026-10-26, PF-03). A freshly started hub has no counter, so it takes storage's reply + 1 (0 on an empty log). A running hub keeps its own counter, defined as 1 + the last `seq` whose `send()` succeeded, so records storage lost in a `kill -9` (unsynced, or still in the socket) leave a hole that storage turns into a GAP (`recovery_gap`). The alternative, always continuing from the reply, was rejected: it reuses the lost `seq`s, so the loss leaves no GAP and the hub's sent log holds duplicates, which breaks "no reading is lost silently" and the Evaluation plan's lost-readings formula. Only a loss where the hub restarts too (power cut) is shown by `unclean_shutdown` alone, which DESIGN.md's Power row already allows. Storage needed no change: its sequence guard already writes the GAP. This rule sets what PF-01 (when to stamp) and PF-02 (the sender's states) must support, and what `storage_faults.sh` checks (PF-04/05).
+- **Hub contract for hop 2** (decided 2026-10-26, PF-01/PF-02): the hub stamps the time on arrival and `seq` + CRC at send; the socket seam gains `recv`; the sender waits for `seq_resume` (2 s deadline) before sending anything. See *Hub contract (hop 2)*.
 - **Message magic is `0xA6`** (proposed), distinct from the on-disk record's `0xA7`, so a record can never be misread as a message.
 - **Truncated messages are rejected at `recv()`,** which must return exactly `GT_MSG_SIZE`, not in decode. Decode keeps its fixed 16 B array.
 - **Range checks stay in the hub:** decode doesn't check that light ≤ 65535. That is the hub's `reading_invalid` check.
@@ -136,6 +138,68 @@ Magic and version are written by encode and checked by decode. They are not `gt_
 
 ## Wire format: hub → storage record (24 B)
 Hop 2 sends the on-disk record exactly as DESIGN.md *In what format → Record* lays it out: magic `0xA7`, type, version, sensor_id, seq (u32 at 4), timestamp (u64 µs at 8), value (u32 at 16) and CRC-32 over bytes 0–19 (at 20). `gt_record` and the codec live in `include/log_record.h`. **Watch the header order:** the record goes magic, **type, version**, sensor_id, while the message goes magic, **version, type**, sensor_id. Don't copy the message encoder without swapping those two bytes. Unlike the message, a GAP record may use sensor_id 0 (all).
+
+## Hub contract (hop 2): stamping, numbering and the sender
+Decided 2026-10-26 to settle PF-01 and PF-02 (Pipeline-Findings.md) before any hub code exists. It builds on the PF-03 numbering rule in *Decisions*. Nothing here is built yet. `include/hub.h` and `include/ipc_sock.h` change to match when the hub steps start, test first.
+
+**Why it changes (PF-01):** a hub that has just started doesn't know its next `seq` until storage's `seq_resume` reply arrives. Storage may be down or still recovering, and Mechanism E says the hub must keep running anyway. So the hub can't finish a record (`seq` + CRC) when the sensor message arrives. It finishes it when it sends it.
+
+### Who stamps what, and when
+| Field | Set by | When | Why |
+|---|---|---|---|
+| `type`, `sensor_id`, `value` | `gt_hub_accept` | message arrives | copied from the checked message |
+| `timestamp_us` | `gt_hub_accept` (`now_us` passed in) | message arrives | keeps the real receive time while the record waits in the queue (the 2026-10-23 reason still holds) |
+| `seq` | the hop-2 sender | just before `send()` | only the sender knows the next `seq` (max rule) |
+| CRC-32 | `gt_record_encode`, called by the sender | just before `send()` | the CRC covers `seq`, so it can't be computed earlier |
+
+- **`gt_hub_accept`'s new contract:** validate, range-check and de-duplicate one `gt_msg`. On `GT_OK`, fill `*out` with type, sensor, value and `timestamp_us = now_us`, and leave `seq` at 0. The hub plan adds the event flags it returns (`reading_invalid`, `ipc_duplicate`, `sensor_seq_gap`). They're outside this contract.
+- **The queue holds unstamped `gt_record`s:** 1024 slots of the in-memory struct (24 B with padding), so DESIGN.md's "1024 records × 24 B" budget still holds. A queued record has no `seq` and no CRC yet.
+- **A `seq` is used only when `send()` returns `GT_OK`.** The sender stamps the queue head with `next_seq` and encodes it. On OK it drops the record and adds 1 to `next_seq`. On FULL or IO the record stays at the head, unchanged, and `next_seq` doesn't move, so a failed send never makes a hole in the numbering.
+
+### The max rule, shared
+- **`gt_next_seq`** (pure, in `include/storage_proto.h` next to `gt_resume`, because it says what the reply means): `gt_status gt_next_seq(int has_own, uint32_t own_next, const gt_resume *resume, uint32_t *next_out)`. It sets `*next_out` to max(`own_next`, `resume->seq` + 1). With `has_own` 0 (a fresh sender) it uses `resume->seq` + 1, or 0 when `resume->has_last` is 0. `GT_ERR_INVAL` for NULL arguments; `GT_ERR_FULL` when the reply's `seq` is `UINT32_MAX` (no next `seq` exists); `*next_out` is untouched on failure. Built and tested 2026-10-26 (NSQ 8/8).
+- **Both callers use it:** the hop-2 sender and `storage_feed` (PF-04/05; `storage_feed` done 2026-10-26). The fault rounds then test the same numbering code the hub runs. `storage_proto.c` is Mechanism D's file, so give Lucas a heads-up.
+
+### The socket seam gains `recv` (PF-02)
+`gt_sock_ops` adds one op. The sensor client never calls it, but `src/ipc_sock.c` and `tests/fake_sock.h` both implement it:
+```c
+/* Receive one whole message into buf (cap bytes). Non-blocking.
+ * GT_OK with *len_out = the message length, or *len_out = 0 when nothing
+ * is waiting (EAGAIN); GT_ERR_IO when the peer closed (recv returns 0) or
+ * reset the connection. */
+gt_status (*recv)(void *ctx, uint8_t *buf, size_t cap, size_t *len_out);
+```
+- **The sender reads into `GT_RESUME_SIZE + 1` bytes**, like the storage and hub receivers, so an oversized reply shows up as too long.
+- **`tests/fake_sock.h` grows:** scripted `recv` replies (bytes, "nothing yet", or IO), and its `sent` frames sized to 24 B as well as 16 B (they are fixed at `GT_MSG_SIZE` today).
+- `gt_ipc_sock_linux(path)` already takes any path and sends any length, so it serves `storage.sock` unchanged apart from `recv`.
+
+### Sender state machine (`include/hub_sender.h`, `src/hub_sender.c`)
+```
+              connect() OK → resume_deadline = now + 2000 ms
+ DISCONNECTED ─────────────────────────────────────────────▶ AWAITING_RESUME
+   ▲  attempt only when now ≥ next_attempt                        │ recv nothing yet → stay (until the deadline)
+   │  backoff 100 ms → 2 s, as the client                         │ valid 8 B reply → gt_next_seq → SENDING
+   │◀── deadline passes, or a bad / wrong-size reply ─────────────┤
+   │    (ipc_bad_message), or recv IO: disconnect, retry later    │
+   │                                                              ▼
+   └──── send IO (EPIPE / ECONNRESET): head record kept ───── SENDING: drain oldest first,
+         unstamped, storage_unreachable once                    stamp seq + encode + send;
+                                                                FULL → stop, stay connected
+```
+- **Nothing is sent before the reply.** In AWAITING_RESUME, records only queue. This is the state the plan's two-state client lacks.
+- **No call ever blocks:** the reply is polled with `recv` from `pump`, and a reply that never comes ends at the 2 s deadline (the same 2 s `storage_feed` waits). After that the sender disconnects and retries with backoff.
+- **Own counter:** `has_own` becomes 1 after the first successful send in this process and stays 1 across reconnects. That's what lets storage see a `kill -9` loss as a hole (PF-03).
+- **Storage sends nothing after the reply.** Anything received in SENDING is `ipc_bad_message`: disconnect and reconnect.
+- **Events are returned as flags** (`storage_unreachable`, `storage_reconnected`, `hub_queue_full`), and the hub logs them, as `gt_ipc_client` does.
+- **Queue full (`hub_queue_full`):** refuse and count, as the client ring does. The GAP needs 2 free slots, and the order is old records, then the GAP, then new ones. The GAP is `{type GAP, sensor_id 0, timestamp_us = the first refused reading's receive time, value = refused count}`, and it gets its `seq` at send like any other record.
+- **API shape:** `gt_hub_sender_open_ops(ops, ctx)` (doesn't connect; owns the ctx as the client does), `gt_hub_sender_push(sender, const gt_record *unstamped, now_ms)` → OK / FULL / INVAL, `gt_hub_sender_pump(sender, now_ms)` → event flags, `gt_hub_sender_close`, and a stats getter (queued, refused, `next_seq`, `has_own`).
+
+### Test prefixes (reserved; none collide with the existing ones)
+`NSQ` next seq (fresh, running, empty log, reply ahead of the counter, NULL), `HAC` hub accept (fields, `seq` left 0, timestamp), `HSO` sender open/close, `HSR` resume wait (deadline, bad reply, IO, nothing sent before the reply), `HSS` sending (stamp on OK only, FULL keeps the head, IO keeps the head, the counter survives a reconnect), `HSQ` queue full and GAP, `HSL` loopback against `gt_storage_serve` over a real socket (a storage restart in the middle leaves a GAP for a running sender and none after a SIGTERM).
+
+### Follow-ups this contract creates
+- **DESIGN.md:** done 2026-10-26. The Hub → storage rows, the hub-queue budget and *At what rate* now say a record gets its `seq` + CRC when it is sent.
+- **`include/hub.h`:** rewrite the `gt_hub_accept` comment to match (with the hub steps, not now).
 
 ## Health state machine
 ```
@@ -470,8 +534,8 @@ This completes rung 5 end to end: the driver detects the failure, the tracker tu
 
 ### Later (not scheduled)
 - **Hardware check:** run `make light_probe` on the Pi and record the rung 1–4 results and jitter numbers under Status.
-- **Hub implementation:** `gt_hub_accept` validates a message, stamps `seq` and the time, and builds the `gt_record` it forwards. The hub process then replaces `hub_listen`, and the on-Pi rungs of the IPC ladder (see *Verification*) are run again against it.
-- **Hop 2 sender (hub → `storage.sock`):** reuses the `ipc_sock` seam to send 24 B records, with its own 1024-record queue (DESIGN.md: hub queue, about 17 min). It is not the 16 B `gt_ipc_client`, whose ring holds messages.
+- **Hub implementation:** `gt_hub_accept` validates a message, stamps the receive time, and builds the unstamped `gt_record` it queues (`seq` + CRC are added at send; see *Hub contract (hop 2)*). The hub process then replaces `hub_listen`, and the on-Pi rungs of the IPC ladder (see *Verification*) are run again against it.
+- **Hop 2 sender (hub → `storage.sock`):** uses the `ipc_sock` seam with a new `recv` op to read `seq_resume`, and sends 24 B records from its own 1024-record queue (DESIGN.md: hub queue, about 17 min). It is not the 16 B `gt_ipc_client`, whose ring holds messages. Its states and API are in *Hub contract (hop 2)*.
 - **`src/light_sensor_main.c`:** sampler at 1000 ms + health tracker + IPC client, plus a heartbeat to `sup.sock`. Also the log sink (stderr, a file or the monitor process) and wall-clock timestamps for log lines.
 
 ## Files
@@ -632,8 +696,8 @@ Every reading the hub forwards reaches the microSD card in a form that survives 
 - **`include/storage_server.h`, `src/storage_server.c`:** `gt_storage_serve` (the `poll()` rx loop) and the flush thread (`gt_flusher_tick`, `gt_flusher_run`).
 - **`include/listen_sock.h`, `src/listen_sock.c`:** the one-listener lock and bind, moved out of `hub_listen_main.c` (Decisions: one listener per socket). `hub_listen` now calls it.
 - **`include/log_verify.h`, `src/log_verify.c`:** the offline verifier, `gt_verify_dir_ops`.
-- **Process mains:** `src/storage_main.c` (the storage process), `src/storage_feed_main.c` (load generator standing in for the hub), `src/log_verify_main.c` (the `log_verify` tool). Makefile targets `storage_main`, `storage_feed`, `log_verify`.
-- **`tools/storage_faults.sh`:** automated `kill9` / `sigterm` rounds against the real process.
+- **Process mains:** `src/storage_main.c` (the storage process), `src/storage_feed_main.c` (load generator standing in for the hub: `storage_feed [-r] SOCK COUNT [RATE_HZ]`; with `-r` it keeps running across storage restarts, reconnects, and picks its next `seq` with `gt_next_seq` like a running hub), `src/log_verify_main.c` (the `log_verify` tool). Makefile targets `storage_main`, `storage_feed`, `log_verify`.
+- **`tools/storage_faults.sh`:** automated `kill9` / `sigterm` rounds against the real process, driven by one `storage_feed -r` for the whole run.
 
 ## Decisions (Mechanism D)
 - **One pending buffer** (2026-10-26). The 64-record batch and the 1 MB outage queue are the same buffer: records stay in it until a flush succeeds. A flush writes everything pending.
@@ -651,7 +715,7 @@ Every reading the hub forwards reaches the microSD card in a form that survives 
 - **`seq_resume` carries the last *accepted* `seq`**, not the last committed (DESIGN.md corrected).
 - **The rx loop and flush thread live in the library**, so the loop is tested over a real socket (SSV) and one flush pass with the fake (FTK); `storage_main` only wires them up. On stop, frames already in the socket are still accepted.
 - **Verifier coverage rule:** after `seq` *s* the next must be *s* + 1, unless the previous record is a GAP and the next equals `GAP.seq + GAP.value`.
-- **Test ID prefixes:** `SGH` segment header, `RSC` recovery scan, `PND` pending buffer, `SQG` sequence guard, `SRV` storage recover, `SNM` segment name, `SOP` open, `SAP` append, `SFL` flush, `SFE` flush errors, `SCL` shutdown, `SBL` backlog, `SRO` rollover, `SLB` real-file loopback, `LCK` listen lock, `LBD` listen bind, `RSE` / `RSD` resume encode / decode, `SRX` rx frames, `SEV` event names, `FTK` flusher tick, `SSV` serve loopback, `VFY` verifier.
+- **Test ID prefixes:** `SGH` segment header, `RSC` recovery scan, `PND` pending buffer, `SQG` sequence guard, `SRV` storage recover, `SNM` segment name, `SOP` open, `SAP` append, `SFL` flush, `SFE` flush errors, `SCL` shutdown, `SBL` backlog, `SRO` rollover, `SLB` real-file loopback, `LCK` listen lock, `LBD` listen bind, `RSE` / `RSD` resume encode / decode, `SRX` rx frames, `SEV` event names, `FTK` flusher tick, `SSV` serve loopback, `VFY` verifier, `NSQ` next seq (`gt_next_seq`, PF-03).
 
 ## Status (Mechanism D)
 | Step | What | Result |
@@ -673,7 +737,7 @@ Every reading the hub forwards reaches the microSD card in a form that survives 
 | 12d | Event names, server loop, flush thread, `storage_main`, `storage_feed` | ✅ SEV 5, FTK 6, SSV 7 (298, 41) |
 | 13a–13b | Verifier, `log_verify`, `storage_faults.sh` | ✅ VFY 10 (308, 42) |
 | — | `make test`, `make asan`, `make memcheck` (WSL + GitHub CI) | ✅ green at every step |
-| — | `storage_faults.sh sigterm 20` / `kill9 50` | ☐ Not recorded |
+| — | `storage_faults.sh sigterm 20` / `kill9 50` | ✅ sigterm 20: 0 failed checks, 0 GAP readings, 1773/1773 committed · kill9 50: 0 failed checks, 0 corrupt files, 18742 sent = 13249 committed + 5493 GAP-covered (recorded 2026-10-26, WSL2) |
 | — | 20 power pulls on the Pi | ☐ Not run |
 
 ## Verification (Mechanism D)
@@ -686,7 +750,17 @@ Every reading the hub forwards reaches the microSD card in a form that survives 
   5. Restart + feed: no `unclean_shutdown`, the reply continues at 199.
   6. Feed at 10 Hz and `kill -9` storage mid-feed.
   7. Restart: `unclean_shutdown` and `recovery_event`; the reply is the last committed `seq`.
-- **Fault rounds:** `tools/storage_faults.sh sigterm 20` and `tools/storage_faults.sh kill9 50`. Each round checks the start-up log (unclean after a kill, clean after SIGTERM), that `seq_resume` equals the last `seq` the verifier saw, and that `log_verify` passes. Target: `0 failed checks`.
+- **Fault rounds:** `tools/storage_faults.sh sigterm 20` and `tools/storage_faults.sh kill9 50`. Target: `0 failed checks`.
+  - **One feed for the whole run:** `storage_feed -r` acts as a hub that keeps running while storage restarts, so a `kill -9` loss must show up as a GAP (PF-03), not as reused `seq`s.
+  - **Each round:**
+    1. Start storage and wait for its `storage_start` line. The socket file can't be trusted, because a `kill -9` leaves the old one behind.
+    2. Check that it did *not* log `unclean_shutdown`, since every start follows a clean stop.
+    3. Check that the feed's `seq_resume` reply equals the last `seq` the verifier saw.
+    4. Stop storage: SIGTERM after a random 0.1–0.9 s, or `kill -9` after a random 1.0–2.9 s. The flusher commits once a second, so an earlier kill would never see a commit and every loss would hit the empty-log case, where storage writes no GAP.
+    5. **`kill9` only, a recovery pass (PF-05):** pause the feed (`SIGSTOP`), start storage so it recovers (it must log `unclean_shutdown`), then SIGTERM it.
+    6. `log_verify` must pass, and the log may not cover more `seq`s than the feed has sent. In `sigterm` mode it must hold no GAP.
+  - **Settle and the final check:** after the last round, start storage once more so the last hole gets its GAP. Then stop the feed, which reports `sent N records, seq A..B`, and stop storage. The check is the Evaluation plan's formula: N = B − A + 1 (no `seq` reused), the log spans exactly A..B, and `data + gap_readings` = N, i.e. sent − committed − GAP-covered = 0.
+  - **Negative control (2026-10-26):** a scratch build of the feed that always continued from the reply + 1 passed every per-round check in `kill9 5`, but failed the final check ("1600 records in 0..1165").
 - **Power pulls (on the Pi, by hand, 20 times):**
   1. Image the SD card first, so a damaged card can be restored.
   2. Start `storage_main /var/lib/plantpi /run/plantpi/storage.sock` and `storage_feed /run/plantpi/storage.sock 100000 50`.
@@ -696,7 +770,7 @@ Every reading the hub forwards reaches the microSD card in a form that survives 
 
 ## Not done yet (Mechanism D)
 - **Disk full and read-only file system:** `ENOSPC`, the 64 KB `statvfs` reserve, and `EROFS` (`storage_disk_full`, `storage_readonly`). Each needs a "disk full" status out of the file seam first.
-- **The hub side of hop 2:** reading `seq_resume`, continuing from the next `seq`, and the 1024-record queue (see *Not done yet* above).
+- **The hub side of hop 2:** reading `seq_resume` and picking the next `seq` by the max rule (Decisions, PF-03), and the 1024-record queue (see *Not done yet* above).
 - **The heartbeat to `sup.sock`:** Mechanism E.
 - **The 1970 file:** a Pi that boots with no network time and an empty log writes `log-19700101.bin` until NTP syncs. Retention keeps it (newest-30 rule), so nothing is lost, but its name is wrong. A proper fix means `storage_main` waiting for the clock.
 - **On-Pi runs:** the fault rounds and power pulls above.
