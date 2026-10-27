@@ -1,9 +1,9 @@
 /* storage_main: the storage process (DESIGN.md Mechanism D).
  *
  * Purpose: wire the tested pieces together into one long-running process.
- * Every decision lives in the library (storage.c, storage_server.c,
- * listen_sock.c); this file only orders the start-up, owns the threads and
- * signals, and prints log lines. Start-up order:
+ * Every decision lives in the library (storage*.c, storage_server.c,
+ * storage_flusher.c, listen_sock.c); this file only orders the start-up,
+ * owns the threads and signals, and prints log lines. Start-up order:
  *   1. Take the one-listener lock for the socket path FIRST. It guards the
  *      log as well as the socket: two storage processes recovering and
  *      appending to one segment would corrupt it. A second copy exits

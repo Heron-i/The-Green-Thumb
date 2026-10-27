@@ -702,7 +702,7 @@ Every reading the hub forwards reaches the microSD card in a form that survives 
   - **`src/storage_flush.c`:** flush, rollover + retention, shutdown.
 - **`include/storage_proto.h`, `src/storage_proto.c`:** the 8 B `seq_resume` reply codec.
 - **`src/storage_event.c`:** the `GT_STORAGE_EV_*` flag → log name / level / reason table.
-- **`include/storage_server.h`, `src/storage_server.c`:** `gt_storage_serve` (the `poll()` rx loop) and the flush thread (`gt_flusher_tick`, `gt_flusher_run`).
+- **`include/storage_server.h`:** the storage process's two loops. **`src/storage_server.c`:** `gt_storage_serve` (the `poll()` rx loop). **`src/storage_flusher.c`:** the flush thread (`gt_flusher_tick`, `gt_flusher_run`).
 - **`include/listen_sock.h`, `src/listen_sock.c`:** the one-listener lock and bind, moved out of `hub_listen_main.c` (Decisions: one listener per socket). `hub_listen` now calls it.
 - **`include/log_verify.h`, `src/log_verify.c`:** the offline verifier, `gt_verify_dir_ops`, and `gt_verify_sent`, which compares a passing report with the sender's range A..B (PF-12).
 - **Process mains:** `src/storage_main.c` (the storage process: `storage_main [-n N] [-t T_SECONDS] DIR SOCK`), `src/storage_feed_main.c` (load generator standing in for the hub: `storage_feed [-r] SOCK COUNT [RATE_HZ]`; with `-r` it keeps running across storage restarts, reconnects, and picks its next `seq` with `gt_next_seq` like a running hub), `src/log_verify_main.c` (the `log_verify` tool: `log_verify [--sent A..B] DIR`). Makefile targets `storage_main`, `storage_feed`, `log_verify`.

@@ -1,4 +1,4 @@
-/* Unit tests for one pass of the flush thread (src/storage_server.c):
+/* Unit tests for one pass of the flush thread (src/storage_flusher.c):
  * gt_flusher_init and gt_flusher_tick.
  *
  * Purpose: prove the flush thread commits when (and only when) a flush is
