@@ -1,4 +1,4 @@
-/* Unit tests for flush failures (src/storage.c): gt_storage_flush when a
+/* Unit tests for flush failures (src/storage_flush.c): gt_storage_flush when a
  * truncate, write or fsync fails, and the retry after it.
  *
  * Purpose: prove DESIGN.md's "Never fail silently" row. Every failure is

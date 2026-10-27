@@ -1,4 +1,4 @@
-/* Unit tests for the clean-shutdown marker (src/storage.c):
+/* Unit tests for the clean-shutdown marker (src/storage_flush.c):
  * gt_storage_shutdown, and how gt_storage_open_ops reads the marker.
  *
  * Purpose: prove DESIGN.md's shutdown rules. A clean shutdown commits
