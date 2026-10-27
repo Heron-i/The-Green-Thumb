@@ -182,17 +182,16 @@ static int parse_batch_options(int argc, char **argv, unsigned long *batch_out,
     int arg_index = 1;
     /* invariant: argv[1 .. arg_index - 1] are whole, valid option pairs */
     while (arg_index + 1 < argc && argv[arg_index][0] == '-') {
-        if (strcmp(argv[arg_index], "-n") == 0 && !seen_batch) {
+        const char *flag = argv[arg_index];
+        int ok = 0;   /* stays 0 for an unknown or repeated option */
+        if (strcmp(flag, "-n") == 0 && !seen_batch) {
             seen_batch = parse_bounded(argv[arg_index + 1], GT_PENDING_MAX_RECORDS, batch_out);
-            if (!seen_batch) {
-                return 0;
-            }
-        } else if (strcmp(argv[arg_index], "-t") == 0 && !seen_age) {
+            ok = seen_batch;
+        } else if (strcmp(flag, "-t") == 0 && !seen_age) {
             seen_age = parse_bounded(argv[arg_index + 1], BATCH_AGE_MAX_S, age_s_out);
-            if (!seen_age) {
-                return 0;
-            }
-        } else {
+            ok = seen_age;
+        }
+        if (!ok) {
             return 0;
         }
         arg_index += 2;
@@ -308,6 +307,18 @@ static int start_flusher(pthread_t *thread, gt_flusher *flusher)
     return created;
 }
 
+/* Say why the one-listener lock wasn't taken: another storage_main holds
+ * it, or the lock file itself failed (errno says how). */
+static void report_lock_error(const char *sock_path, int already_running)
+{
+    if (already_running) {
+        fprintf(stderr, "storage_main: already running on %s (%s.lock is locked)\n",
+                sock_path, sock_path);
+        return;
+    }
+    fprintf(stderr, "storage_main: lock %s.lock: %s\n", sock_path, strerror(errno));
+}
+
 int main(int argc, char **argv)
 {
     unsigned long batch_records = GT_BATCH_MAX_RECORDS;
@@ -329,12 +340,7 @@ int main(int argc, char **argv)
     /* 1. The lock, before anything touches the log. */
     int lock_fd = -1, already_running = 0;
     if (gt_listen_lock(sock_path, &lock_fd, &already_running) != GT_OK) {
-        if (already_running) {
-            fprintf(stderr, "storage_main: already running on %s (%s.lock is locked)\n",
-                    sock_path, sock_path);
-        } else {
-            fprintf(stderr, "storage_main: lock %s.lock: %s\n", sock_path, strerror(errno));
-        }
+        report_lock_error(sock_path, already_running);
         return 1;
     }
 
@@ -382,11 +388,10 @@ int main(int argc, char **argv)
     int flusher_running = start_flusher(&flush_thread, &flusher);
     if (!flusher_running) {
         log_line(NULL, GT_LOG_ERROR, "flusher_start_error", NULL);
-    } else {
-        status = gt_storage_serve(storage, listen_fd, stop_pipe[0], log_line, NULL);
-        if (status != GT_OK) {
-            log_line(NULL, GT_LOG_ERROR, "rx_loop_error", NULL);
-        }
+    }
+    if (flusher_running
+        && gt_storage_serve(storage, listen_fd, stop_pipe[0], log_line, NULL) != GT_OK) {
+        log_line(NULL, GT_LOG_ERROR, "rx_loop_error", NULL);
     }
 
     /* Shut down: stop and join the flush thread, then the final flush and
