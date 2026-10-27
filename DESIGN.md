@@ -70,7 +70,7 @@ flowchart TB
     LT -.->|"heartbeat 1 Hz"| SUPSOCK
     ST -.->|"heartbeat 1 Hz"| SUPSOCK
     HT -.->|"heartbeat 1 Hz"| SUPSOCK
-    FL -.->|"heartbeat 1 Hz"| SUPSOCK
+    RX -.->|"heartbeat 1 Hz"| SUPSOCK
     SUPSOCK -.->|"heartbeat 1 Hz, timeout 5 s (4 msg/s total)"| SUP
     SIG -.->|"event: SIGCHLD"| SUP
     SUP -.->|"event: restart, backoff 1→2→4… max 30 s"| LP
@@ -123,7 +123,7 @@ flowchart TB
 
 ## Failure-mode table
 
-Log format for every component: `timestamp level component event key=value`. `timestamp` is µs since the Unix epoch, written as an integer (the same unit as the on-disk record, so log lines and records can be joined), and `level` is one of `DEBUG`, `INFO`, `WARN` or `ERROR`. Every component builds its lines with the shared `gt_log_format` (`src/gt_log.c`). Rule: whichever component refuses a reading records the gap (start, end, count), so no reading is ever lost silently. Besides the events in the table, storage logs `storage_start` / `storage_stop` (with segment, last `seq`, committed and refused counts), `segment_rollover`, and `hub_connected` / `hub_disconnected` / `hub_duplicate_client` for its one hub connection; `storage_degraded` carries `reason=write_failed` or `reason=queue_full`. The flag-to-name table is `src/storage_event.c`.
+Log format for every component: `timestamp level component event key=value`. `timestamp` is µs since the Unix epoch, written as an integer (the same unit as the on-disk record, so log lines and records can be joined), and `level` is one of `DEBUG`, `INFO`, `WARN` or `ERROR`. Every component builds its lines with the shared `gt_log_format` (`src/gt_log.c`) and writes them to stderr; children inherit the supervisor's stderr, so under systemd every line reaches the journal. Rule: whichever component refuses a reading records the gap (start, end, count), so no reading is ever lost silently. Besides the events in the table, storage logs `storage_start` / `storage_stop` (with segment, last `seq`, committed and refused counts), `segment_rollover`, and `hub_connected` / `hub_disconnected` / `hub_duplicate_client` for its one hub connection; `storage_degraded` carries `reason=write_failed` or `reason=queue_full`. The flag-to-name table is `src/storage_event.c`.
 
 | Component | Failure | Detection | Response | Log |
 |---|---|---|---|---|
@@ -401,7 +401,7 @@ Each measurement below has a method and a target. Unless a row says otherwise, m
 
 **Test tooling**
 - **Load generator:** writes synthetic records into `storage.sock` at a set rate.
-- **Verifier:** reads the log offline and checks every record's CRC, that `seq` strictly increases, and that every missing `seq` is covered by a GAP record. It then compares the log against the hub's sent-sequence log.
+- **Verifier:** reads the log offline and checks every record's CRC, that `seq` strictly increases, and that every missing `seq` is covered by a GAP record. It then compares the log against the range of `seq`s the hub sent (`log_verify --sent A..B`): within one hub run the sent `seq`s are one unbroken range A..B, because a `seq` is used only when `send()` succeeds. Every `seq` in A..B must be stored or covered by a GAP, and nothing after B may be in the log. `seq`s before A belong to earlier hub runs. The `seq`s it reports as lost are the *Lost readings* formula below.
 - **Timing:** latency is measured with `CLOCK_MONOTONIC` timestamps, logged at each stage and keyed by sensor counter and hub `seq`, then joined offline.
 - **Fault injector:** a script that picks a target process and a random time, then sends `SIGKILL` (crash), `SIGSTOP` (hang) or closes its socket (disconnect). It logs each injection with a `CLOCK_MONOTONIC` timestamp so it can be joined with the supervisor's `child_exit`, `heartbeat_timeout` and restart events.
 - **Fake I2C bus:** `tests/fake_i2c.h` fails the Nth bus operation, so retry, skip and offline logic is tested on a dev machine without hardware (runs in CI under `make test`, `make asan` and `make memcheck`).

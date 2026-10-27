@@ -22,15 +22,15 @@ Adversarial review of branch `Menu-Mechanism-D` (Lucas's Mechanism D storage wor
 | PF-07 | A storage-made GAP record carries the gap's end time | DESIGN.md | Medium | Resolved (2026-10-26) |
 | PF-08 | Commits are not logged and fsync is not timed | DESIGN.md (2 rows) | Medium | Resolved (2026-10-27) |
 | PF-09 | DESIGN.md describes disk-full and read-only handling as done | DESIGN.md | Medium | Resolved in docs (2026-10-26); handling not built |
-| PF-10 | Storage heartbeat: not built, and DESIGN.md disagrees with itself | DESIGN.md | Medium | Open |
+| PF-10 | Storage heartbeat: not built, and DESIGN.md disagrees with itself | DESIGN.md | Medium | Proposed in docs (2026-10-27); pending Lucas |
 | PF-11 | The (N, T) batching experiment can't run as specified | DESIGN.md | Low | Open |
-| PF-12 | The verifier doesn't compare against the hub's sent `seq`s | DESIGN.md | Low | Open |
+| PF-12 | The verifier doesn't compare against the hub's sent `seq`s | DESIGN.md | Low | Resolved (2026-10-27); the hub's sent-range line comes with the hub |
 | PF-13 | `clock_unsynced` / `clock_synced` are never logged | DESIGN.md | Low | Resolved (2026-10-27) |
 | PF-14 | Some log lines are missing their `key=value` fields | DESIGN.md | Low | Resolved (2026-10-27) |
 | PF-15 | Doc errors: "lux" range check, wrong decode function | [Both docs] / DESIGN.md | Low | Resolved (2026-10-26) |
-| PF-16 | Socket calls outside `src/ipc_sock.c` | Sensor-Pipeline.md | Low | Open |
+| PF-16 | Socket calls outside `src/ipc_sock.c` | Sensor-Pipeline.md | Low | Resolved in docs (2026-10-27) |
 | PF-17 | Lily's Status section edited; "storage is done" overclaims | Sensor-Pipeline.md | Low | Resolved (2026-10-27) |
-| PF-18 | The log sink was chosen by one side | Sensor-Pipeline.md | Low | Open |
+| PF-18 | The log sink was chosen by one side | Sensor-Pipeline.md | Low | Resolved in docs (2026-10-27) |
 | PF-19 | The Code map is out of date | Sensor-Pipeline.md | Low | Resolved (2026-10-27) |
 | PF-20 | Smaller storage edge cases | DESIGN.md | Low | Resolved (2026-10-27); the 1970 wait still needs an on-Pi check |
 
@@ -161,6 +161,11 @@ Storage itself was correct: the feed's output file later held `seq_resume: last=
 ### PF-10: Storage heartbeat: not built, and DESIGN.md disagrees with itself
 - The architecture diagram has the **flush thread** send a 1 Hz heartbeat to `sup.sock`; the `fsync_slow` row says the **rx thread** sends it (so a stalled fsync can't stop it).
 - Neither is built; `storage_main.c` says it "arrives with Mechanism E". DESIGN.md needs one answer before it is.
+- **Resolution (proposed 2026-10-27, docs only; pending Lucas):**
+  - **The proposal:** the **rx thread** sends it, as the `fsync_slow` row already said. The flush thread can sit in a stalled `fsync()`, so a heartbeat from it would stop exactly when the supervisor needs to tell "slow" from "hung".
+  - **Where it's written:** DESIGN.md's diagram arrow now runs from the rx thread to `sup.sock`. Sensor-Pipeline.md has a Mechanism D Decisions bullet marked *pending Lucas*, and its *Not done yet* points to it.
+  - **What building it needs:** `gt_storage_serve`'s `poll()` gets a 1000 ms timeout instead of `-1`, and `gt_storage_stats` gains the time the current flush started (the beat carries "flush in progress since t" and the committed count).
+  - **Still to do:** Lucas confirms it, then it is built with `sup.sock` (Mechanism E).
 
 ### PF-11: The (N, T) batching experiment can't run as specified
 - **DESIGN.md**, Mechanism D: compare fsync count, latency and CPU at (N, T) = (1, 1 s), (64, 10 s) and (64, 60 s).
@@ -169,6 +174,20 @@ Storage itself was correct: the feed's output file later held `seq_resume: last=
 ### PF-12: The verifier doesn't compare against the hub's sent `seq`s
 - **DESIGN.md**, Test tooling: the verifier "then compares the log against the hub's sent-sequence log".
 - `log_verify` checks every CRC, that `seq` strictly increases across segments, and that every hole is covered by a GAP, but there is no hub yet to compare against. Together with PF-03, a `kill -9` loss is currently undetectable.
+- **Resolution (2026-10-27):**
+  - **The rule:** compare ranges, not a per-`seq` log. Within one hub run the sent `seq`s are one unbroken range A..B: a `seq` is used only when `send()` succeeds, and a running hub's counter stays ahead of storage's reply (PF-03). A passing report already guarantees every `seq` from its first to its last is stored or GAP-covered, so:
+    - lost = the sent `seq`s outside that range (`sent_seq_lost`);
+    - a `seq` after B fails as `seq_not_sent`;
+    - `seq`s before A are earlier hub runs and are allowed.
+  - **Changed from the plan:** checking `data + gap_readings = B − A + 1` was dropped. It only held because `storage_feed` never sends a GAP. A hub GAP has its own `seq`, and its value counts refused readings that never got a `seq`, so the sum would break once the hub exists.
+  - **The code:**
+    - `gt_verify_sent` in `log_verify.h` / `log_verify.c`, written test first (VSR-01 to VSR-07 in `tests/test_verify_sent.c`).
+    - `log_verify [--sent A..B] DIR` prints `sent=N lost=L` and fails on a mismatch.
+    - `storage_faults.sh`'s settle check uses it in place of the bash arithmetic. It still checks N = B − A + 1 (no `seq` reused) and that the log starts at A, since its log starts empty.
+  - **Docs:** DESIGN.md *Test tooling → Verifier*; Sensor-Pipeline.md's Mechanism D Code map, a Decisions bullet, the `VSR` prefix and the settle-check description.
+  - **Still to do:**
+    - Record a `storage_faults.sh sigterm` / `kill9` run with the new check.
+    - The hub logs its own sent range when it stops (hub step H8), so the same flag works on the Pi.
 
 ### PF-13: `clock_unsynced` / `clock_synced` are never logged
 - **DESIGN.md**, System clock row: log the unsynced period with `clock_unsynced` / `clock_synced`.
@@ -201,6 +220,9 @@ Storage itself was correct: the feed's output file later held `seq_resume: last=
 - **Sensor-Pipeline.md** (*Design principle*): "`src/ipc_sock.c` is the only file that makes socket system calls"; everything else goes through `gt_sock_ops` so tests can use a fake.
 - `listen_sock.c` calling `socket` / `bind` / `listen` is expected: the plan's own *Decisions* asked for that shared helper.
 - `storage_server.c` calls `accept`, `recv` and `send` directly ([src/storage_server.c:79](src/storage_server.c#L79), [96](src/storage_server.c#L96), [115](src/storage_server.c#L115)), so its loop is tested only over real sockets (SSV), not with a fake. Defensible for a server, but it should be recorded as a Decision.
+- **Resolution (2026-10-27, docs only):**
+  - **The rule:** the socket seam is for clients. Servers (`listen_sock.c`, `storage_server.c`, and later the hub's rx loop) call the socket API directly and are tested over real sockets (LBD, SSV, and later the hub loopback). A server-side seam with its own fake was rejected: an ops table and a second fake to test very little logic.
+  - **Where it's written:** a new Sensor-Pipeline.md Decisions bullet; the *Design principle → IPC seam* bullet now says "client-side"; so does the header comment in `include/ipc_sock.h`.
 
 ### PF-17: Lily's Status section edited; "storage is done" overclaims
 - **Sensor-Pipeline.md**: "Update the Status section only at the end of the day, when asked." The PR rewrites Lily's *Not done yet* bullet to say "**The storage process itself is done**".
@@ -214,6 +236,10 @@ Storage itself was correct: the feed's output file later held `seq_resume: last=
 ### PF-18: The log sink was chosen by one side
 - **Sensor-Pipeline.md** (*Decisions → Log sink deferred*): where log lines go is to be decided together with the light process.
 - `storage_main` writes to stderr ([src/storage_main.c:68-75](src/storage_main.c#L68-L75)). A reasonable choice, but it now sets the precedent for every process.
+- **Resolution (2026-10-27, docs only):**
+  - **The rule:** stderr for every process, adopted as a joint decision. Children inherit the supervisor's stderr, so under systemd every line reaches the journal. A shared file sink (rotation becomes our problem) and the monitor process (waits on Mechanism E) were rejected.
+  - **Where it's written:** Sensor-Pipeline.md's *Log sink* Decision (was *Log sink deferred*), plus its *Later* and *Not done yet* bullets for `light_sensor_main.c`; one sentence in DESIGN.md's log-format paragraph.
+  - **No code change:** `storage_main` already does this.
 
 ### PF-19: The Code map is out of date
 - The diagram still shows the storage process as not built (☐).
@@ -235,6 +261,7 @@ Storage itself was correct: the feed's output file later held `seq_resume: last=
   - **The 1970 file (decided 2026-10-27):** on an empty log with an unsynced clock, `storage_main` now waits up to 120 s for the clock before open names the first segment. It logs `clock_wait max_s=120`, then `clock_wait_done waited_s=N synced=0|1`. The hub's 1024-record queue covers the wait. "Empty log" comes from the new `gt_storage_log_empty` / `_ops`, which uses the same listing open uses (SOP-16, red then green).
   - **Still possible:** with no network for the whole 120 s, it still starts a 1970 file. That stays a documented limit in `storage.h` and DESIGN.md.
   - **Not tested yet:** the wait itself has not been seen running, because WSL's clock is always synced. It needs a check on the Pi with the network unplugged.
+  - **Doc follow-up (2026-10-27):** Sensor-Pipeline.md's *Not done yet (Mechanism D)* still listed "the 1970 file" as unfixed, saying a proper fix meant `storage_main` waiting for the clock. That wait now exists, so the bullet was reworded to the open item: the on-Pi check of the clock wait.
 
 ## What meets the plans
 
@@ -262,5 +289,5 @@ Storage itself was correct: the feed's output file later held `seq_resume: last=
 1. ~~**Decide PF-01 to PF-03 in DESIGN.md:** the hub stamps the timestamp on arrival and `seq` + CRC at send time; the socket seam gains a `recv` op and the sender a "waiting for `seq_resume`" state; a running hub keeps its own `seq` counter. Update Sensor-Pipeline.md's *Decisions* and `include/hub.h` to match.~~ **Done in both documents (2026-10-26).** `include/hub.h` waits for the hub steps.
 2. ~~**Fix PF-04** (and PF-05), then run `storage_faults.sh sigterm 20` and `kill9 50` and record the results.~~ **Done (2026-10-26):** both ran with 0 failed checks; results are in PF-04/05 and the Mechanism D Status table.
 3. ~~**Fix or document PF-06 and PF-07.**~~ **Done (2026-10-26):** both fixed test-first; see their Resolution lines.
-4. ~~**Mark PF-09's rows as planned**~~ (done 2026-10-26) and settle PF-10's heartbeat owner thread (Lucas owns the heartbeat and will settle it).
+4. ~~**Mark PF-09's rows as planned**~~ (done 2026-10-26) and settle PF-10's heartbeat owner thread. **Proposed (2026-10-27):** the rx thread, written into both documents and marked pending Lucas, who owns the heartbeat.
 5. ~~**Clean up the docs:** PF-15 (restore "raw count"), PF-17 (Status ownership and file scope), PF-19 (Code map).~~ **Done** (PF-15 2026-10-26; PF-17 and PF-19 2026-10-27). Who owns each Status section is left to the team (PF-17).

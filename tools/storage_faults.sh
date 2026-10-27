@@ -23,9 +23,10 @@
 #      the feed sent, and, for sigterm, hold no GAP.
 # Then a settle phase: start storage once more so the last hole gets its
 # GAP, stop the feed (its last line gives N records sent, seqs A..B), stop
-# storage, and check the Evaluation plan's formula: N = B - A + 1 (no seq
-# reused), the log spans exactly A..B, and data + gap_readings = N
-# (sent - committed - GAP-covered = 0).
+# storage, and check the Evaluation plan's formula with
+# log_verify --sent A..B (sent - committed - GAP-covered = 0, nothing
+# stored past B), plus N = B - A + 1 (no seq reused) and the log starting
+# at A.
 # Any failed check is counted and printed; the scratch directory is kept
 # for inspection if anything failed, and removed otherwise.
 #
@@ -231,19 +232,18 @@ if [[ "$rounds_done" -eq "$ROUNDS" ]]; then
             sent_total="${BASH_REMATCH[1]}"
             sent_first="${BASH_REMATCH[2]}"
             sent_last="${BASH_REMATCH[3]}"
-            verify_out="$("$BUILD/log_verify" "$LOG_DIR")"
+            # --sent checks every seq in A..B is committed or GAP-covered
+            # and nothing past B is stored (PF-12). It allows seqs before A
+            # (earlier hub runs), but this run's log started empty, so the
+            # first seq is checked here too.
+            verify_out="$("$BUILD/log_verify" --sent "$sent_first..$sent_last" "$LOG_DIR")"
             if [[ $? -ne 0 ]]; then
-                fail "log_verify: $(echo "$verify_out" | tr '\n' ' ')"
+                fail "log_verify --sent: $(echo "$verify_out" | tr '\n' ' ')"
             else
-                held=$(( $(verify_field data) + $(verify_field gap_readings) ))
                 (( sent_total == sent_last - sent_first + 1 )) \
                     || fail "the feed reused seqs: $sent_total records in $sent_first..$sent_last"
                 [[ "$(verify_field first_seq)" == "$sent_first" ]] \
                     || fail "log starts at $(verify_field first_seq), the feed at $sent_first"
-                [[ "$(verify_field last_seq)" == "$sent_last" ]] \
-                    || fail "log ends at $(verify_field last_seq), the feed at $sent_last"
-                (( held == sent_total )) \
-                    || fail "the feed sent $sent_total; committed + GAP-covered is $held"
             fi
             echo "settle: $sent_line; $(echo "$verify_out" | sed -n 2p)"
         fi
