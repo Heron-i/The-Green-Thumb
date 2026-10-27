@@ -190,3 +190,40 @@ gt_status gt_verify_dir_ops(const gt_file_ops *ops, void *ctx, gt_verify_report 
     }
     return status;
 }
+
+/* A passing report covers every seq in first_seq..last_seq, so the sent
+ * seqs accounted for are exactly the overlap of that range with A..B, and
+ * lost is the rest. All counts are 64-bit, so 0..UINT32_MAX can't wrap. */
+gt_status gt_verify_sent(const gt_verify_report *report, uint32_t sent_first,
+                         uint32_t sent_last, gt_verify_sent_result *result_out)
+{
+    if (report == NULL || result_out == NULL || sent_first > sent_last) {
+        return GT_ERR_INVAL;
+    }
+    gt_verify_sent_result result = {
+        .ok = 0, .sent = (uint64_t)sent_last - sent_first + 1, .lost = 0, .failure = NULL,
+    };
+    if (!report->ok) {
+        result.failure = GT_VERIFY_LOG_FAILED;
+        *result_out = result;
+        return GT_OK;
+    }
+    uint64_t held = 0;
+    if (report->has_records) {
+        uint32_t overlap_first = report->first_seq > sent_first ? report->first_seq : sent_first;
+        uint32_t overlap_last = report->last_seq < sent_last ? report->last_seq : sent_last;
+        if (overlap_first <= overlap_last) {
+            held = (uint64_t)overlap_last - overlap_first + 1;
+        }
+    }
+    result.lost = result.sent - held;
+    if (report->has_records && report->last_seq > sent_last) {
+        result.failure = GT_VERIFY_SEQ_NOT_SENT;
+    } else if (result.lost > 0) {
+        result.failure = GT_VERIFY_SENT_SEQ_LOST;
+    } else {
+        result.ok = 1;
+    }
+    *result_out = result;
+    return GT_OK;
+}

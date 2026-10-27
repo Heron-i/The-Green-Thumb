@@ -24,7 +24,7 @@ Adversarial review of branch `Menu-Mechanism-D` (Lucas's Mechanism D storage wor
 | PF-09 | DESIGN.md describes disk-full and read-only handling as done | DESIGN.md | Medium | Resolved in docs (2026-10-26); handling not built |
 | PF-10 | Storage heartbeat: not built, and DESIGN.md disagrees with itself | DESIGN.md | Medium | Proposed in docs (2026-10-27); pending Lucas |
 | PF-11 | The (N, T) batching experiment can't run as specified | DESIGN.md | Low | Open |
-| PF-12 | The verifier doesn't compare against the hub's sent `seq`s | DESIGN.md | Low | Open |
+| PF-12 | The verifier doesn't compare against the hub's sent `seq`s | DESIGN.md | Low | Resolved (2026-10-27); the hub's sent-range line comes with the hub |
 | PF-13 | `clock_unsynced` / `clock_synced` are never logged | DESIGN.md | Low | Resolved (2026-10-27) |
 | PF-14 | Some log lines are missing their `key=value` fields | DESIGN.md | Low | Resolved (2026-10-27) |
 | PF-15 | Doc errors: "lux" range check, wrong decode function | [Both docs] / DESIGN.md | Low | Resolved (2026-10-26) |
@@ -174,6 +174,20 @@ Storage itself was correct: the feed's output file later held `seq_resume: last=
 ### PF-12: The verifier doesn't compare against the hub's sent `seq`s
 - **DESIGN.md**, Test tooling: the verifier "then compares the log against the hub's sent-sequence log".
 - `log_verify` checks every CRC, that `seq` strictly increases across segments, and that every hole is covered by a GAP, but there is no hub yet to compare against. Together with PF-03, a `kill -9` loss is currently undetectable.
+- **Resolution (2026-10-27):**
+  - **The rule:** compare ranges, not a per-`seq` log. Within one hub run the sent `seq`s are one unbroken range A..B: a `seq` is used only when `send()` succeeds, and a running hub's counter stays ahead of storage's reply (PF-03). A passing report already guarantees every `seq` from its first to its last is stored or GAP-covered, so:
+    - lost = the sent `seq`s outside that range (`sent_seq_lost`);
+    - a `seq` after B fails as `seq_not_sent`;
+    - `seq`s before A are earlier hub runs and are allowed.
+  - **Changed from the plan:** checking `data + gap_readings = B − A + 1` was dropped. It only held because `storage_feed` never sends a GAP. A hub GAP has its own `seq`, and its value counts refused readings that never got a `seq`, so the sum would break once the hub exists.
+  - **The code:**
+    - `gt_verify_sent` in `log_verify.h` / `log_verify.c`, written test first (VSR-01 to VSR-07 in `tests/test_verify_sent.c`).
+    - `log_verify [--sent A..B] DIR` prints `sent=N lost=L` and fails on a mismatch.
+    - `storage_faults.sh`'s settle check uses it in place of the bash arithmetic. It still checks N = B − A + 1 (no `seq` reused) and that the log starts at A, since its log starts empty.
+  - **Docs:** DESIGN.md *Test tooling → Verifier*; Sensor-Pipeline.md's Mechanism D Code map, a Decisions bullet, the `VSR` prefix and the settle-check description.
+  - **Still to do:**
+    - Record a `storage_faults.sh sigterm` / `kill9` run with the new check.
+    - The hub logs its own sent range when it stops (hub step H8), so the same flag works on the Pi.
 
 ### PF-13: `clock_unsynced` / `clock_synced` are never logged
 - **DESIGN.md**, System clock row: log the unsynced period with `clock_unsynced` / `clock_synced`.
@@ -247,6 +261,7 @@ Storage itself was correct: the feed's output file later held `seq_resume: last=
   - **The 1970 file (decided 2026-10-27):** on an empty log with an unsynced clock, `storage_main` now waits up to 120 s for the clock before open names the first segment. It logs `clock_wait max_s=120`, then `clock_wait_done waited_s=N synced=0|1`. The hub's 1024-record queue covers the wait. "Empty log" comes from the new `gt_storage_log_empty` / `_ops`, which uses the same listing open uses (SOP-16, red then green).
   - **Still possible:** with no network for the whole 120 s, it still starts a 1970 file. That stays a documented limit in `storage.h` and DESIGN.md.
   - **Not tested yet:** the wait itself has not been seen running, because WSL's clock is always synced. It needs a check on the Pi with the network unplugged.
+  - **Doc follow-up (2026-10-27):** Sensor-Pipeline.md's *Not done yet (Mechanism D)* still listed "the 1970 file" as unfixed, saying a proper fix meant `storage_main` waiting for the clock. That wait now exists, so the bullet was reworded to the open item: the on-Pi check of the clock wait.
 
 ## What meets the plans
 

@@ -401,7 +401,7 @@ Each measurement below has a method and a target. Unless a row says otherwise, m
 
 **Test tooling**
 - **Load generator:** writes synthetic records into `storage.sock` at a set rate.
-- **Verifier:** reads the log offline and checks every record's CRC, that `seq` strictly increases, and that every missing `seq` is covered by a GAP record. It then compares the log against the hub's sent-sequence log.
+- **Verifier:** reads the log offline and checks every record's CRC, that `seq` strictly increases, and that every missing `seq` is covered by a GAP record. It then compares the log against the range of `seq`s the hub sent (`log_verify --sent A..B`): within one hub run the sent `seq`s are one unbroken range A..B, because a `seq` is used only when `send()` succeeds. Every `seq` in A..B must be stored or covered by a GAP, and nothing after B may be in the log. `seq`s before A belong to earlier hub runs. The `seq`s it reports as lost are the *Lost readings* formula below.
 - **Timing:** latency is measured with `CLOCK_MONOTONIC` timestamps, logged at each stage and keyed by sensor counter and hub `seq`, then joined offline.
 - **Fault injector:** a script that picks a target process and a random time, then sends `SIGKILL` (crash), `SIGSTOP` (hang) or closes its socket (disconnect). It logs each injection with a `CLOCK_MONOTONIC` timestamp so it can be joined with the supervisor's `child_exit`, `heartbeat_timeout` and restart events.
 - **Fake I2C bus:** `tests/fake_i2c.h` fails the Nth bus operation, so retry, skip and offline logic is tested on a dev machine without hardware (runs in CI under `make test`, `make asan` and `make memcheck`).

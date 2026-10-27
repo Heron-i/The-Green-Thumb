@@ -10,8 +10,8 @@
  * Segments are written into tests/fake_file.h by hand. Run under make test
  * / asan / memcheck. Implements VFY-01 through VFY-10.
  *
- * What these tests cannot prove: the comparison with the hub's sent-seq
- * log ("lost = sent - committed - covered"), which needs the hub. */
+ * The comparison with the sender's range ("lost = sent - committed -
+ * covered") is gt_verify_sent, tested in tests/test_verify_sent.c (VSR). */
 #include <stdint.h>
 #include <string.h>
 

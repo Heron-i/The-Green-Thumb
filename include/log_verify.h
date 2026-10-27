@@ -53,4 +53,35 @@ typedef struct {
  * *report_out is untouched unless GT_OK. */
 gt_status gt_verify_dir_ops(const gt_file_ops *ops, void *ctx, gt_verify_report *report_out);
 
+/* Comparison with what the sender sent (DESIGN.md Evaluation plan: lost
+ * readings = seqs the hub sent - seqs committed - seqs covered by a GAP;
+ * PF-12). Within one hub run the sent seqs are one unbroken range A..B: a
+ * seq is used only when send() succeeds, and a running hub's counter is
+ * always ahead of storage's reply. A passing report already guarantees
+ * every seq from first_seq to last_seq is stored or covered by a GAP, so
+ * only the two ranges need comparing:
+ *   - seqs before A are allowed: they are earlier hub runs;
+ *   - a seq after B was never sent by this run: seq_not_sent;
+ *   - every sent seq outside first_seq..last_seq is lost: sent_seq_lost.
+ * Run it after the hub has stopped, before a new run adds to the log. */
+#define GT_VERIFY_LOG_FAILED    "log_failed"     /* the report itself did not pass */
+#define GT_VERIFY_SEQ_NOT_SENT  "seq_not_sent"   /* the log goes past B */
+#define GT_VERIFY_SENT_SEQ_LOST "sent_seq_lost"  /* some of A..B is missing */
+
+typedef struct {
+    int         ok;        /* 1: every sent seq is accounted for, nothing extra */
+    uint64_t    sent;      /* B - A + 1 (64 bits: 0..UINT32_MAX is 2^32 seqs) */
+    uint64_t    lost;      /* sent seqs neither stored nor covered by a GAP */
+    const char *failure;   /* one of the three above, or NULL when ok */
+} gt_verify_sent_result;
+
+/* Compare `report` (from gt_verify_dir_ops) with the sent range
+ * sent_first..sent_last. When the report did not pass, the result fails
+ * with log_failed and lost is not computed (0).
+ *   GT_OK         the comparison ran; *result_out says pass or fail
+ *   GT_ERR_INVAL  NULL args, or sent_first > sent_last
+ * *result_out is untouched unless GT_OK. */
+gt_status gt_verify_sent(const gt_verify_report *report, uint32_t sent_first,
+                         uint32_t sent_last, gt_verify_sent_result *result_out);
+
 #endif
