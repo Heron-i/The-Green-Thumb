@@ -13,8 +13,9 @@
  * flushed into the old day's segment before the switch (PF-06). If that
  * flush fails, the old segment's torn tail is cut first, or the switch
  * waits if it can't be. Uses tests/fake_file.h with a 3-day window (the
- * fake holds 8 files). Run under make test / asan / memcheck. Implements
- * SRO-01 through SRO-14.
+ * fake holds 8 files). The active segment's name can be read back for
+ * storage_stop. Run under make test / asan / memcheck. Implements SRO-01
+ * through SRO-15.
  *
  * What these tests cannot prove: a real midnight on the Pi during the
  * soak, or how storage_main learns the clock is synced (Step 12d). */
@@ -423,6 +424,29 @@ static void test_sro10_bad_args(void)
     gt_storage_close(storage);
 }
 
+/* ---- SRO-15: the active segment follows the rollover ----
+ * Today's name after open, tomorrow's after the rollover: what
+ * storage_main puts in storage_stop (PF-14). NULL arguments are rejected
+ * and the output is left alone. */
+static void test_sro15_active_segment_name(void)
+{
+    const gt_file_ops *ops = fake_fs_ops(&fs);
+    gt_storage *storage = open_today(ops);
+    char name[GT_FILE_NAME_MAX] = "untouched";
+
+    CHECK_EQ(gt_storage_active_segment(storage, name), GT_OK);
+    CHECK(strcmp(name, TODAY_NAME) == 0);
+    rollover_expect(storage, TOMORROW_US, 1, GT_OK, GT_STORAGE_EV_ROLLOVER);
+    CHECK_EQ(gt_storage_active_segment(storage, name), GT_OK);
+    CHECK(strcmp(name, TOMORROW_NAME) == 0);
+
+    strcpy(name, "untouched");
+    CHECK_EQ(gt_storage_active_segment(NULL, name), GT_ERR_INVAL);
+    CHECK(strcmp(name, "untouched") == 0);
+    CHECK_EQ(gt_storage_active_segment(storage, NULL), GT_ERR_INVAL);
+    gt_storage_close(storage);
+}
+
 static const test_case_t tests[] = {
     {"SRO-01", "the same day does not roll over", test_sro01_same_day_no_rollover},
     {"SRO-02", "a new day gets a new durable segment", test_sro02_new_day_new_segment},
@@ -438,6 +462,7 @@ static const test_case_t tests[] = {
     {"SRO-12", "a failed tail cut delays the rollover", test_sro12_failed_cut_delays_rollover},
     {"SRO-13", "pending records go into the old day", test_sro13_pending_goes_to_old_day},
     {"SRO-14", "a failed pre-flush still rolls over", test_sro14_failed_preflush_still_rolls},
+    {"SRO-15", "the active segment follows the rollover", test_sro15_active_segment_name},
 };
 
 int main(void)

@@ -268,6 +268,15 @@ static gt_status find_newest(gt_storage *storage,
             info->recovered = 1;
             memcpy(info->recovered_name, name, GT_FILE_NAME_MAX);
             info->recovery = report;
+        } else if (report.outcome != GT_RECOVER_CLEAN) {
+            /* An older segment recovery changed: report it too (PF-14). */
+            if (info->older_count < GT_OPEN_OLDER_MAX) {
+                gt_older_recovery *older = &info->older[info->older_count++];
+                memcpy(older->name, name, GT_FILE_NAME_MAX);
+                older->report = report;
+            } else {
+                info->older_unlisted++;
+            }
         }
         if (report.outcome == GT_RECOVER_RENAMED) {
             continue;
@@ -774,6 +783,37 @@ gt_status gt_storage_open(const char *dir, uint64_t now_us, gt_storage **storage
     return gt_storage_open_ops(ops, ctx, now_us, 0, storage_out, info_out);
 }
 
+/* Uses the same listing open uses, so "empty" means exactly "open would
+ * name a new segment from the clock". */
+gt_status gt_storage_log_empty_ops(const gt_file_ops *ops, void *ctx, int *empty_out)
+{
+    if (ops == NULL || empty_out == NULL) {
+        return GT_ERR_INVAL;
+    }
+    char segments[GT_FILE_LIST_MAX][GT_FILE_NAME_MAX];
+    size_t segment_count = 0;
+    int marker_present = 0;   /* not needed here */
+    if (gt_storage_list_segments(ops, ctx, segments, &segment_count, &marker_present) != GT_OK) {
+        return GT_ERR_IO;
+    }
+    *empty_out = segment_count == 0;
+    return GT_OK;
+}
+
+/* The ctx is this function's own, so it is destroyed on every path. */
+gt_status gt_storage_log_empty(const char *dir, int *empty_out)
+{
+    const gt_file_ops *ops = NULL;
+    void *ctx = NULL;
+    gt_status status = gt_file_ops_linux(dir, &ops, &ctx);
+    if (status != GT_OK) {
+        return status;
+    }
+    status = gt_storage_log_empty_ops(ops, ctx, empty_out);
+    ops->destroy(ctx);
+    return status;
+}
+
 /* Everything but a malformed frame or a disconnect keeps the connection:
  * a refused record (old seq, full buffer) is storage's decision, not a
  * sign the hub is broken, so closing would only force a needless
@@ -814,6 +854,16 @@ gt_status gt_storage_resume(const gt_storage *storage, gt_resume *resume_out)
     resume_out->has_last = storage->has_last_accepted;
     resume_out->seq = storage->has_last_accepted ? storage->last_accepted_seq : 0;
     pthread_mutex_unlock(lock);
+    return GT_OK;
+}
+
+/* No lock: active_name belongs to the flushing thread (see storage.h). */
+gt_status gt_storage_active_segment(const gt_storage *storage, char name_out[GT_FILE_NAME_MAX])
+{
+    if (storage == NULL || name_out == NULL) {
+        return GT_ERR_INVAL;
+    }
+    memcpy(name_out, storage->active_name, GT_FILE_NAME_MAX);
     return GT_OK;
 }
 

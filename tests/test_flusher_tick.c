@@ -8,9 +8,10 @@
  * Every commit is logged with its count and durations (storage_commit),
  * and an fsync over 1 s also as fsync_slow (PF-08). An unsynced clock is
  * logged once per spell (clock_unsynced), and its end with the spell's
- * length (clock_synced unsynced_ms=..., PF-13). Times are passed in, so
- * nothing sleeps; uses tests/fake_file.h. Run under make test / asan /
- * memcheck. Implements FTK-01 through FTK-11.
+ * length (clock_synced unsynced_ms=..., PF-13). A rollover that keeps
+ * failing logs segment_create_error once per spell (PF-20). Times are
+ * passed in, so nothing sleeps; uses tests/fake_file.h. Run under make
+ * test / asan / memcheck. Implements FTK-01 through FTK-12.
  *
  * What these tests cannot prove: the real one-second loop and stopping it
  * (gt_flusher_run, checked in the WSL smoke run of storage_main). */
@@ -327,6 +328,33 @@ static void test_ftk11_synced_from_start_quiet(void)
     gt_storage_close(storage);
 }
 
+/* ---- FTK-12: a failing rollover is logged once per spell ----
+ * Today's segment can't be created for three passes in a row: one
+ * segment_create_error, not one a second (PF-20). The pass that succeeds
+ * logs segment_rollover, and that re-arms it: a failure on the next day
+ * is logged again. */
+static void test_ftk12_create_error_once_per_spell(void)
+{
+    gt_flusher flusher;
+    gt_storage *storage = open_with_flusher(&flusher);
+    const uint64_t day_after_us = TOMORROW_US + (uint64_t)86400u * 1000000u;
+
+    /* invariant: every pass so far found today's segment impossible to create */
+    for (int failing_pass = 0; failing_pass < 3; failing_pass++) {
+        fs.fail_open_call = fs.open_calls + 1;
+        gt_flusher_tick(&flusher, TOMORROW_US, (uint64_t)failing_pass * 1000u, 1);
+    }
+    CHECK_EQ(logged("segment_create_error"), 1);
+
+    gt_flusher_tick(&flusher, TOMORROW_US, 3000, 1);
+    CHECK_EQ(logged("segment_rollover"), 1);
+
+    fs.fail_open_call = fs.open_calls + 1;
+    gt_flusher_tick(&flusher, day_after_us, 4000, 1);
+    CHECK_EQ(logged("segment_create_error"), 2);
+    gt_storage_close(storage);
+}
+
 static const test_case_t tests[] = {
     {"FTK-01", "a pass with nothing due does nothing", test_ftk01_nothing_due},
     {"FTK-02", "a due pass commits and logs it", test_ftk02_due_pass_commits},
@@ -339,6 +367,7 @@ static const test_case_t tests[] = {
     {"FTK-09", "an unsynced clock is logged once", test_ftk09_unsynced_logged_once},
     {"FTK-10", "the end of an unsynced spell is logged", test_ftk10_synced_logs_period},
     {"FTK-11", "a clock synced from the start is quiet", test_ftk11_synced_from_start_quiet},
+    {"FTK-12", "a failing rollover is logged once", test_ftk12_create_error_once_per_spell},
 };
 
 int main(void)

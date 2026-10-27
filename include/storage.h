@@ -32,7 +32,13 @@ int       gt_is_segment_name(const char *name);
  * oldest first (alphabetical order is date order). *marker_out is 1 if
  * the clean-shutdown marker is there too. Storage, retention and the log
  * verifier all read segments in this one order. GT_OK, or GT_ERR_IO if
- * the listing fails. */
+ * the listing fails.
+ *
+ * Known limit (PF-20): the listing holds GT_FILE_LIST_MAX (128) names of
+ * every kind. .corrupt files are evidence and are never deleted, so a
+ * directory that has collected more than 128 names (about 90 corruptions
+ * beside 30 segments) fails here with GT_ERR_IO, and storage_main stops
+ * with storage_open_error. Clearing old .corrupt files by hand fixes it. */
 gt_status gt_storage_list_segments(const gt_file_ops *ops, void *ctx,
                                    char segments[GT_FILE_LIST_MAX][GT_FILE_NAME_MAX],
                                    size_t *count_out, int *marker_out);
@@ -43,6 +49,16 @@ typedef struct gt_storage gt_storage;
  * after its final flush, and open deletes. If it is missing at open, the
  * last run ended without a clean shutdown (power cut, kill -9, crash). */
 #define GT_STORAGE_MARKER_NAME "clean_shutdown"
+
+/* How many older segments open reports by name when recovery changed
+ * them during the walk back for the last seq (PF-14); more are counted. */
+#define GT_OPEN_OLDER_MAX 8
+
+/* One older segment that recovery truncated or renamed. */
+typedef struct {
+    char              name[GT_FILE_NAME_MAX];
+    gt_recover_report report;   /* outcome TRUNCATED or RENAMED */
+} gt_older_recovery;
 
 /* What gt_storage_open_ops found and did, for the caller to log
  * (unclean_shutdown, recovery_event, segment_corrupt) and to answer the
@@ -58,6 +74,12 @@ typedef struct {
     uint32_t last_seq;                       /* seq of the newest record on disk */
     uint64_t last_timestamp_us;              /* that record's timestamp: a GAP found after
                                               * this restart is stamped with it (PF-07) */
+    /* Older segments the walk back for the last seq changed, newest first
+     * (the newest segment is in `recovery` above). Clean ones are not
+     * listed. Beyond GT_OPEN_OLDER_MAX they are only counted (PF-14). */
+    size_t   older_count;
+    gt_older_recovery older[GT_OPEN_OLDER_MAX];
+    size_t   older_unlisted;
 } gt_storage_open_info;
 
 /* Counters for tests, heartbeats and the seq_resume reply. A pair of
@@ -128,6 +150,26 @@ gt_status   gt_storage_open_ops(const gt_file_ops *ops, void *ctx, uint64_t now_
 
 /* Copy the counters into *stats_out. GT_ERR_INVAL for NULL args. */
 gt_status   gt_storage_read_stats(const gt_storage *storage, gt_storage_stats *stats_out);
+
+/* *empty_out = 1 if the directory behind ops/ctx holds no segment yet (a
+ * fresh install, or only .corrupt files), else 0. Open would then name a
+ * new segment from now_us, so storage_main waits for the clock first on an
+ * unsynced Pi, rather than starting log-19700101.bin (PF-20). Touches
+ * nothing; ops/ctx stay the caller's. GT_OK, GT_ERR_IO if the listing
+ * fails, GT_ERR_INVAL for NULL ops or empty_out; *empty_out is untouched on
+ * failure. */
+gt_status   gt_storage_log_empty_ops(const gt_file_ops *ops, void *ctx, int *empty_out);
+
+/* gt_storage_log_empty_ops over the real directory `dir` (through
+ * gt_file_ops_linux, destroyed again before it returns). */
+gt_status   gt_storage_log_empty(const char *dir, int *empty_out);
+
+/* Copy the active segment's name (the file new records go to) into
+ * name_out. Rollover changes it on the flushing thread without the lock,
+ * so call this from that thread or after it has been joined; storage_main
+ * does, for its storage_stop line (PF-14). GT_ERR_INVAL for NULL args,
+ * with name_out untouched. */
+gt_status   gt_storage_active_segment(const gt_storage *storage, char name_out[GT_FILE_NAME_MAX]);
 
 /* Give storage a monotonic clock so every commit is timed (PF-08). It is
  * read three times per flush that writes: just before the write (or the
@@ -311,8 +353,11 @@ gt_status   gt_storage_flush(gt_storage *storage, unsigned *events_out);
  * retention_days 0 means GT_RETENTION_DAYS; tests pass a small number.
  *
  * Known limitation: a Pi that boots with no network time and an empty
- * log starts writing log-19700101.bin. That file is outside the window
- * at once, but the newest-N rule keeps it until N newer segments exist.
+ * log would start writing log-19700101.bin. storage_main now waits up to
+ * 120 s for the clock on an empty log (gt_storage_log_empty, PF-20), so
+ * this only happens with no network for that long. Such a file is outside
+ * the window at once, but the newest-N rule keeps it until N newer
+ * segments exist.
  *   GT_OK        done (also for "nothing to do" and RETENTION_SKIPPED). A
  *                failed delete adds RETENTION_ERROR and the rest go on:
  *                history is never at risk.

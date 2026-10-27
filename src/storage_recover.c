@@ -17,6 +17,10 @@
 #include "log_record.h"
 
 #define CORRUPT_SUFFIX ".corrupt"
+/* Copies of one segment's .corrupt file: <name>.corrupt, then
+ * <name>.2.corrupt up to <name>.99.corrupt (PF-20). */
+#define CORRUPT_COPIES_MAX     99
+#define CORRUPT_SUFFIX_LONGEST ".99.corrupt"
 
 gt_status gt_recover_scan(const uint8_t *bytes, size_t len, gt_scan_result *out)
 {
@@ -96,14 +100,55 @@ static gt_status read_whole_file(const gt_file_ops *ops, void *ctx, int handle,
     return GT_OK;
 }
 
+/* 1 if a file called `name` can be opened, i.e. it exists. */
+static int file_exists(const gt_file_ops *ops, void *ctx, const char *name)
+{
+    int handle = -1;
+    if (ops->open(ctx, name, 0, &handle) != GT_OK) {
+        return 0;
+    }
+    ops->close(ctx, handle);
+    return 1;
+}
+
+/* Set corrupt_name to <segment_name>.corrupt for copy 1, or
+ * <segment_name>.<copy>.corrupt for copies 2-99. Fits: the caller checked
+ * room for CORRUPT_SUFFIX_LONGEST. */
+static void corrupt_name_for(const char *segment_name, int copy,
+                             char corrupt_name[GT_FILE_NAME_MAX])
+{
+    strcpy(corrupt_name, segment_name);
+    if (copy > 1) {
+        char number[4] = { '.', 0, 0, 0 };
+        if (copy < 10) {
+            number[1] = (char)('0' + copy);
+        } else {
+            number[1] = (char)('0' + copy / 10);
+            number[2] = (char)('0' + copy % 10);
+        }
+        strcat(corrupt_name, number);
+    }
+    strcat(corrupt_name, CORRUPT_SUFFIX);
+}
+
 /* Move a segment with a bad header out of the way, then make the rename
  * durable: without fsync_dir a power cut could bring the bad file back
- * under its old name. */
+ * under its old name. rename() replaces an existing file, so the first
+ * free name is picked: an earlier .corrupt copy of the same segment is
+ * evidence and is never overwritten (PF-20). All 99 names taken is
+ * GT_ERR_IO. */
 static gt_status rename_corrupt(const gt_file_ops *ops, void *ctx, const char *segment_name)
 {
     char corrupt_name[GT_FILE_NAME_MAX];
-    strcpy(corrupt_name, segment_name);   /* fits: checked by the caller */
-    strcat(corrupt_name, CORRUPT_SUFFIX);
+    int copy = 1;
+    corrupt_name_for(segment_name, copy, corrupt_name);
+    /* invariant: every copy name before `copy` is already taken */
+    while (file_exists(ops, ctx, corrupt_name)) {
+        if (++copy > CORRUPT_COPIES_MAX) {
+            return GT_ERR_IO;
+        }
+        corrupt_name_for(segment_name, copy, corrupt_name);
+    }
 
     if (ops->rename(ctx, segment_name, corrupt_name) != GT_OK
         || ops->fsync_dir(ctx) != GT_OK) {
@@ -118,7 +163,7 @@ gt_status gt_storage_recover_ops(const gt_file_ops *ops, void *ctx,
                                  const char *segment_name, gt_recover_report *report_out)
 {
     if (ops == NULL || segment_name == NULL || report_out == NULL
-        || strlen(segment_name) + strlen(CORRUPT_SUFFIX) >= GT_FILE_NAME_MAX) {
+        || strlen(segment_name) + strlen(CORRUPT_SUFFIX_LONGEST) >= GT_FILE_NAME_MAX) {
         return GT_ERR_INVAL;
     }
 

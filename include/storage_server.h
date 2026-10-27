@@ -26,6 +26,15 @@ typedef void (*gt_storage_log_fn)(void *log_ctx, gt_log_level level, const char 
  * shutdown. NULL log is a no-op. */
 void gt_storage_log_events(gt_storage_log_fn log, void *log_ctx, unsigned events);
 
+/* gt_storage_log_events for the events of one received frame, except that
+ * GT_STORAGE_EV_BACKLOG is logged with the threshold it crossed and the
+ * buffer's fill, read from the stats: "storage_backlog percent=N
+ * pending=P" (DESIGN.md "storage_backlog at 50/75/90%", PF-14). The rx
+ * loop uses it. NULL storage logs storage_backlog without fields; NULL
+ * log is a no-op. */
+void gt_storage_log_rx_events(gt_storage_log_fn log, void *log_ctx, const gt_storage *storage,
+                              unsigned events);
+
 /* An fsync longer than this is logged as fsync_slow (DESIGN.md fsync_slow
  * row: "log any fsync over 1 s"). */
 #define GT_FSYNC_SLOW_US 1000000u
@@ -65,6 +74,8 @@ typedef struct {
     gt_storage_log_fn  log;
     void              *log_ctx;
     int                logged_unsynced;  /* 1 while retention_skipped has been logged */
+    int                logged_create_error;  /* 1 while segment_create_error has been
+                                              * logged and no rollover has succeeded */
     int                clock_unsynced;   /* 1 during an unsynced spell (PF-13) */
     uint64_t           unsynced_since_ms;  /* now_ms of the spell's first pass */
 } gt_flusher;
@@ -80,7 +91,9 @@ void gt_flusher_init(gt_flusher *flusher, gt_storage *storage, unsigned retentio
  * is logged too (DESIGN.md System clock row, PF-13): clock_unsynced at
  * WARN on the first unsynced pass of a spell, and clock_synced at INFO
  * with "unsynced_ms=N" (from now_ms) on the first synced pass after it.
- * A clock synced from the start logs neither. now_us is the wall clock;
+ * A clock synced from the start logs neither. segment_create_error is
+ * likewise logged once per failure spell, not on every retry; the next
+ * successful rollover re-arms it (PF-20). now_us is the wall clock;
  * now_ms the same monotonic clock appends use. NULL flusher is a no-op. */
 void gt_flusher_tick(gt_flusher *flusher, uint64_t now_us, uint64_t now_ms, int clock_synced);
 

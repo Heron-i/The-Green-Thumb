@@ -26,13 +26,13 @@ Adversarial review of branch `Menu-Mechanism-D` (Lucas's Mechanism D storage wor
 | PF-11 | The (N, T) batching experiment can't run as specified | DESIGN.md | Low | Open |
 | PF-12 | The verifier doesn't compare against the hub's sent `seq`s | DESIGN.md | Low | Open |
 | PF-13 | `clock_unsynced` / `clock_synced` are never logged | DESIGN.md | Low | Resolved (2026-10-27) |
-| PF-14 | Some log lines are missing their `key=value` fields | DESIGN.md | Low | Open |
+| PF-14 | Some log lines are missing their `key=value` fields | DESIGN.md | Low | Resolved (2026-10-27) |
 | PF-15 | Doc errors: "lux" range check, wrong decode function | [Both docs] / DESIGN.md | Low | Resolved (2026-10-26) |
 | PF-16 | Socket calls outside `src/ipc_sock.c` | Sensor-Pipeline.md | Low | Open |
 | PF-17 | Lily's Status section edited; "storage is done" overclaims | Sensor-Pipeline.md | Low | Resolved (2026-10-27) |
 | PF-18 | The log sink was chosen by one side | Sensor-Pipeline.md | Low | Open |
 | PF-19 | The Code map is out of date | Sensor-Pipeline.md | Low | Resolved (2026-10-27) |
-| PF-20 | Smaller storage edge cases | DESIGN.md | Low | Open |
+| PF-20 | Smaller storage edge cases | DESIGN.md | Low | Resolved (2026-10-27); the 1970 wait still needs an on-Pi check |
 
 Resolved since the first pass: `storage_main.c` now exists, `seq_resume` is documented in DESIGN.md, and DESIGN.md's memory budget now matches the single pending buffer (see *What meets the plans*).
 
@@ -181,6 +181,12 @@ Storage itself was correct: the feed's output file later held `seq_resume: last=
 - `storage_stop` lacks the segment and last `seq` that DESIGN.md's new text says it carries.
 - `storage_backlog` doesn't say which threshold (50/75/90%) was crossed.
 - Only the newest segment's recovery is logged, so an older segment truncated during the walk back for the last `seq` goes unreported.
+- **Resolution (2026-10-27):**
+  - **`storage_stop`:** DESIGN.md never actually said what this line carries, so the first point's premise was wrong. It was still adopted (decided 2026-10-27): `storage_stop` now has `segment=… last_seq=…` like `storage_start`. The segment comes from the new `gt_storage_active_segment` (SRO-15).
+  - **`storage_backlog`:** it now carries `percent=N pending=P`. The new `gt_storage_log_rx_events` (SLE-01 to SLE-04) does this, and the rx loop uses it.
+  - **The walk back:** the open info now lists each older segment that recovery cut or renamed (up to 8 by name, any more counted), and `storage_main` logs each as `recovery_event` / `segment_corrupt` (SOP-14, SOP-15). The walk back can rename segments as well as cut them, which the finding didn't mention.
+  - **Tests:** all new tests were seen red, then green (SLE-04 is a NULL-safety guard and passed from the start).
+  - **WSL check:** with yesterday's segment ending in 10 torn bytes and today's header-only, storage logged `recovery_event segment=log-20261026.bin bytes_removed=10 records_removed=1` at WARN, and `storage_stop` showed `segment=log-20261027.bin last_seq=4`.
 
 ### PF-15: Doc errors
 - **[Both docs]** The Hub range-check row says "light 0–65535 **lux**". Sensor-Pipeline.md says "Raw counts are stored, never lux", and its Step 7 changed this row to "raw count". Git history shows the fix was lost in merge #71 (`complete-pipe` → `main`), not by Lucas.
@@ -222,6 +228,13 @@ Storage itself was correct: the feed's output file later held `seq_resume: last=
 - **`.corrupt` files:** retention never deletes them, a second `.corrupt` of the same name silently replaces the first (`renameat`), and once the directory holds 128 names (`GT_FILE_LIST_MAX`), `gt_storage_open` fails.
 - **Rollover failure logs every second:** while a new segment can't be created, `segment_create_error` is logged on every 1 s tick.
 - **The 1970 file:** a Pi that boots with no network time and an empty log writes `log-19700101.bin` until NTP syncs (acknowledged in Lucas's *Not done yet*).
+- **Resolution (2026-10-27):**
+  - **Unique `.corrupt` names:** a second `.corrupt` copy of the same segment no longer replaces the first. Recovery picks the first free name of `<name>.corrupt`, `<name>.2.corrupt` … `<name>.99.corrupt` (SRV-12). Every name still ends in `.corrupt`, so `log_verify` counts them.
+  - **Retention and the 128-name limit:** `.corrupt` files are still never deleted (decided 2026-10-27: they are evidence). The limit is now documented in `storage.h` and DESIGN.md: more than 128 names stops storage at start with `storage_open_error`, and the fix is to clear old `.corrupt` files by hand.
+  - **`segment_create_error`:** it is now logged once per failure spell, and the next successful rollover re-arms it (FTK-12).
+  - **The 1970 file (decided 2026-10-27):** on an empty log with an unsynced clock, `storage_main` now waits up to 120 s for the clock before open names the first segment. It logs `clock_wait max_s=120`, then `clock_wait_done waited_s=N synced=0|1`. The hub's 1024-record queue covers the wait. "Empty log" comes from the new `gt_storage_log_empty` / `_ops`, which uses the same listing open uses (SOP-16, red then green).
+  - **Still possible:** with no network for the whole 120 s, it still starts a 1970 file. That stays a documented limit in `storage.h` and DESIGN.md.
+  - **Not tested yet:** the wait itself has not been seen running, because WSL's clock is always synced. It needs a check on the Pi with the network unplugged.
 
 ## What meets the plans
 
