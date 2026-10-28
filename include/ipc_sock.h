@@ -12,7 +12,8 @@
  * and overflow path with no hub and no real waiting. src/ipc_sock.c is the
  * only file that makes client-side socket system calls; servers
  * (listen_sock.c, storage_server.c) make their own and are tested over
- * real sockets (Sensor-Pipeline.md Decisions, PF-16).
+ * real sockets (Sensor-Pipeline.md Decisions, PF-16). The hub's storage
+ * sender (hub_sender.c) uses the same seam for storage.sock.
  *
  * The socket is AF_UNIX SOCK_SEQPACKET: the kernel keeps message
  * boundaries, so one send() is one whole 16 B message. Every op is
@@ -26,6 +27,16 @@ typedef struct {
      * try again later); GT_ERR_IO on EPIPE / ECONNRESET (the hub is gone:
      * disconnect and reconnect). */
     gt_status (*send)(void *ctx, const uint8_t *buf, size_t len);
+    /* Receive one whole message into buf (cap bytes, cap > 0), without
+     * waiting. GT_OK with *len_out = the message's length, or *len_out = 0
+     * when nothing has arrived yet (EAGAIN); GT_ERR_IO when the peer closed
+     * the connection (recv returns 0), reset it, or there is no connection.
+     * Only the hub's storage sender calls it, to read the 8 B seq_resume
+     * reply; the sensor client never does (Sensor-Pipeline.md, Hub
+     * contract). SEQPACKET cuts off whatever doesn't fit in buf, so pass
+     * one byte more than the expected message: a longer one then shows up
+     * as too long instead of being silently cut. */
+    gt_status (*recv)(void *ctx, uint8_t *buf, size_t cap, size_t *len_out);
     /* Close the current connection but keep ctx, so connect() can be
      * called again. Safe to call when not connected. */
     void      (*disconnect)(void *ctx);

@@ -16,7 +16,11 @@
  * How errno maps to a gt_status:
  *   connect: any failure (ENOENT: no socket file; ECONNREFUSED: file but
  *            no hub listening; EAGAIN: the hub's backlog is full) -> GT_ERR_IO
- *   send:    EAGAIN -> GT_ERR_FULL; EPIPE, ECONNRESET, anything else -> GT_ERR_IO */
+ *   send:    EAGAIN -> GT_ERR_FULL; EPIPE, ECONNRESET, anything else -> GT_ERR_IO
+ *   recv:    EAGAIN -> GT_OK with 0 bytes; peer closed (0), ECONNRESET,
+ *            anything else -> GT_ERR_IO
+ * The same file serves the hub's storage sender on storage.sock: it sends
+ * 24 B records and uses recv for the seq_resume reply. */
 #include "ipc_sock.h"
 
 #include <errno.h>
@@ -90,6 +94,37 @@ static gt_status sock_send(void *ctx, const uint8_t *buf, size_t len)
     return GT_ERR_IO;
 }
 
+/* Receive one whole message without waiting. MSG_DONTWAIT makes this one
+ * call non-blocking even on its own (the socket already is). EINTR is
+ * tried again, as in sock_send. EAGAIN means nothing has arrived yet:
+ * GT_OK with *len_out = 0, and the caller polls again later. recv()
+ * returning 0 means the peer closed the connection; that, ECONNRESET and
+ * not being connected are all GT_ERR_IO. A message longer than cap comes
+ * back cut to cap bytes (SEQPACKET), which is why callers pass one spare
+ * byte. *len_out is untouched on GT_ERR_IO. */
+static gt_status sock_recv(void *ctx, uint8_t *buf, size_t cap, size_t *len_out)
+{
+    linux_sock *sock = ctx;
+    if (sock->fd < 0) {
+        return GT_ERR_IO;
+    }
+    ssize_t received;
+    /* Repeat only while a signal interrupted the call before anything arrived. */
+    do {
+        received = recv(sock->fd, buf, cap, MSG_DONTWAIT);
+    } while (received < 0 && errno == EINTR);
+
+    if (received > 0) {
+        *len_out = (size_t)received;
+        return GT_OK;
+    }
+    if (received < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        *len_out = 0;
+        return GT_OK;
+    }
+    return GT_ERR_IO;
+}
+
 /* Close the current connection but keep the ctx and its address, so the
  * next connect makes a fresh socket. Called by the client when send says
  * the hub is gone. Safe when not connected. */
@@ -115,6 +150,7 @@ static void sock_destroy(void *ctx)
 static const gt_sock_ops linux_ops = {
     .connect    = sock_connect,
     .send       = sock_send,
+    .recv       = sock_recv,
     .disconnect = sock_disconnect,
     .destroy    = sock_destroy,
 };
