@@ -46,36 +46,71 @@ gt_status gt_file_size_linux(void *ctx, int handle, uint64_t *size_out)
     return GT_OK;
 }
 
-/* pread may return fewer bytes than asked for, so it is called until all
- * `len` bytes are in. 0 bytes back means the end of the file came first. */
+/* One whole read or write: which file, where, how much. Only one of the
+ * two buffers is set; each step function uses the one it needs, so the
+ * write side never has to cast away `const`. */
+struct transfer {
+    int handle;
+    uint64_t offset;
+    size_t len;
+    uint8_t *read_buf;          /* set for reads  */
+    const uint8_t *write_buf;   /* set for writes */
+};
+
+/* A function pointer: a variable that holds which function to call (like
+ * gt_read_fn in sampler.h). A step moves bytes [done, len) at `position`
+ * with one syscall and returns what that syscall returned. */
+typedef ssize_t (*transfer_step_fn)(const struct transfer *job, size_t done, off_t position);
+
+static ssize_t read_step(const struct transfer *job, size_t done, off_t position)
+{
+    return pread(job->handle, &job->read_buf[done], job->len - done, position);
+}
+
+static ssize_t write_step(const struct transfer *job, size_t done, off_t position)
+{
+    return pwrite(job->handle, &job->write_buf[done], job->len - done, position);
+}
+
+/* pread and pwrite may move fewer bytes than asked for, so the step is
+ * called until all `len` bytes are moved. */
+static gt_status transfer_all(const struct transfer *job, transfer_step_fn step)
+{
+    size_t done = 0;
+    /* invariant: bytes [0, done) of the buffer have been moved from offset on */
+    while (done < job->len) {
+        off_t position;
+        if (!to_off_t(job->offset + done, &position)) {
+            return GT_ERR_IO;
+        }
+        ssize_t moved = step(job, done, position);
+        if (moved < 0 && errno == EINTR) {
+            continue;
+        }
+        if (moved <= 0) {
+            /* an error; or 0 bytes: end of file on a read (a short read),
+             * and on a write it would loop forever */
+            return GT_ERR_IO;
+        }
+        done += (size_t)moved;
+    }
+    return GT_OK;
+}
+
+/* Reads exactly `len` bytes; reaching the end of the file first is a
+ * short read and fails. */
 gt_status gt_file_pread_linux(void *ctx, int handle, uint64_t offset, uint8_t *buf, size_t len)
 {
     (void)ctx;
     if (buf == NULL) {
         return GT_ERR_INVAL;
     }
-    size_t done = 0;
-    /* invariant: buf[0 .. done - 1] holds the file's bytes from offset on */
-    while (done < len) {
-        off_t position;
-        if (!to_off_t(offset + done, &position)) {
-            return GT_ERR_IO;
-        }
-        ssize_t got = pread(handle, &buf[done], len - done, position);
-        if (got < 0 && errno == EINTR) {
-            continue;
-        }
-        if (got <= 0) {
-            return GT_ERR_IO;   /* an error, or the end of the file: a short read */
-        }
-        done += (size_t)got;
-    }
-    return GT_OK;
+    struct transfer job = { .handle = handle, .offset = offset, .len = len, .read_buf = buf };
+    return transfer_all(&job, read_step);
 }
 
-/* pwrite may write fewer bytes than asked for (a "short write"), so it is
- * called until all `len` bytes are out. A failure part-way leaves the
- * bytes already written in the file: the torn write storage truncates. */
+/* Writes exactly `len` bytes. A failure part-way leaves the bytes already
+ * written in the file: the torn write storage truncates. */
 gt_status gt_file_pwrite_linux(void *ctx, int handle, uint64_t offset, const uint8_t *buf,
                                size_t len)
 {
@@ -83,23 +118,8 @@ gt_status gt_file_pwrite_linux(void *ctx, int handle, uint64_t offset, const uin
     if (buf == NULL) {
         return GT_ERR_INVAL;
     }
-    size_t done = 0;
-    /* invariant: buf[0 .. done - 1] is in the file from offset on */
-    while (done < len) {
-        off_t position;
-        if (!to_off_t(offset + done, &position)) {
-            return GT_ERR_IO;
-        }
-        ssize_t wrote = pwrite(handle, &buf[done], len - done, position);
-        if (wrote < 0 && errno == EINTR) {
-            continue;
-        }
-        if (wrote <= 0) {
-            return GT_ERR_IO;   /* 0 would loop forever, so it counts as a failure */
-        }
-        done += (size_t)wrote;
-    }
-    return GT_OK;
+    struct transfer job = { .handle = handle, .offset = offset, .len = len, .write_buf = buf };
+    return transfer_all(&job, write_step);
 }
 
 /* storage_file.c's fsync_dir uses this too, on the directory's own

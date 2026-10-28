@@ -28,6 +28,18 @@ gt_status gt_resume_encode(const gt_resume *resume, uint8_t out[GT_RESUME_SIZE])
     return GT_OK;
 }
 
+/* 1 if the reply starts with the seq_resume magic, version and type. */
+static int resume_header_ok(const uint8_t in[GT_RESUME_SIZE])
+{
+    return in[0] == GT_RESUME_MAGIC && in[1] == GT_RESUME_VERSION && in[2] == GT_RESUME_TYPE;
+}
+
+/* 1 if has_last is 1, or is 0 with seq 0 (no seq without has_last). */
+static int resume_has_last_ok(uint8_t has_last, uint32_t seq)
+{
+    return has_last == 1 || (has_last == 0 && seq == 0);
+}
+
 /* Every check runs before `resume` is written, so a rejected reply leaves
  * it exactly as it was. Each byte is widened to uint32_t before shifting,
  * so a shift by 24 can't overflow an int. */
@@ -38,8 +50,7 @@ gt_status gt_resume_decode(const uint8_t in[GT_RESUME_SIZE], gt_resume *resume)
     }
     uint32_t seq = (uint32_t)in[4] | ((uint32_t)in[5] << 8)
                  | ((uint32_t)in[6] << 16) | ((uint32_t)in[7] << 24);
-    if (in[0] != GT_RESUME_MAGIC || in[1] != GT_RESUME_VERSION || in[2] != GT_RESUME_TYPE
-        || in[3] > 1 || (in[3] == 0 && seq != 0)) {
+    if (!resume_header_ok(in) || !resume_has_last_ok(in[3], seq)) {
         return GT_ERR_CORRUPT;
     }
     resume->has_last = in[3];

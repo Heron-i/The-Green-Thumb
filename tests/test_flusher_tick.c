@@ -76,7 +76,9 @@ static gt_storage *open_with_flusher(gt_flusher *flusher)
 {
     const gt_file_ops *ops = fake_fs_ops(&fs);
     gt_storage *storage = NULL;
-    CHECK_EQ(gt_storage_open_ops(ops, &fs, TODAY_US, TEST_CAPACITY, &storage, NULL), GT_OK);
+    gt_storage_open_args args = { .ops = ops, .ctx = &fs, .now_us = TODAY_US,
+                                  .pending_capacity = TEST_CAPACITY };
+    CHECK_EQ(gt_storage_open_ops(&args, &storage, NULL), GT_OK);
     memset(&book, 0, sizeof book);
     gt_flusher_init(flusher, storage, 3, record_log, &book);
     return storage;

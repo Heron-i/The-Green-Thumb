@@ -52,7 +52,9 @@ static void put_old_segment(const char *name)
 static gt_storage *open_today(const gt_file_ops *ops)
 {
     gt_storage *storage = NULL;
-    CHECK_EQ(gt_storage_open_ops(ops, &fs, TODAY_US, TEST_CAPACITY, &storage, NULL), GT_OK);
+    gt_storage_open_args args = { .ops = ops, .ctx = &fs, .now_us = TODAY_US,
+                                  .pending_capacity = TEST_CAPACITY };
+    CHECK_EQ(gt_storage_open_ops(&args, &storage, NULL), GT_OK);
     return storage;
 }
 

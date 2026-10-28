@@ -59,7 +59,9 @@ static gt_storage *open_storage(uint32_t last_on_disk)
                              GT_SEG_HEADER_SZ + last_on_disk * GT_REC_SIZE), GT_OK);
     }
     gt_storage *storage = NULL;
-    CHECK_EQ(gt_storage_open_ops(ops, &fs, TODAY_US, TEST_CAPACITY, &storage, NULL), GT_OK);
+    gt_storage_open_args args = { .ops = ops, .ctx = &fs, .now_us = TODAY_US,
+                                  .pending_capacity = TEST_CAPACITY };
+    CHECK_EQ(gt_storage_open_ops(&args, &storage, NULL), GT_OK);
     return storage;
 }
 

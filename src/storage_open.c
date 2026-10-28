@@ -222,13 +222,15 @@ static gt_status open_active(gt_storage *storage, const char *name, int create, 
     return GT_OK;
 }
 
-gt_status gt_storage_open_ops(const gt_file_ops *ops, void *ctx, uint64_t now_us,
-                              size_t pending_capacity, gt_storage **storage_out,
+gt_status gt_storage_open_ops(const gt_storage_open_args *args, gt_storage **storage_out,
                               gt_storage_open_info *info_out)
 {
-    if (ops == NULL) {
+    if (args == NULL || args->ops == NULL) {
         return GT_ERR_INVAL;   /* no destroy to call: the caller keeps ctx */
     }
+    const gt_file_ops *ops = args->ops;
+    void *ctx = args->ctx;
+    uint64_t now_us = args->now_us;
     char today[GT_FILE_NAME_MAX];
     if (storage_out == NULL || gt_segment_name(now_us, today) != GT_OK) {
         ops->destroy(ctx);
@@ -236,7 +238,7 @@ gt_status gt_storage_open_ops(const gt_file_ops *ops, void *ctx, uint64_t now_us
     }
 
     gt_storage *storage = NULL;
-    gt_status status = alloc_storage(ops, ctx, pending_capacity, &storage);
+    gt_status status = alloc_storage(ops, ctx, args->pending_capacity, &storage);
     if (status != GT_OK) {
         return status;   /* alloc_storage already destroyed ctx */
     }
@@ -289,7 +291,8 @@ gt_status gt_storage_open(const char *dir, uint64_t now_us, gt_storage **storage
     if (status != GT_OK) {
         return status;
     }
-    return gt_storage_open_ops(ops, ctx, now_us, 0, storage_out, info_out);
+    gt_storage_open_args args = { .ops = ops, .ctx = ctx, .now_us = now_us, .pending_capacity = 0 };
+    return gt_storage_open_ops(&args, storage_out, info_out);
 }
 
 void gt_storage_close(gt_storage *storage)

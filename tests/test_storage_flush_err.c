@@ -43,7 +43,9 @@ static gt_storage *open_with_records(uint32_t record_count)
 {
     const gt_file_ops *ops = fake_fs_ops(&fs);
     gt_storage *storage = NULL;
-    CHECK_EQ(gt_storage_open_ops(ops, &fs, TODAY_US, TEST_CAPACITY, &storage, NULL), GT_OK);
+    gt_storage_open_args args = { .ops = ops, .ctx = &fs, .now_us = TODAY_US,
+                                  .pending_capacity = TEST_CAPACITY };
+    CHECK_EQ(gt_storage_open_ops(&args, &storage, NULL), GT_OK);
     /* invariant: records 1 .. seq - 1 are pending */
     for (uint32_t seq = 1; seq <= record_count; seq++) {
         uint8_t wire[GT_REC_SIZE];
