@@ -402,7 +402,8 @@ static inline void fake_fs_destroy(void *ctx)
 }
 
 /* Reset `fs` and return the ops that route every call to it. Pass `fs`
- * itself as the ctx: gt_storage_open_ops(fake_fs_ops(&fs), &fs, ...). */
+ * itself as the ctx: { .ops = fake_fs_ops(&fs), .ctx = &fs, ... } in the
+ * gt_storage_open_args handed to gt_storage_open_ops. */
 static inline const gt_file_ops *fake_fs_ops(fake_fs *fs)
 {
     static const gt_file_ops ops = {

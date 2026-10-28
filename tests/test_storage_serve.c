@@ -118,7 +118,9 @@ static int start_server(server *running, uint32_t last_on_disk)
         CHECK_EQ(fake_fs_put(&fs, TODAY_NAME, segment,
                              GT_SEG_HEADER_SZ + last_on_disk * GT_REC_SIZE), GT_OK);
     }
-    if (gt_storage_open_ops(ops, &fs, TODAY_US, TEST_CAPACITY, &running->storage, NULL) != GT_OK) {
+    gt_storage_open_args args = { .ops = ops, .ctx = &fs, .now_us = TODAY_US,
+                                  .pending_capacity = TEST_CAPACITY };
+    if (gt_storage_open_ops(&args, &running->storage, NULL) != GT_OK) {
         return 0;
     }
     strcpy(running->dir, "/tmp/gt-ssv-XXXXXX");
@@ -343,7 +345,9 @@ static void test_ssv07_bad_args(void)
 {
     gt_storage *storage = NULL;
     const gt_file_ops *ops = fake_fs_ops(&fs);
-    CHECK_EQ(gt_storage_open_ops(ops, &fs, TODAY_US, TEST_CAPACITY, &storage, NULL), GT_OK);
+    gt_storage_open_args args = { .ops = ops, .ctx = &fs, .now_us = TODAY_US,
+                                  .pending_capacity = TEST_CAPACITY };
+    CHECK_EQ(gt_storage_open_ops(&args, &storage, ), );
 
     CHECK_EQ(gt_storage_serve(NULL, 3, 4, record_log, &book), GT_ERR_INVAL);
     CHECK_EQ(gt_storage_serve(storage, -1, 4, record_log, &book), GT_ERR_INVAL);

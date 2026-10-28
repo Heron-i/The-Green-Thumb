@@ -41,7 +41,9 @@ static void make_wire(uint8_t wire[GT_REC_SIZE], uint32_t seq)
 static gt_storage *open_storage(const gt_file_ops *ops, gt_storage_open_info *info)
 {
     gt_storage *storage = NULL;
-    CHECK_EQ(gt_storage_open_ops(ops, &fs, TODAY_US, TEST_CAPACITY, &storage, info), GT_OK);
+    gt_storage_open_args args = { .ops = ops, .ctx = &fs, .now_us = TODAY_US,
+                                  .pending_capacity = TEST_CAPACITY };
+    CHECK_EQ(gt_storage_open_ops(&args, &storage, ), );
     return storage;
 }
 
@@ -221,7 +223,9 @@ static void test_scl08_marker_delete_failure(void)
     put_earlier_run(2, 1);
     fs.fail_fsync_dir_call = 1;   /* the only fsync_dir: today's segment is reused */
 
-    CHECK_EQ(gt_storage_open_ops(ops, &fs, TODAY_US, TEST_CAPACITY, &storage, NULL), GT_ERR_IO);
+    gt_storage_open_args args = { .ops = ops, .ctx = &fs, .now_us = TODAY_US,
+                                  .pending_capacity = TEST_CAPACITY };
+    CHECK_EQ(gt_storage_open_ops(&args, &storage, ), );
     CHECK(storage == NULL);
     CHECK_EQ(fs.destroy_calls, 1);
     CHECK_EQ(fake_fs_open_handles(&fs), 0);

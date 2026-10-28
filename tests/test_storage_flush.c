@@ -48,7 +48,9 @@ static void make_wire(uint8_t wire[GT_REC_SIZE], uint32_t seq)
 static gt_storage *open_storage(const gt_file_ops *ops, size_t capacity)
 {
     gt_storage *storage = NULL;
-    CHECK_EQ(gt_storage_open_ops(ops, &fs, TODAY_US, capacity, &storage, NULL), GT_OK);
+    gt_storage_open_args args = { .ops = ops, .ctx = &fs, .now_us = TODAY_US,
+                                  .pending_capacity = capacity };
+    CHECK_EQ(gt_storage_open_ops(&args, &storage, NULL), GT_OK);
     return storage;
 }
 
