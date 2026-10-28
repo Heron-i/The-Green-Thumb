@@ -126,6 +126,9 @@ In the worst case a read makes 1 try + 3 retries with 3 × 10 ms gaps, so it wai
 - **Any send result other than OK or FULL counts as the hub gone** (Step 19): disconnect, report `GT_IPC_EV_DISCONNECT` and retry after the wait. Both failure paths (a failed connect and a lost hub) share `schedule_retry`, so the wait doubles the same way for each.
 - **Order moved to fit the link** (decided 2026-10-24). Every test binary links every file in `src/`, so nothing in `src/` may call a function that doesn't exist yet. `gt_ipc_client_open` calls `gt_ipc_sock_linux`, so it moved from Step 16 to Step 22, and its tests ICO-03/04 moved from Step 15 to Step 21. ICC-03 needs `send` to leave a frame in the ring, so it moved from Step 17 to Step 18.
 - **One listener per socket, enforced by a lock** (decided 2026-10-24). A process that listens on a socket (`hub_listen` now; the hub and storage later) first takes an `fcntl` write lock on `<socket>.lock` and holds it for its whole life. Only the lock holder may remove a leftover socket file and bind a new one; a second copy prints `already running` and exits without touching anything. The kernel drops the lock when the holder dies, `kill -9` included, so a crash never leaves a stale lock. This is safer than probing with `connect()`, which leaves a gap: two copies started together could both see the file as stale, and the second would take the first one's address. Closing *any* fd the process holds on the lock file releases the lock, so the file is opened in one place only. When the hub is written, this moves into a shared `src/` helper; testing it needs `fork()`, because a process never blocks on its own `fcntl` lock.
+- **Hub range check for soil rejects only `0xFFFF`** (decided 2026-10-27). That is the seesaw's error code; every other raw count is stored, so an open-air or very wet reading is kept and flagged rather than dropped. It sits behind `GT_HUB_SOIL_RAW_MAX` (`0xFFFE`), which Lucas can tighten once the soil driver exists. Light stays 0–65535. The nominal 200–2000 range was rejected: readings just outside it would be lost.
+- **A sensor restart is logged, not turned into a GAP** (decided 2026-10-27). When a sensor's new connection starts with a counter below the one expected (the process restarted and its counter went back to 0), the hub logs `sensor_restart last_seen_us=… first_us=…` and writes no GAP record. The hub can't know how many readings the dead process lost, so any count would be made up; the two timestamps show the hole. A GAP with count 0 and one with a count estimated from the elapsed time were both rejected.
+- **The hub is built before `light_sensor_main.c`** (decided 2026-10-27). The hub steps are H1–H9 and the light process is H10 (*Hub steps*), so the last step runs sensor → hub → storage end to end.
 - **The socket seam is for clients; servers call the socket API directly** (decided 2026-10-27, PF-16). Clients (`gt_ipc_client`, and later the hub's hop-2 sender) go through `gt_sock_ops`, because their backoff, ring and resume logic is worth testing against a fake with no real waiting. Servers (`listen_sock.c`, `storage_server.c`, and later the hub's rx loop) call `socket` / `bind` / `listen` / `accept` / `recv` / `send` themselves and are tested over real sockets in a `/tmp` directory (LBD, SSV, and later the hub loopback). A server loop is mostly "wait in `poll()`, then hand the bytes on", which a real socket tests well. A server-side seam with its own fake was rejected: it would add an ops table and a second fake to test very little logic.
 
 ## Wire format: sensor → hub message (16 B, little-endian, encoded byte by byte)
@@ -200,7 +203,7 @@ gt_status (*recv)(void *ctx, uint8_t *buf, size_t cap, size_t *len_out);
 - **API shape:** `gt_hub_sender_open_ops(ops, ctx)` (doesn't connect; owns the ctx as the client does), `gt_hub_sender_push(sender, const gt_record *unstamped, now_ms)` → OK / FULL / INVAL, `gt_hub_sender_pump(sender, now_ms)` → event flags, `gt_hub_sender_close`, and a stats getter (queued, refused, `next_seq`, `has_own`).
 
 ### Test prefixes (reserved; none collide with the existing ones)
-`NSQ` next seq (fresh, running, empty log, reply ahead of the counter, NULL), `HAC` hub accept (fields, `seq` left 0, timestamp), `HSO` sender open/close, `HSR` resume wait (deadline, bad reply, IO, nothing sent before the reply), `HSS` sending (stamp on OK only, FULL keeps the head, IO keeps the head, the counter survives a reconnect), `HSQ` queue full and GAP, `HSL` loopback against `gt_storage_serve` over a real socket (a storage restart in the middle leaves a GAP for a running sender and none after a SIGTERM).
+`NSQ` next seq (fresh, running, empty log, reply ahead of the counter, NULL), `HAC` hub accept (fields, `seq` left 0, timestamp), `HSO` sender open/close, `HSR` resume wait (deadline, bad reply, IO, nothing sent before the reply), `HSS` sending (stamp on OK only, FULL keeps the head, IO keeps the head, the counter survives a reconnect), `HSQ` queue full and GAP, `HSL` loopback against `gt_storage_serve` over a real socket (a storage restart in the middle leaves a GAP for a running sender and none after a SIGTERM). Added 2026-10-27 with *Hub steps*: `HTO` hub timeouts, `HEV` hub event names, `HRX` hub rx loop over real sockets, `LLP` light process loop.
 
 ### Follow-ups this contract creates
 - **DESIGN.md:** done 2026-10-26. The Hub → storage rows, the hub-queue budget and *At what rate* now say a record gets its `seq` + CRC when it is sent.
@@ -542,6 +545,48 @@ This completes rung 5 end to end: the driver detects the failure, the tracker tu
 - **Hub implementation:** `gt_hub_accept` validates a message, stamps the receive time, and builds the unstamped `gt_record` it queues (`seq` + CRC are added at send; see *Hub contract (hop 2)*). The hub process then replaces `hub_listen`, and the on-Pi rungs of the IPC ladder (see *Verification*) are run again against it.
 - **Hop 2 sender (hub → `storage.sock`):** uses the `ipc_sock` seam with a new `recv` op to read `seq_resume`, and sends 24 B records from its own 1024-record queue (DESIGN.md: hub queue, about 17 min). It is not the 16 B `gt_ipc_client`, whose ring holds messages. Its states and API are in *Hub contract (hop 2)*.
 - **`src/light_sensor_main.c`:** sampler at 1000 ms + health tracker + IPC client, plus a heartbeat to `sup.sock`. Log lines go to stderr (*Decisions*, PF-18) with wall-clock timestamps.
+
+### Hub steps (H1–H10)
+Planned 2026-10-27. These build *Hub contract (hop 2)* plus the hub's receive side, its process main and the light process. The workflow is the same as above: tests first, one function or one test case per write.
+
+**Two clocks:** records are stamped with the wall clock (µs) and timeouts and backoff use the monotonic clock (ms). Both are passed in one struct, so no hub function takes more than 5 parameters:
+```c
+typedef struct { uint64_t wall_us; uint64_t mono_ms; } gt_hub_clock;
+```
+
+**`gt_hub_accept(hub, conn_id, message, now, result)`** (pure logic, `src/hub.c`):
+- `conn_id` is a number the rx loop gives each accepted connection, counting up. It isn't the fd, because fds are reused after `close`.
+- `result` holds the unstamped `gt_record`, `has_record`, the event flags, and the numbers the log lines need (`expected_counter`, `last_seen_us`).
+- Value out of range → `GT_ERR_CORRUPT` + `reading_invalid`, and nothing is queued.
+- Same connection, counter below the expected one → dropped (`ipc_duplicate`, no record).
+- Counter above the expected one → queued, and `sensor_seq_gap` is logged.
+- A new `conn_id` for a sensor → `NEW_CLIENT`, and the rx loop closes any older connection for it (`sensor_duplicate_client`). If the counter went back, it's also `sensor_restart` (log only, *Decisions*).
+- A sensor's GAP message → a GAP record stamped with that sensor's last DATA receive time (the earliest the gap could have started, as in PF-07), or now if there is none. The next expected counter is `counter + value`.
+- The first message from a stale sensor → `sensor_resumed`.
+
+**`gt_hub_check_timeouts(hub, now_ms)`** returns a bitmask of the sensors that just went stale (3 s light, 180 s soil). The timers start when the hub is created, so a sensor that never connects is reported once.
+
+**The rx loop `gt_hub_serve`** (a server, so it uses real sockets, PF-16):
+- `poll()` waits on the listener, up to 8 sensor connections and `stop_fd`, with a 100 ms timeout.
+- Each frame: `gt_ipc_frame_decode` → `gt_hub_accept` → `gt_hub_sender_push`.
+- Every pass: check timeouts, then pump the sender.
+
+**`hub_main HUB_SOCK STORAGE_SOCK`:**
+- The lock and bind on `hub.sock`, and log lines to stderr.
+- On SIGTERM it drains the queue for up to 1 s, then logs `hub_stop sent=N first_seq=A last_seq=B dropped=Q`, which is the range `log_verify --sent A..B` takes (PF-12).
+
+| Step | What | Tests |
+|---|---|---|
+| H1 | Socket seam gains `recv` (`ipc_sock.h`, `ipc_sock.c`, `fake_sock.h`: scripted replies, sent frames up to 24 B, `expected_len` with 0 meaning 16) | build green, existing tests unchanged, scratchpad smoke test |
+| H2 | `hub.h` rewrite, `src/hub.c`: create, destroy, `gt_hub_accept` | `HAC` |
+| H3 | Timeouts and event names | `HTO`, `HEV` |
+| H4 | `hub_sender.h`, open/close, waiting for `seq_resume` | `HSO`, `HSR` |
+| H5 | Sending: stamp on OK only, counter kept across reconnects | `HSS` |
+| H6 | Queue full and the GAP | `HSQ` |
+| H7 | Sender loopback against the real `gt_storage_serve`; `gt_hub_sender_open(path)` | `HSL` |
+| H8 | `gt_hub_serve`, then `src/hub_main.c` and its Makefile target | `HRX` |
+| H9 | WSL end to end with `kill -9` of the hub and storage; `log_verify --sent A..B` from `hub_stop`; docs | — |
+| H10 | `src/light_sensor_main.c`, with its loop in a testable `src/light_loop.c` | `LLP` |
 
 ## Files
 - **Done (Step 0):** `include/i2c_bus.h`, `src/i2c_bus.c`, `include/light_sensor.h`, `src/light_sensor.c`, `src/light_probe_main.c`, `tests/check.h`, `tests/fake_i2c.h`, `tests/test_light_{open,read,close}.c`
