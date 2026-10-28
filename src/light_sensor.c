@@ -27,6 +27,21 @@ static gt_status send_cmd(gt_light_sensor *s, uint8_t op)
     return s->bus.ops->write(s->bus.ctx, &op, 1);
 }
 
+/* The init sequence: power on, reset the data register, start continuous
+ * high-res mode, then wait one worst-case conversion so the next read
+ * returns real data. Stops at the first NACKed command (GT_ERR_IO) without
+ * waiting. Shared by open and reinit; closes nothing. */
+static gt_status init_chip(gt_light_sensor *s)
+{
+    if (send_cmd(s, GT_BH1750_POWER_ON) != GT_OK ||
+        send_cmd(s, GT_BH1750_RESET) != GT_OK ||
+        send_cmd(s, GT_BH1750_CONT_HRES) != GT_OK) {
+        return GT_ERR_IO;
+    }
+    s->bus.ops->sleep_ms(s->bus.ctx, GT_BH1750_MEAS_MAX_MS);
+    return GT_OK;
+}
+
 /* Open the BH1750 on the Linux bus `i2c_dev` at GT_LIGHT_I2C_ADDR.
  * Returns NULL if the bus cannot be opened or the device does not respond. */
 gt_light_sensor *gt_light_open(const char *i2c_dev)
@@ -38,10 +53,9 @@ gt_light_sensor *gt_light_open(const char *i2c_dev)
     return gt_light_open_bus(bus);
 }
 
-/* Initialise the device on an already-open bus: power on, reset the data
- * register, start continuous high-res mode, then wait one worst-case
- * conversion so the first read returns real data. The power-on write is the
- * first point where a missing device shows up (no ACK -> GT_ERR_IO).
+/* Initialise the device on an already-open bus (init_chip), so the first
+ * read returns real data. The power-on write is the first point where a
+ * missing device shows up (no ACK -> GT_ERR_IO).
  * Takes ownership of `bus`: on any failure the bus is closed and NULL is
  * returned, so the caller never has to clean up. */
 gt_light_sensor *gt_light_open_bus(gt_i2c_bus bus)
@@ -57,16 +71,22 @@ gt_light_sensor *gt_light_open_bus(gt_i2c_bus bus)
     }
     s->bus = bus;
 
-    if (send_cmd(s, GT_BH1750_POWER_ON) != GT_OK ||
-        send_cmd(s, GT_BH1750_RESET) != GT_OK ||
-        send_cmd(s, GT_BH1750_CONT_HRES) != GT_OK) {
+    if (init_chip(s) != GT_OK) {
         bus.ops->close(bus.ctx);
         free(s);
         return NULL;
     }
-
-    bus.ops->sleep_ms(bus.ctx, GT_BH1750_MEAS_MAX_MS);
     return s;
+}
+
+/* Re-run init_chip on an open sensor (see light_sensor.h). The bus stays
+ * open on failure: the sensor is still the caller's to probe or close. */
+gt_status gt_light_reinit(gt_light_sensor *s)
+{
+    if (s == NULL) {
+        return GT_ERR_INVAL;
+    }
+    return init_chip(s);
 }
 
 /* Read the latest measurement as a raw 16-bit count into `raw_out`.
