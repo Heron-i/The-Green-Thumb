@@ -163,6 +163,70 @@ gt_status gt_hub_accept(gt_hub *hub, uint32_t conn_id, const gt_msg *message,
     return status;
 }
 
+/* Mark each sensor that has been quiet for its timeout as stale and
+ * report it once (see hub.h). A stale sensor is skipped until its next
+ * message clears `stale` (note_message), so one quiet spell gives one
+ * report. The `now_ms >= last_seen_ms` test comes first because the
+ * subtraction is unsigned: an earlier now_ms would wrap to a huge
+ * number and look like a timeout. */
+unsigned gt_hub_check_timeouts(gt_hub *hub, uint64_t now_ms)
+{
+    if (hub == NULL) {
+        return 0;
+    }
+    unsigned timed_out = 0;
+    /* Invariant: every sensor before sensor_id has been checked, and each
+     * one that just went quiet is now stale with its bit in timed_out. */
+    for (unsigned sensor_id = GT_SENSOR_LIGHT; sensor_id <= GT_SENSOR_SOIL; sensor_id++) {
+        sensor_track *track = &hub->sensors[sensor_id];
+        uint64_t timeout_ms = sensor_id == GT_SENSOR_LIGHT ? GT_HUB_LIGHT_TIMEOUT_MS
+                                                           : GT_HUB_SOIL_TIMEOUT_MS;
+        if (!track->stale && now_ms >= track->last_seen_ms &&
+            now_ms - track->last_seen_ms >= timeout_ms) {
+            track->stale = 1;
+            timed_out |= 1u << sensor_id;
+        }
+    }
+    return timed_out;
+}
+
+/* One row per GT_HUB_EV_* flag: the log name DESIGN.md's Hub rows use and
+ * its level. Problems with the data (invalid, duplicate, lost, restarted,
+ * quiet) are WARN; a sensor connecting or coming back is INFO. */
+typedef struct {
+    unsigned     flag;
+    gt_hub_event event;
+} hub_event_row;
+
+static const hub_event_row HUB_EVENT_TABLE[] = {
+    { GT_HUB_EV_READING_INVALID, { "reading_invalid",  GT_LOG_WARN } },
+    { GT_HUB_EV_DUPLICATE,       { "ipc_duplicate",    GT_LOG_WARN } },
+    { GT_HUB_EV_SEQ_GAP,         { "sensor_seq_gap",   GT_LOG_WARN } },
+    { GT_HUB_EV_NEW_CLIENT,      { "sensor_connected", GT_LOG_INFO } },
+    { GT_HUB_EV_SENSOR_RESTART,  { "sensor_restart",   GT_LOG_WARN } },
+    { GT_HUB_EV_RESUMED,         { "sensor_resumed",   GT_LOG_INFO } },
+    { GT_HUB_EV_TIMEOUT,         { "sensor_timeout",   GT_LOG_WARN } },
+};
+
+/* An exact match against one row's flag also rules out 0 and any word
+ * with two bits set, since every row has exactly one bit (as in
+ * gt_storage_event_describe). */
+gt_status gt_hub_event_describe(unsigned flag, gt_hub_event *out)
+{
+    if (out == NULL) {
+        return GT_ERR_INVAL;
+    }
+    size_t row_count = sizeof HUB_EVENT_TABLE / sizeof HUB_EVENT_TABLE[0];
+    /* Invariant: no row before row_index has this flag. */
+    for (size_t row_index = 0; row_index < row_count; row_index++) {
+        if (HUB_EVENT_TABLE[row_index].flag == flag) {
+            *out = HUB_EVENT_TABLE[row_index].event;
+            return GT_OK;
+        }
+    }
+    return GT_ERR_INVAL;
+}
+
 /* The hub owns no other memory, so this is just free(). NULL is a no-op
  * (free(NULL) is defined to do nothing). */
 void gt_hub_destroy(gt_hub *hub)

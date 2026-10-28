@@ -2,6 +2,7 @@
 #define HUB_H
 
 #include <stdint.h>
+#include "gt_log.h"
 #include "ipc.h"
 #include "log_record.h"
 
@@ -45,6 +46,23 @@
                                           * sensor_restart, log only, no GAP */
 #define GT_HUB_EV_RESUMED         0x20u  /* first message after a timeout:
                                           * sensor_resumed */
+#define GT_HUB_EV_TIMEOUT         0x40u  /* never in a result: names the
+                                          * sensor_timeout line the rx loop
+                                          * logs for each bit
+                                          * gt_hub_check_timeouts returns */
+
+/* How the rx loop logs one GT_HUB_EV_* flag (DESIGN.md failure-mode table,
+ * Hub rows). A NEW_CLIENT is logged as sensor_connected. */
+typedef struct {
+    const char  *name;    /* the log event name, never containing a space */
+    gt_log_level level;
+} gt_hub_event;
+
+/* Describe exactly one flag. GT_ERR_INVAL for 0, an unknown bit, more than
+ * one bit set, or NULL out; *out is untouched on failure. The rx loop logs
+ * an events word by describing each set bit in turn (as storage does with
+ * gt_storage_event_describe). */
+gt_status gt_hub_event_describe(unsigned flag, gt_hub_event *out);
 
 /* The two clocks the hub reads, passed together. wall_us (CLOCK_REALTIME,
  * us since the epoch) is stamped into records; mono_ms (CLOCK_MONOTONIC)
@@ -96,10 +114,12 @@ gt_hub   *gt_hub_create(uint64_t now_ms);
 gt_status gt_hub_accept(gt_hub *hub, uint32_t conn_id, const gt_msg *message,
                         const gt_hub_clock *now, gt_hub_result *result);
 
-/* Last-seen check (built in H3). Returns a bit mask with bit (1u <<
- * sensor_id) set for each sensor that has just gone quiet: nothing for
- * GT_HUB_LIGHT_TIMEOUT_MS / GT_HUB_SOIL_TIMEOUT_MS. A sensor is reported
- * once per quiet spell; its next message brings GT_HUB_EV_RESUMED. */
+/* Last-seen check, called on every pass of the rx loop. Returns a bit mask
+ * with bit (1u << sensor_id) set for each sensor that has just gone quiet:
+ * no message for at least GT_HUB_LIGHT_TIMEOUT_MS / GT_HUB_SOIL_TIMEOUT_MS
+ * of now_ms (monotonic). A sensor is reported once per quiet spell; its
+ * next message brings GT_HUB_EV_RESUMED and starts a new spell. 0 for a
+ * NULL hub. */
 unsigned  gt_hub_check_timeouts(gt_hub *hub, uint64_t now_ms);
 
 /* Free the hub. NULL is a no-op. */
