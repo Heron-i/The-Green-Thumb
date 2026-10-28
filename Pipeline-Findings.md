@@ -13,9 +13,9 @@ Adversarial review of branch `Menu-Mechanism-D` (Lucas's Mechanism D storage wor
 
 | ID | Finding | Contradicts | Severity | Status |
 |---|---|---|---|---|
-| PF-01 | The hub can't stamp `seq` when a message arrives | [Both docs] [Breaks plan] | High | Decided in docs; hub not built |
-| PF-02 | The hop-2 sender can't reuse the `ipc_sock` seam | Sensor-Pipeline.md [Breaks plan] | High | Decided in docs; seam not changed |
-| PF-03 | A storage `kill -9` loses records with no trace in the log | [Both docs] | High | Decided in docs; `gt_next_seq`, `storage_feed` and the fault rounds follow it; hub sender not built |
+| PF-01 | The hub can't stamp `seq` when a message arrives | [Both docs] [Breaks plan] | High | Resolved (2026-10-28): hub built to the decision |
+| PF-02 | The hop-2 sender can't reuse the `ipc_sock` seam | Sensor-Pipeline.md [Breaks plan] | High | Resolved (2026-10-28): seam gained `recv`; sender built |
+| PF-03 | A storage `kill -9` loses records with no trace in the log | [Both docs] | High | Resolved (2026-10-28): the hub sender follows it; seen end to end in WSL |
 | PF-04 | `storage_faults.sh` fails every round | Tooling (confirmed by a run) | High | Resolved (2026-10-26) |
 | PF-05 | `kill9` rounds verify the log before recovery has run | Tooling (plausible) | Medium | Resolved (2026-10-26) |
 | PF-06 | Records from the end of a day go into the next day's segment | DESIGN.md | Medium | Resolved (2026-10-26) |
@@ -24,7 +24,7 @@ Adversarial review of branch `Menu-Mechanism-D` (Lucas's Mechanism D storage wor
 | PF-09 | DESIGN.md describes disk-full and read-only handling as done | DESIGN.md | Medium | Resolved in docs (2026-10-26); handling not built |
 | PF-10 | Storage heartbeat: not built, and DESIGN.md disagrees with itself | DESIGN.md | Medium | Proposed in docs (2026-10-27); pending Lucas |
 | PF-11 | The (N, T) batching experiment can't run as specified | DESIGN.md | Low | Resolved (2026-10-27); the experiment itself is not run yet |
-| PF-12 | The verifier doesn't compare against the hub's sent `seq`s | DESIGN.md | Low | Resolved (2026-10-27); the hub's sent-range line comes with the hub |
+| PF-12 | The verifier doesn't compare against the hub's sent `seq`s | DESIGN.md | Low | Resolved (2026-10-27); the hub's `hub_stop` sent range added 2026-10-28 |
 | PF-13 | `clock_unsynced` / `clock_synced` are never logged | DESIGN.md | Low | Resolved (2026-10-27) |
 | PF-14 | Some log lines are missing their `key=value` fields | DESIGN.md | Low | Resolved (2026-10-27) |
 | PF-15 | Doc errors: "lux" range check, wrong decode function | [Both docs] / DESIGN.md | Low | Resolved (2026-10-26) |
@@ -52,7 +52,7 @@ These three come from the same change: on every connect, storage now sends the h
   - **Where it's written:**
     - Sensor-Pipeline.md: the new *Hub contract (hop 2)* section, a Decisions bullet, an amendment note on the 2026-10-23 hop-2 Decision, and the *Later* bullets.
     - DESIGN.md: both Hub → storage rows, the hub-queue budget row, and *At what rate*.
-  - **Still to do:** rewrite the `gt_hub_accept` comment in `include/hub.h` when the hub steps start.
+  - ~~**Still to do:** rewrite the `gt_hub_accept` comment in `include/hub.h` when the hub steps start.~~ **Done (2026-10-28, hub step H2):** `include/hub.h` now says the record leaves accept with `seq` 0, and `src/hub.c` builds it that way (HAC-01).
 
 ### PF-02: The hop-2 sender can't reuse the `ipc_sock` seam [Breaks plan]
 - **Sensor-Pipeline.md** (*Later*): the sender "reuses the `ipc_sock` seam to send 24 B records".
@@ -63,7 +63,7 @@ These three come from the same change: on every connect, storage now sends the h
   - **The seam:** `gt_sock_ops` gains a non-blocking `recv` op. It returns 0 bytes when nothing is waiting and `GT_ERR_IO` when the peer has closed.
   - **The sender:** it gets an `AWAITING_RESUME` state between DISCONNECTED and SENDING, and sends nothing until the reply arrives. A reply that doesn't come within 2 s, or a bad one, means disconnect and retry with backoff.
   - **Where it's written:** in Sensor-Pipeline.md's *Hub contract (hop 2)*: the state diagram, the API sketch (`hub_sender.h`), the `fake_sock.h` additions and the reserved test prefixes (`HSO`, `HSR`, `HSS`, `HSQ`, `HSL`).
-  - **Still to do:** the header, fake and sender, test first.
+  - ~~**Still to do:** the header, fake and sender, test first.~~ **Done (2026-10-28, hub steps H1 and H4–H7):** the seam's `recv` op (`ipc_sock.h`, `ipc_sock.c`, `fake_sock.h`) and `src/hub_sender.c` with its three states, test first (HSO, HSR, HSS, HSQ, HSL). HSL runs the sender against the real `gt_storage_serve`, so the real `recv` reads the real reply.
 
 ### PF-03: A storage `kill -9` loses records with no trace in the log [Both docs]
 - **Sensor-Pipeline.md** treats every loss as visible: "whichever component refuses a reading records the gap"; a message lost in transit shows up as "the jump in the counter" (`sensor_seq_gap`); ladder rung 4 requires the data counters plus `gap.value` to "cover every counter".
@@ -85,7 +85,7 @@ These three come from the same change: on every connect, storage now sends the h
     - `gt_next_seq` written test first (NSQ 8/8, red then green).
     - `storage_feed` uses it, its header comment is fixed, and its new `-r` mode keeps its counter across storage restarts.
     - `storage_faults.sh` runs one feed across all rounds. In `kill9 50`, each of the 50 kills left exactly one GAP, written at the next start (round *n* showed `gaps=n−1`, and the settle start added the 50th; 5493 readings covered). The final check found sent = committed + GAP-covered.
-  - **Still to do:** the hub's hop-2 sender calls `gt_next_seq` (PF-02's sender steps).
+  - ~~**Still to do:** the hub's hop-2 sender calls `gt_next_seq` (PF-02's sender steps).~~ **Done (2026-10-28):** the sender calls it on every reply. HSS-04 and HSL-02 show a running sender leaving a hole after a storage `kill -9`, and storage writing the GAP. In the WSL end-to-end run (hub step H9: real `storage_main` and `hub_main`, storage `-n 16`, killed after its second commit), storage restarted at 31, the hub resumed at 46, and storage logged `recovery_gap`; the log held one GAP of 14 readings.
 
 ## Tooling bugs
 
@@ -204,7 +204,7 @@ Storage itself was correct: the feed's output file later held `seq_resume: last=
   - **Tests:** `make test`, `make asan` and `make memcheck` all pass with VSR included (2026-10-27).
   - **Still to do:**
     - Record a `storage_faults.sh sigterm` / `kill9` run with the new check.
-    - The hub logs its own sent range when it stops (hub step H8), so the same flag works on the Pi.
+    - ~~The hub logs its own sent range when it stops (hub step H8), so the same flag works on the Pi.~~ **Done (2026-10-28):** `hub_main` logs `hub_stop sent=N first_seq=A last_seq=B refused=R dropped=Q`. In the H9 run, `log_verify --sent 156..274` on the second hub run's range passed with `lost=0`.
 
 ### PF-13: `clock_unsynced` / `clock_synced` are never logged
 - **DESIGN.md**, System clock row: log the unsynced period with `clock_unsynced` / `clock_synced`.
