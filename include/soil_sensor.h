@@ -33,6 +33,11 @@ gt_soil_sensor *gt_soil_open(const char *i2c_dev);
 /* Takes ownership of `bus` (closed on failure or by gt_soil_close). */
 gt_soil_sensor *gt_soil_open_bus(gt_i2c_bus bus);
 gt_status       gt_soil_read(gt_soil_sensor *s, uint32_t *raw_out);
-void            gt_soil_close(gt_soil_sensor *s);
+/* Re-run the open-time init (software reset, 500 ms boot wait, hardware-ID
+ * check) on an open sensor, for a board that was replugged or browned out.
+ * GT_ERR_IO if a step is NACKed or the ID is wrong; unlike open, the bus
+ * stays open, so the caller can try again later. GT_ERR_INVAL for NULL. */
+gt_status       gt_soil_reinit(gt_soil_sensor *s);
+void           gt_soil_close(gt_soil_sensor *s);
 
 #endif

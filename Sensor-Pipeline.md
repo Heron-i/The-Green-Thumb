@@ -204,7 +204,7 @@ gt_status (*recv)(void *ctx, uint8_t *buf, size_t cap, size_t *len_out);
 - **API shape:** `gt_hub_sender_open_ops(ops, ctx)` (doesn't connect; owns the ctx as the client does), `gt_hub_sender_push(sender, const gt_record *unstamped, now_ms)` → OK / FULL / INVAL, `gt_hub_sender_pump(sender, now_ms)` → event flags, `gt_hub_sender_close`, and a stats getter (queued, refused, `next_seq`, `has_own`).
 
 ### Test prefixes (reserved; none collide with the existing ones)
-`NSQ` next seq (fresh, running, empty log, reply ahead of the counter, NULL), `HAC` hub accept (fields, `seq` left 0, timestamp), `HSO` sender open/close, `HSR` resume wait (deadline, bad reply, IO, nothing sent before the reply), `HSS` sending (stamp on OK only, FULL keeps the head, IO keeps the head, the counter survives a reconnect), `HSQ` queue full and GAP, `HSL` loopback against `gt_storage_serve` over a real socket (a storage restart in the middle leaves a GAP for a running sender and none after a SIGTERM). Added 2026-10-27 with *Hub steps*: `HTO` hub timeouts, `HEV` hub event names, `HRX` hub rx loop over real sockets, `LLP` light process loop. Added 2026-10-28: `SSO` / `SSR` / `SSC` soil seesaw driver open / read / close.
+`NSQ` next seq (fresh, running, empty log, reply ahead of the counter, NULL), `HAC` hub accept (fields, `seq` left 0, timestamp), `HSO` sender open/close, `HSR` resume wait (deadline, bad reply, IO, nothing sent before the reply), `HSS` sending (stamp on OK only, FULL keeps the head, IO keeps the head, the counter survives a reconnect), `HSQ` queue full and GAP, `HSL` loopback against `gt_storage_serve` over a real socket (a storage restart in the middle leaves a GAP for a running sender and none after a SIGTERM). Added 2026-10-27 with *Hub steps*: `HTO` hub timeouts, `HEV` hub event names, `HRX` hub rx loop over real sockets, `LLP` light process loop. Added 2026-10-28: `SSO` / `SSR` / `SSC` / `SSI` soil seesaw driver open / read / close / reinit; `SLC` / `SLS` / `SLH` / `SLI` soil loop create / sampling / health / IPC.
 
 ### Follow-ups this contract creates
 - **DESIGN.md:** done 2026-10-26. The Hub → storage rows, the hub-queue budget and *At what rate* now say a record gets its `seq` + CRC when it is sent.
@@ -671,8 +671,12 @@ _Update at the end of the day, when asked: tick the step table, and add one Log 
 | — | IPC ladder rungs 1–2 (WSL/CI) | ✅ Pass (2026-10-24): rung 1 IFD/ICO/ICC/ICS/ICR/IOV, rung 2 IPL 5/5 |
 | — | IPC ladder rungs 3–6 (on the Pi) | ☐ Needs `src/light_sensor_main.c` (rungs 3–4), the soil process (rung 5) and the hub (rung 6) |
 | — | On-Pi `light_probe` run | ☐ Not recorded |
-| S0 | Soil seesaw driver (`src/soil_sensor.c`), SSO/SSR/SSC tests, `soil_probe` | 🟡 Written 2026-10-28: SSO 7/7, SSR 10/10, SSC 2/2 on macOS (plain + ASan/UBSan); WSL `make test`/`asan`/`memcheck` not yet run |
-| — | On-Pi `soil_probe` run | ☐ Not recorded |
+| S0 | Soil seesaw driver (`src/soil_sensor.c`), SSO/SSR/SSC tests, `soil_probe` | ✅ Done (2026-10-28): SSO 7/7, SSR 10/10, SSC 2/2; `make test`, `make asan`, `make memcheck` green in WSL |
+| — | On-Pi `soil_probe` run | ✅ Pass (2026-10-28): checks 1–4 PASS on the Pi; sensor alive. Raw air/wet counts and jitter numbers not yet recorded |
+| S1 | `gt_soil_reinit` (shared `init_chip`, mirrors `gt_light_reinit`) | 🟡 Written 2026-10-28: SSI 4/4 on macOS (plain + ASan/UBSan); WSL gate not yet run |
+| S2 | `src/soil_loop.c`: schedule, health, 5 s offline probe, open retry, IPC send/pump | 🟡 Written 2026-10-28: SLC 4/4, SLS 4/4, SLH 4/4, SLI 2/2 on macOS (plain + ASan/UBSan); WSL gate not yet run |
+| S3 | `src/soil_sensor_main.c` + `make soil_sensor` | 🟡 Written 2026-10-28: compiles warning-free; not yet run |
+| — | IPC ladder rung 5 on the Pi (soil → hub → storage) | ☐ Not run; needs S1–S3 green in WSL |
 | — | Hop-2 (hub→storage) format | ✅ Decided 2026-10-23: the 24 B record (see Decisions) |
 
 ### Not done yet

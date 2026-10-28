@@ -32,6 +32,29 @@ static gt_status select_reg(gt_soil_sensor *s, uint8_t base, uint8_t function)
     return s->bus.ops->write(s->bus.ctx, reg, sizeof reg);
 }
 
+/* The init sequence: software reset, wait for the firmware to reboot, then
+ * read the hardware ID and require 0x55. Stops at the first failed step
+ * (GT_ERR_IO); a wrong ID is GT_ERR_IO too. Shared by open and reinit;
+ * closes nothing. */
+static gt_status init_chip(gt_soil_sensor *s)
+{
+    const uint8_t reset[3] = { GT_SEESAW_STATUS_BASE, GT_SEESAW_STATUS_SWRST, 0xFF };
+    uint8_t hw_id = 0;
+    gt_status status = s->bus.ops->write(s->bus.ctx, reset, sizeof reset);
+    if (status == GT_OK) {
+        s->bus.ops->sleep_ms(s->bus.ctx, GT_SOIL_RESET_MS);
+        status = select_reg(s, GT_SEESAW_STATUS_BASE, GT_SEESAW_STATUS_HW_ID);
+    }
+    if (status == GT_OK) {
+        s->bus.ops->sleep_ms(s->bus.ctx, GT_SOIL_CONV_MS);
+        status = s->bus.ops->read(s->bus.ctx, &hw_id, 1);
+    }
+    if (status != GT_OK || hw_id != GT_SEESAW_HW_ID_CODE) {
+        return GT_ERR_IO;
+    }
+    return GT_OK;
+}
+
 /* Open the seesaw on the Linux bus `i2c_dev` at GT_SOIL_I2C_ADDR.
  * Returns NULL if the bus cannot be opened or the device does not respond. */
 gt_soil_sensor *gt_soil_open(const char *i2c_dev)
@@ -43,8 +66,7 @@ gt_soil_sensor *gt_soil_open(const char *i2c_dev)
     return gt_soil_open_bus(bus);
 }
 
-/* Initialise the device on an already-open bus: software reset, wait for the
- * firmware to reboot, then read the hardware ID and require 0x55. The reset
+/* Initialise the device on an already-open bus (init_chip). The reset
  * write is the first point where a missing device shows up (no ACK ->
  * GT_ERR_IO); the ID check catches some other chip answering at 0x36.
  * Takes ownership of `bus`: on any failure the bus is closed and NULL is
@@ -62,23 +84,22 @@ gt_soil_sensor *gt_soil_open_bus(gt_i2c_bus bus)
     }
     s->bus = bus;
 
-    const uint8_t reset[3] = { GT_SEESAW_STATUS_BASE, GT_SEESAW_STATUS_SWRST, 0xFF };
-    uint8_t hw_id = 0;
-    gt_status status = bus.ops->write(bus.ctx, reset, sizeof reset);
-    if (status == GT_OK) {
-        bus.ops->sleep_ms(bus.ctx, GT_SOIL_RESET_MS);
-        status = select_reg(s, GT_SEESAW_STATUS_BASE, GT_SEESAW_STATUS_HW_ID);
-    }
-    if (status == GT_OK) {
-        bus.ops->sleep_ms(bus.ctx, GT_SOIL_CONV_MS);
-        status = bus.ops->read(bus.ctx, &hw_id, 1);
-    }
-    if (status != GT_OK || hw_id != GT_SEESAW_HW_ID_CODE) {
+    if (init_chip(s) != GT_OK) {
         bus.ops->close(bus.ctx);
         free(s);
         return NULL;
     }
     return s;
+}
+
+/* Re-run init_chip on an open sensor (see soil_sensor.h). The bus stays
+ * open on failure: the sensor is still the caller's to probe or close. */
+gt_status gt_soil_reinit(gt_soil_sensor *s)
+{
+    if (s == NULL) {
+        return GT_ERR_INVAL;
+    }
+    return init_chip(s);
 }
 
 /* Read the moisture channel as a raw 16-bit count into `raw_out`.
