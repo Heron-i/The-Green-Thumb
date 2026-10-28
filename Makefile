@@ -18,6 +18,7 @@ TEST_BINS := $(patsubst tests/%.c,$(BUILD)/%,$(TEST_SRC))
 
 VALGRIND := valgrind --leak-check=full --show-leak-kinds=all --error-exitcode=1
 
+all: $(TEST_BINS) $(BUILD)/light_probe $(BUILD)/soil_probe $(BUILD)/soil_sensor $(BUILD)/hub_listen $(BUILD)/hub_main $(BUILD)/storage_main $(BUILD)/storage_feed $(BUILD)/log_verify
 all: $(TEST_BINS) $(BUILD)/light_probe $(BUILD)/light_sensor $(BUILD)/hub_listen $(BUILD)/hub_main $(BUILD)/storage_main $(BUILD)/storage_feed $(BUILD)/log_verify
 
 $(BUILD)/%: tests/%.c $(LIB_SRC) $(HEADERS)
@@ -32,6 +33,21 @@ $(BUILD)/light_probe: src/light_probe_main.c $(LIB_SRC) $(HEADERS)
 
 light_probe: $(BUILD)/light_probe
 
+# On-Pi STEMMA seesaw bring-up check (see src/soil_probe_main.c). Not run by
+# `make test`: it needs real I2C hardware.
+$(BUILD)/soil_probe: src/soil_probe_main.c $(LIB_SRC) $(HEADERS)
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) $(LIB_SRC) $< -o $@
+
+soil_probe: $(BUILD)/soil_probe
+
+# The soil sensor process (see src/soil_sensor_main.c): reads the seesaw and
+# sends to hub.sock. Not run by `make test`: it runs until SIGTERM.
+$(BUILD)/soil_sensor: src/soil_sensor_main.c $(LIB_SRC) $(HEADERS)
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) $(LIB_SRC) $< -o $@
+
+soil_sensor: $(BUILD)/soil_sensor
 # The light sensor process (see src/light_sensor_main.c): BH1750 readings
 # to hub.sock. Not run by `make test`: it runs until SIGTERM, and reads
 # real I2C (without it, it logs i2c_open_error and retries every 5 s).
@@ -104,4 +120,5 @@ memcheck: $(TEST_BINS)
 clean:
 	rm -rf build
 
+.PHONY: all test asan ubsan memcheck clean light_probe soil_probe soil_sensor hub_listen hub_main storage_main storage_feed log_verify
 .PHONY: all test asan ubsan memcheck clean light_probe light_sensor hub_listen hub_main storage_main storage_feed log_verify
