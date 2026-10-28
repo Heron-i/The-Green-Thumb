@@ -265,6 +265,21 @@ static void push_gap(gt_hub_sender *sender)
     sender->gap_pending = 0;
 }
 
+/* The real sender: the Linux socket ops for `sock_path` (ipc_sock.c,
+ * which sends any length and reads the reply with its recv op) under
+ * gt_hub_sender_open_ops. Neither step connects. A bad path fails in
+ * gt_ipc_sock_linux before any ctx exists, so there is nothing to free;
+ * after that, open_ops owns the ctx and destroys it itself if it fails. */
+gt_hub_sender *gt_hub_sender_open(const char *sock_path)
+{
+    const gt_sock_ops *ops = NULL;
+    void *ctx = NULL;
+    if (gt_ipc_sock_linux(sock_path, &ops, &ctx) != GT_OK) {
+        return NULL;
+    }
+    return gt_hub_sender_open_ops(ops, ctx);
+}
+
 /* Queue one unstamped record behind the others, or refuse it into the
  * current gap. It is test-encoded first (into a scratch buffer that is
  * thrown away), so a record storage could never decode is refused here
