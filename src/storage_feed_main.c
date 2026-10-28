@@ -212,63 +212,110 @@ static feed_result send_next(feed_state *state, const char *sock_path, int recon
     return FEED_SENT;
 }
 
-int main(int argc, char **argv)
+/* The command line, parsed. */
+typedef struct {
+    int           reconnect;   /* 1 if -r was given */
+    const char   *sock_path;
+    unsigned long count;       /* records to send; 0 with -r means no limit */
+    unsigned long rate_hz;     /* sends per second; 0 means as fast as possible */
+} feed_opts;
+
+/* Route SIGTERM and SIGINT to on_stop. No SA_RESTART: a stop signal cuts
+ * nanosleep/poll short (EINTR), so the loop sees stop_requested at once. */
+static void install_stop_handlers(void)
 {
-    /* _IOLBF = line buffering: flush stdout at every '\n', even when it is
-     * redirected to a file (the default there is to hold it until exit). */
-    setvbuf(stdout, NULL, _IOLBF, 0);
-    /* No SA_RESTART: a stop signal cuts nanosleep/poll short (EINTR), so
-     * the loop sees stop_requested at once. */
     struct sigaction stop_action;
     memset(&stop_action, 0, sizeof stop_action);
     stop_action.sa_handler = on_stop;
     sigemptyset(&stop_action.sa_mask);
     sigaction(SIGTERM, &stop_action, NULL);
     sigaction(SIGINT, &stop_action, NULL);
+}
+
+/* Parse "[-r] SOCK COUNT [RATE_HZ]" into `opts`. Returns 1 on success, or
+ * 0 after printing usage. */
+static int parse_feed_args(int argc, char **argv, feed_opts *opts)
+{
     /* -r, if given, comes first; arg_base is then the index of SOCK. */
-    int reconnect = argc > 1 && strcmp(argv[1], "-r") == 0;
-    int arg_base = reconnect ? 2 : 1;
+    opts->reconnect = argc > 1 && strcmp(argv[1], "-r") == 0;
+    int arg_base = opts->reconnect ? 2 : 1;
     int args_left = argc - arg_base;
-    unsigned long count = 0, rate_hz = 10;
-    if ((args_left != 2 && args_left != 3) || !parse_count(argv[arg_base + 1], &count)
-        || (args_left == 3 && !parse_count(argv[arg_base + 2], &rate_hz))) {
+    opts->sock_path = argv[arg_base];
+    opts->count = 0;
+    opts->rate_hz = 10;
+    if ((args_left != 2 && args_left != 3) || !parse_count(argv[arg_base + 1], &opts->count)
+        || (args_left == 3 && !parse_count(argv[arg_base + 2], &opts->rate_hz))) {
         fprintf(stderr, "usage: %s [-r] /run/plantpi/storage.sock COUNT [RATE_HZ]\n",
                 argv[0]);
+        return 0;
+    }
+    return 1;
+}
+
+/* The pause between sends for `rate_hz` sends per second (zero for 0). */
+static struct timespec rate_to_delay(unsigned long rate_hz)
+{
+    struct timespec delay = { 0, 0 };
+    if (rate_hz > 0) {
+        delay.tv_sec = (time_t)(1 / rate_hz);
+        delay.tv_nsec = (long)((1000000000ul / rate_hz) % 1000000000ul);
+    }
+    return delay;
+}
+
+/* 1 while the send loop should go on: no stop signal yet, and either -r
+ * with no limit or fewer than COUNT records sent. */
+static int should_keep_sending(const feed_opts *opts, const feed_state *state)
+{
+    return !stop_requested && ((opts->reconnect && opts->count == 0) || state->sent < opts->count);
+}
+
+/* Print the final "sent N records" line, close the connection if one is
+ * open, and return the exit code: 0 if all COUNT records went, or if -r
+ * was stopped by a signal; 1 otherwise. */
+static int close_and_report(feed_state *state, const feed_opts *opts)
+{
+    if (state->sent > 0) {
+        printf("sent %lu records, seq %lu..%lu\n", state->sent, (unsigned long)state->first_seq,
+               (unsigned long)(state->own_next - 1));
+    } else {
+        printf("sent 0 records\n");
+    }
+    if (state->fd >= 0) {
+        close(state->fd);
+    }
+    return (state->sent == opts->count || (opts->reconnect && stop_requested)) ? 0 : 1;
+}
+
+int main(int argc, char **argv)
+{
+    /* _IOLBF = line buffering: flush stdout at every '\n', even when it is
+     * redirected to a file (the default there is to hold it until exit). */
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    install_stop_handlers();
+    feed_opts opts;
+    if (!parse_feed_args(argc, argv, &opts)) {
         return 2;
     }
-    const char *sock_path = argv[arg_base];
 
-    struct timespec gap = { 0, 0 };
-    if (rate_hz > 0) {
-        gap.tv_sec = (time_t)(1 / rate_hz);
-        gap.tv_nsec = (long)((1000000000ul / rate_hz) % 1000000000ul);
-    }
+    struct timespec delay = rate_to_delay(opts.rate_hz);
     feed_state state = { .fd = -1, .own_next = 0, .first_seq = 0, .sent = 0 };
-    if (!reconnect) {
-        state.fd = open_session(sock_path, 0, 0, 0, &state.own_next);
+    if (!opts.reconnect) {
+        state.fd = open_session(opts.sock_path, 0, 0, 0, &state.own_next);
         if (state.fd < 0) {
             return 1;
         }
     }
     /* invariant: every seq below state.own_next was sent exactly once; none
      * is reused */
-    while (!stop_requested && ((reconnect && count == 0) || state.sent < count)) {
-        feed_result result = send_next(&state, sock_path, reconnect);
+    while (should_keep_sending(&opts, &state)) {
+        feed_result result = send_next(&state, opts.sock_path, opts.reconnect);
         if (result == FEED_STOP) {
             break;
         }
-        if (result == FEED_SENT && rate_hz > 0) {
-            nanosleep(&gap, NULL);
+        if (result == FEED_SENT && opts.rate_hz > 0) {
+            nanosleep(&delay, NULL);
         }
     }
-    if (state.sent > 0) {
-        printf("sent %lu records, seq %lu..%lu\n", state.sent, (unsigned long)state.first_seq,
-               (unsigned long)(state.own_next - 1));
-    } else {
-        printf("sent 0 records\n");
-    }
-    if (state.fd >= 0) {
-        close(state.fd);
-    }
-    return (state.sent == count || (reconnect && stop_requested)) ? 0 : 1;
+    return close_and_report(&state, &opts);
 }
