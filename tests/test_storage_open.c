@@ -66,7 +66,9 @@ static void put_segment(const char *name, const uint32_t *seqs, size_t seq_count
 static gt_storage *open_ok(const gt_file_ops *ops, uint64_t now_us, gt_storage_open_info *info)
 {
     gt_storage *storage = NULL;
-    CHECK_EQ(gt_storage_open_ops(ops, &fs, now_us, TEST_CAPACITY, &storage, info), GT_OK);
+    gt_storage_open_args args = { .ops = ops, .ctx = &fs, .now_us = now_us,
+                                  .pending_capacity = TEST_CAPACITY };
+    CHECK_EQ(gt_storage_open_ops(&args, &storage, info), GT_OK);
     CHECK(storage != NULL);
     return storage;
 }
@@ -104,8 +106,10 @@ static void open_expect_failure(const gt_file_ops *ops, gt_status expected)
 {
     static char sentinel;
     gt_storage *storage = (gt_storage *)(void *)&sentinel;
+    gt_storage_open_args args = { .ops = ops, .ctx = &fs, .now_us = TODAY_US,
+                                  .pending_capacity = TEST_CAPACITY };
 
-    CHECK_EQ(gt_storage_open_ops(ops, &fs, TODAY_US, TEST_CAPACITY, &storage, NULL), expected);
+    CHECK_EQ(gt_storage_open_ops(&args, &storage, NULL), expected);
     CHECK(storage == (gt_storage *)(void *)&sentinel);
     CHECK_EQ(fs.destroy_calls, 1);
     CHECK_EQ(fake_fs_open_handles(&fs), 0);
@@ -349,26 +353,30 @@ static void test_sop11_close_and_null_info(void)
 }
 
 /* ---- SOP-12: bad arguments are rejected ----
- * NULL ops: the caller still owns ctx, so destroy is not called. NULL
- * storage_out or a now_us past 9999: storage owns ctx, so destroy is
- * called once. NULL args to read_stats are GT_ERR_INVAL. */
+ * NULL args or NULL ops: the caller still owns ctx, so destroy is not
+ * called. NULL storage_out or a now_us past 9999: storage owns ctx, so
+ * destroy is called once. NULL args to read_stats are GT_ERR_INVAL. */
 static void test_sop12_bad_args(void)
 {
     gt_storage *storage = NULL;
     gt_storage_stats stats;
 
     const gt_file_ops *ops = fake_fs_ops(&fs);
-    CHECK_EQ(gt_storage_open_ops(NULL, &fs, TODAY_US, TEST_CAPACITY, &storage, NULL),
-             GT_ERR_INVAL);
+    CHECK_EQ(gt_storage_open_ops(NULL, &storage, NULL), GT_ERR_INVAL);
     CHECK_EQ(fs.destroy_calls, 0);
 
-    CHECK_EQ(gt_storage_open_ops(ops, &fs, TODAY_US, TEST_CAPACITY, NULL, NULL),
-             GT_ERR_INVAL);
+    gt_storage_open_args args = { .ops = NULL, .ctx = &fs, .now_us = TODAY_US,
+                                  .pending_capacity = TEST_CAPACITY };
+    CHECK_EQ(gt_storage_open_ops(&args, &storage, NULL), GT_ERR_INVAL);
+    CHECK_EQ(fs.destroy_calls, 0);
+
+    args.ops = ops;
+    CHECK_EQ(gt_storage_open_ops(&args, NULL, NULL), GT_ERR_INVAL);
     CHECK_EQ(fs.destroy_calls, 1);
 
-    ops = fake_fs_ops(&fs);
-    CHECK_EQ(gt_storage_open_ops(ops, &fs, UINT64_MAX, TEST_CAPACITY, &storage, NULL),
-             GT_ERR_INVAL);
+    args.ops = fake_fs_ops(&fs);
+    args.now_us = UINT64_MAX;
+    CHECK_EQ(gt_storage_open_ops(&args, &storage, NULL), GT_ERR_INVAL);
     CHECK(storage == NULL);
     CHECK_EQ(fs.destroy_calls, 1);
     CHECK_EQ(fake_fs_open_handles(&fs), 0);

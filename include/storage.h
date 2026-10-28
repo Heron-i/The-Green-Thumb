@@ -108,7 +108,17 @@ typedef struct {
  * reading CLOCK_MONOTONIC; tests pass a scripted one). */
 typedef uint64_t (*gt_clock_us_fn)(void);
 
-/* Open storage over the directory behind ops/ctx, running recovery before
+/* What gt_storage_open_ops opens: the directory behind ops/ctx, the wall
+ * clock, and the pending buffer size. A struct groups related values so
+ * they travel together as one argument (like gt_log_entry in gt_log.h). */
+typedef struct {
+    const gt_file_ops *ops;     /* NULL: GT_ERR_INVAL, caller keeps ctx */
+    void *ctx;
+    uint64_t now_us;            /* wall clock, us since the epoch */
+    size_t pending_capacity;    /* 0 means GT_PENDING_MAX_RECORDS */
+} gt_storage_open_args;
+
+/* Open storage over the directory behind args->ops/ctx, running recovery before
  * anything else (DESIGN.md "recovery runs before storage.sock accepts any
  * data"):
  *   0. Check for the clean-shutdown marker (DESIGN.md recovery step 1).
@@ -130,22 +140,21 @@ typedef uint64_t (*gt_clock_us_fn)(void);
  *   5. A new segment gets its header written, then fsync, then fsync_dir,
  *      so it can't vanish in a power cut. A half-made file left by a
  *      failure here is renamed .corrupt by the next open's recovery.
- * now_us is the wall clock in us since the epoch; it picks today's segment
- * and stamps a new header. pending_capacity is how many records may wait
- * to be committed: 0 means GT_PENDING_MAX_RECORDS (1 MB); tests pass a
- * small number. info_out may be NULL.
+ * args->now_us is the wall clock in us since the epoch; it picks today's
+ * segment and stamps a new header. args->pending_capacity is how many
+ * records may wait to be committed: 0 means GT_PENDING_MAX_RECORDS (1 MB);
+ * tests pass a small number. info_out may be NULL.
  *
- * Ownership, as for gt_ipc_client_open_ops: once ops is non-NULL, storage
- * owns ctx and calls ops->destroy(ctx) exactly once, from gt_storage_close,
- * or before returning if open fails for any reason. With NULL ops the
- * caller still owns ctx.
+ * Ownership, as for gt_ipc_client_open_ops: once args->ops is non-NULL,
+ * storage owns args->ctx and calls ops->destroy(ctx) exactly once, from
+ * gt_storage_close, or before returning if open fails for any reason. With
+ * NULL args or NULL args->ops the caller still owns ctx.
  *
  * `storage_out` is a pointer-to-pointer (`**`), as in ipc_sock.h: on GT_OK,
  * *storage_out is set to the new storage; on failure it is untouched.
  *   GT_OK, GT_ERR_IO (any file op failed), GT_ERR_NOMEM, GT_ERR_INVAL
- *   (NULL ops or storage_out, or a now_us past the year 9999) */
-gt_status   gt_storage_open_ops(const gt_file_ops *ops, void *ctx, uint64_t now_us,
-                                size_t pending_capacity, gt_storage **storage_out,
+ *   (NULL args, ops or storage_out, or a now_us past the year 9999) */
+gt_status   gt_storage_open_ops(const gt_storage_open_args *args, gt_storage **storage_out,
                                 gt_storage_open_info *info_out);
 
 /* Copy the counters into *stats_out. GT_ERR_INVAL for NULL args. */
