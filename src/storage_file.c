@@ -35,13 +35,21 @@ typedef struct {
     int dir_fd;
 } linux_dir;
 
+/* 1 if `name` is "." or "..": the directory itself or its parent. */
+static int is_dot_name(const char *name)
+{
+    return strcmp(name, ".") == 0 || strcmp(name, "..") == 0;
+}
+
 /* 1 if `name` is a plain file name inside the directory: not NULL, not
  * empty, short enough for a row, no '/', and not "." or "..". Anything
  * else could reach outside the directory. */
 static int name_ok(const char *name)
 {
-    return name != NULL && name[0] != '\0' && strlen(name) < GT_FILE_NAME_MAX
-           && strchr(name, '/') == NULL && strcmp(name, ".") != 0 && strcmp(name, "..") != 0;
+    if (name == NULL || name[0] == '\0' || strlen(name) >= GT_FILE_NAME_MAX) {
+        return 0;
+    }
+    return strchr(name, '/') == NULL && !is_dot_name(name);
 }
 
 static gt_status file_open(void *ctx, const char *name, unsigned flags, int *handle_out)
