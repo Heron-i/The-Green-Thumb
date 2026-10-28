@@ -18,7 +18,8 @@
 #include "i2c_bus.h"
 
 #define FAKE_I2C_MAX_WRITTEN 64
-#define FAKE_I2C_MAX_READ    64
+#define FAKE_I2C_MAX_READ    256   /* 128 two-byte readings: enough to fill the
+                                    * 64-slot IPC ring (LLP-11) */
 
 typedef struct {
     /* Every attempted write, in order (failed ones too: the bus was driven). */
