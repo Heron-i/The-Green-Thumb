@@ -26,6 +26,11 @@ gt_light_sensor *gt_light_open(const char *i2c_dev);
 /* Takes ownership of `bus` (closed on failure or by gt_light_close). */
 gt_light_sensor *gt_light_open_bus(gt_i2c_bus bus);
 gt_status        gt_light_read(gt_light_sensor *s, uint32_t *raw_out);
+/* Re-run the open-time init (power-on, reset, mode select, 180 ms wait) on
+ * an open sensor, for a chip that was replugged or browned out and lost its
+ * mode. GT_ERR_IO if a command is NACKed; unlike open, the bus stays open,
+ * so the caller can try again later. GT_ERR_INVAL for NULL. */
+gt_status        gt_light_reinit(gt_light_sensor *s);
 void             gt_light_close(gt_light_sensor *s);
 
 #endif
