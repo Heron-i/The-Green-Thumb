@@ -21,7 +21,8 @@
 
 #include "ipc_sock.h"
 
-#define FAKE_SOCK_MAX_SENT    256   /* enough for two full rings plus GAPs */
+#define FAKE_SOCK_MAX_SENT    1100  /* a full hub queue (1024) plus GAPs and
+                                     * new records; also two client rings */
 #define FAKE_SOCK_MAX_RESULTS 64
 #define FAKE_SOCK_MAX_REPLIES 16
 /* Largest frame the fake keeps: the hub sender's 24 B record (GT_REC_SIZE

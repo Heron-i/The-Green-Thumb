@@ -49,6 +49,14 @@ struct gt_hub_sender {
     uint32_t  backoff_ms;
     uint64_t  resume_deadline_ms;   /* AWAITING_RESUME gives up at this time */
 
+    /* The GAP being built while the queue is full. gap_pending stays set
+     * from the first refusal until the GAP is queued, so one overflow run
+     * gives one GAP and one GT_HUB_SENDER_EV_QUEUE_FULL. gap_readings counts
+     * readings, not records: a refused sensor GAP adds its own count. */
+    int       gap_pending;
+    uint64_t  gap_first_us;         /* receive time of the first refused record */
+    uint32_t  gap_readings;
+
     gt_hub_send_stats stats;
 };
 
@@ -231,12 +239,45 @@ gt_hub_sender *gt_hub_sender_open_ops(const gt_sock_ops *ops, void *ctx)
     return sender;
 }
 
-/* Queue one unstamped record behind the others. It is test-encoded first
- * (into a scratch buffer that is thrown away), so a record storage could
- * never decode is refused here instead of reaching the head of the queue
- * and blocking every record behind it. (head + count) % GT_HUB_QUEUE_SLOTS
- * is the slot just after the newest record: `%` wraps it back to 0. A
- * full queue refuses and counts; H6 adds the event and the GAP. */
+/* Copy `record` into the slot just after the newest one. Only called when
+ * there is room. (head + count) % GT_HUB_QUEUE_SLOTS is that slot: `%`
+ * wraps an index past the last slot back round to slot 0. */
+static void queue_push(gt_hub_sender *sender, const gt_record *record)
+{
+    size_t tail = (sender->head + sender->count) % GT_HUB_QUEUE_SLOTS;
+    sender->queue[tail] = *record;
+    sender->count++;
+    sender->stats.queued = (uint32_t)sender->count;
+}
+
+/* Queue the GAP record for the run of refused records, and end the run
+ * (DESIGN.md Hub -> storage row "Hub queue full"): sensor 0 (the refused
+ * records may come from either sensor), stamped with the first refused
+ * record's receive time, the gap's start, and counting the refused
+ * readings. Like any record it gets its seq at send. Only called with at
+ * least 2 free slots, so the record that follows it fits too. */
+static void push_gap(gt_hub_sender *sender)
+{
+    const gt_record gap = { .type = GT_REC_GAP, .sensor_id = GT_SENSOR_ALL, .seq = 0,
+                            .timestamp_us = sender->gap_first_us,
+                            .value = sender->gap_readings };
+    queue_push(sender, &gap);
+    sender->gap_pending = 0;
+}
+
+/* Queue one unstamped record behind the others, or refuse it into the
+ * current gap. It is test-encoded first (into a scratch buffer that is
+ * thrown away), so a record storage could never decode is refused here
+ * instead of reaching the head of the queue and blocking every record
+ * behind it.
+ * A record is refused when the queue is full, and also while a gap is
+ * pending but fewer than 2 slots are free: the GAP must go in just before
+ * the next accepted record, so storage gets old records, then the GAP,
+ * then new ones (the same rule as the sensor client's ring). The first
+ * refusal of a run starts the gap (its receive time) and reports
+ * GT_HUB_SENDER_EV_QUEUE_FULL; every refusal adds its readings (a sensor
+ * GAP's own count, otherwise 1, held at UINT32_MAX rather than wrapping)
+ * and is counted in stats.refused. */
 gt_status gt_hub_sender_push(gt_hub_sender *sender, const gt_record *unstamped,
                              unsigned *events_out)
 {
@@ -250,15 +291,27 @@ gt_status gt_hub_sender_push(gt_hub_sender *sender, const gt_record *unstamped,
     if (gt_record_encode(unstamped, scratch) != GT_OK) {
         return GT_ERR_INVAL;
     }
-    if (sender->count == GT_HUB_QUEUE_SLOTS) {
-        sender->stats.refused++;
-        return GT_ERR_FULL;
+    if (sender->gap_pending && GT_HUB_QUEUE_SLOTS - sender->count >= 2) {
+        push_gap(sender);
     }
-    size_t tail = (sender->head + sender->count) % GT_HUB_QUEUE_SLOTS;
-    sender->queue[tail] = *unstamped;
-    sender->count++;
-    sender->stats.queued = (uint32_t)sender->count;
-    return GT_OK;
+    /* With no gap pending, queue it if there's room; with one pending, refuse. */
+    if (!sender->gap_pending && sender->count < GT_HUB_QUEUE_SLOTS) {
+        queue_push(sender, unstamped);
+        return GT_OK;
+    }
+    if (!sender->gap_pending) {
+        sender->gap_pending = 1;
+        sender->gap_first_us = unstamped->timestamp_us;
+        sender->gap_readings = 0;
+        if (events_out != NULL) {
+            *events_out = GT_HUB_SENDER_EV_QUEUE_FULL;
+        }
+    }
+    uint32_t readings = unstamped->type == GT_REC_GAP ? unstamped->value : 1u;
+    sender->gap_readings = readings > UINT32_MAX - sender->gap_readings
+                               ? UINT32_MAX : sender->gap_readings + readings;
+    sender->stats.refused++;
+    return GT_ERR_FULL;
 }
 
 /* Move through the states as far as now_ms allows: connect, then (in the
