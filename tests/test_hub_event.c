@@ -1,10 +1,11 @@
-/* Unit tests for the hub's event names (src/hub.c): gt_hub_event_describe.
+/* Unit tests for the hub's event names (src/hub.c, src/hub_sender.c):
+ * gt_hub_event_describe and gt_hub_sender_event_describe.
  *
  * Purpose: pin each GT_HUB_EV_* flag to the event name DESIGN.md's Hub
  * rows use and the level it is logged at, so the rx loop only loops over
  * the bits it got back. Mirrors storage's SEV tests. Pure lookup. Run
  * under make test / asan / memcheck.
- * Implements HEV-01 through HEV-03.
+ * Implements HEV-01 through HEV-04.
  *
  * What these tests cannot prove: that the rx loop logs every bit (HRX
  * does). */
@@ -12,6 +13,7 @@
 
 #include "check.h"
 #include "hub.h"
+#include "hub_sender.h"
 
 /* ---- HEV-01: every flag has its DESIGN.md name and level ---- */
 static void test_hev01_names_and_levels(void)
@@ -64,10 +66,41 @@ static void test_hev03_unknown_or_null(void)
     CHECK_EQ(gt_hub_event_describe(GT_HUB_EV_SEQ_GAP, NULL), GT_ERR_INVAL);
 }
 
+/* ---- HEV-04: every sender flag has its name and level ----
+ * hub_queue_full is ERROR because readings are being refused; the bad
+ * reply shares the sensor side's ipc_bad_message name. 0 is rejected. */
+static void test_hev04_sender_names(void)
+{
+    const struct {
+        unsigned     flag;
+        const char  *name;
+        gt_log_level level;
+    } expected[] = {
+        { GT_HUB_SENDER_EV_UNREACHABLE, "storage_unreachable", GT_LOG_WARN },
+        { GT_HUB_SENDER_EV_RECONNECTED, "storage_reconnected", GT_LOG_INFO },
+        { GT_HUB_SENDER_EV_RESUMED,     "seq_resume",          GT_LOG_INFO },
+        { GT_HUB_SENDER_EV_BAD_REPLY,   "ipc_bad_message",     GT_LOG_WARN },
+        { GT_HUB_SENDER_EV_QUEUE_FULL,  "hub_queue_full",      GT_LOG_ERROR },
+    };
+
+    /* Invariant: expected[0..row_index-1] each described as listed. */
+    for (size_t row_index = 0; row_index < sizeof expected / sizeof expected[0]; row_index++) {
+        gt_hub_event event = { NULL, GT_LOG_DEBUG };
+        CHECK_EQ(gt_hub_sender_event_describe(expected[row_index].flag, &event), GT_OK);
+        CHECK(event.name != NULL && strcmp(event.name, expected[row_index].name) == 0);
+        CHECK_EQ(event.level, expected[row_index].level);
+    }
+    gt_hub_event untouched = { "untouched", GT_LOG_ERROR };
+    CHECK_EQ(gt_hub_sender_event_describe(0, &untouched), GT_ERR_INVAL);
+    CHECK_EQ(gt_hub_sender_event_describe(GT_HUB_SENDER_EV_QUEUE_FULL, NULL), GT_ERR_INVAL);
+    CHECK(strcmp(untouched.name, "untouched") == 0);
+}
+
 static const test_case_t tests[] = {
     {"HEV-01", "every flag has its DESIGN.md name and level", test_hev01_names_and_levels},
     {"HEV-02", "0 or two bits at once are rejected", test_hev02_zero_or_two_bits},
     {"HEV-03", "an unknown bit or a NULL out is rejected", test_hev03_unknown_or_null},
+    {"HEV-04", "every sender flag has its name and level", test_hev04_sender_names},
 };
 
 int main(void)

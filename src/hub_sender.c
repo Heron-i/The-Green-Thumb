@@ -358,6 +358,40 @@ gt_status gt_hub_sender_pump(gt_hub_sender *sender, uint64_t now_ms, unsigned *e
     return GT_OK;
 }
 
+/* One row per GT_HUB_SENDER_EV_* flag: its log name and level (DESIGN.md
+ * Hub -> storage rows). hub_queue_full is ERROR because readings are
+ * being refused, which is real loss even though a GAP records it. */
+typedef struct {
+    unsigned     flag;
+    gt_hub_event event;
+} sender_event_row;
+
+static const sender_event_row SENDER_EVENT_TABLE[] = {
+    { GT_HUB_SENDER_EV_UNREACHABLE, { "storage_unreachable", GT_LOG_WARN } },
+    { GT_HUB_SENDER_EV_RECONNECTED, { "storage_reconnected", GT_LOG_INFO } },
+    { GT_HUB_SENDER_EV_RESUMED,     { "seq_resume",          GT_LOG_INFO } },
+    { GT_HUB_SENDER_EV_BAD_REPLY,   { "ipc_bad_message",     GT_LOG_WARN } },
+    { GT_HUB_SENDER_EV_QUEUE_FULL,  { "hub_queue_full",      GT_LOG_ERROR } },
+};
+
+/* An exact match against one row's flag also rules out 0 and any word
+ * with two bits set, since every row has exactly one bit. */
+gt_status gt_hub_sender_event_describe(unsigned flag, gt_hub_event *out)
+{
+    if (out == NULL) {
+        return GT_ERR_INVAL;
+    }
+    size_t row_count = sizeof SENDER_EVENT_TABLE / sizeof SENDER_EVENT_TABLE[0];
+    /* Invariant: no row before row_index has this flag. */
+    for (size_t row_index = 0; row_index < row_count; row_index++) {
+        if (SENDER_EVENT_TABLE[row_index].flag == flag) {
+            *out = SENDER_EVENT_TABLE[row_index].event;
+            return GT_OK;
+        }
+    }
+    return GT_ERR_INVAL;
+}
+
 /* Copy the counters out as one struct assignment, so the caller gets a
  * snapshot it can't use to change the sender. */
 gt_status gt_hub_sender_stats(const gt_hub_sender *sender, gt_hub_send_stats *stats_out)

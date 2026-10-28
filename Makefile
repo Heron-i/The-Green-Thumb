@@ -18,7 +18,7 @@ TEST_BINS := $(patsubst tests/%.c,$(BUILD)/%,$(TEST_SRC))
 
 VALGRIND := valgrind --leak-check=full --show-leak-kinds=all --error-exitcode=1
 
-all: $(TEST_BINS) $(BUILD)/light_probe $(BUILD)/hub_listen $(BUILD)/storage_main $(BUILD)/storage_feed $(BUILD)/log_verify
+all: $(TEST_BINS) $(BUILD)/light_probe $(BUILD)/hub_listen $(BUILD)/hub_main $(BUILD)/storage_main $(BUILD)/storage_feed $(BUILD)/log_verify
 
 $(BUILD)/%: tests/%.c $(LIB_SRC) $(HEADERS)
 	@mkdir -p $(BUILD)
@@ -39,6 +39,14 @@ $(BUILD)/hub_listen: src/hub_listen_main.c $(LIB_SRC) $(HEADERS)
 	$(CC) $(CFLAGS) $(LIB_SRC) $< -o $@
 
 hub_listen: $(BUILD)/hub_listen
+
+# The hub process (see src/hub_main.c): sensors on hub.sock, records to
+# storage.sock. Not run by `make test`: it serves until SIGTERM.
+$(BUILD)/hub_main: src/hub_main.c $(LIB_SRC) $(HEADERS)
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) $(LIB_SRC) $< -o $@
+
+hub_main: $(BUILD)/hub_main
 
 # The storage process (see src/storage_main.c). Not run by `make test`: it
 # serves until SIGTERM.
@@ -87,4 +95,4 @@ memcheck: $(TEST_BINS)
 clean:
 	rm -rf build
 
-.PHONY: all test asan ubsan memcheck clean light_probe hub_listen storage_main storage_feed log_verify
+.PHONY: all test asan ubsan memcheck clean light_probe hub_listen hub_main storage_main storage_feed log_verify

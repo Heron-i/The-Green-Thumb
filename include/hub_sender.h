@@ -2,6 +2,7 @@
 #define HUB_SENDER_H
 
 #include <stdint.h>
+#include "hub.h"
 #include "ipc.h"
 #include "ipc_sock.h"
 #include "log_record.h"
@@ -95,6 +96,13 @@ gt_status gt_hub_sender_pump(gt_hub_sender *sender, uint64_t now_ms, unsigned *e
 
 /* Copy the counters into *stats_out. GT_ERR_INVAL for NULL args. */
 gt_status gt_hub_sender_stats(const gt_hub_sender *sender, gt_hub_send_stats *stats_out);
+
+/* How the hub logs one GT_HUB_SENDER_EV_* flag: storage_unreachable
+ * (WARN), storage_reconnected (INFO), seq_resume (INFO), ipc_bad_message
+ * (WARN; the hub adds peer=storage) or hub_queue_full (ERROR: readings
+ * are being refused). Same contract as gt_hub_event_describe: exactly one
+ * known bit, else GT_ERR_INVAL with *out untouched. */
+gt_status gt_hub_sender_event_describe(unsigned flag, gt_hub_event *out);
 
 /* Close the connection and free the sender. Sends nothing more: records
  * still queued are dropped (hub_main drains first and logs how many were
