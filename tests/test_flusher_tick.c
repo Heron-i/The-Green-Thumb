@@ -78,7 +78,7 @@ static gt_storage *open_with_flusher(gt_flusher *flusher)
     gt_storage *storage = NULL;
     gt_storage_open_args args = { .ops = ops, .ctx = &fs, .now_us = TODAY_US,
                                   .pending_capacity = TEST_CAPACITY };
-    CHECK_EQ(gt_storage_open_ops(&args, &storage, ), );
+    CHECK_EQ(gt_storage_open_ops(&args, &storage, NULL), GT_OK);
     memset(&book, 0, sizeof book);
     gt_flusher_init(flusher, storage, 3, record_log, &book);
     return storage;

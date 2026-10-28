@@ -43,7 +43,7 @@ static gt_storage *open_storage(const gt_file_ops *ops, gt_storage_open_info *in
     gt_storage *storage = NULL;
     gt_storage_open_args args = { .ops = ops, .ctx = &fs, .now_us = TODAY_US,
                                   .pending_capacity = TEST_CAPACITY };
-    CHECK_EQ(gt_storage_open_ops(&args, &storage, ), );
+    CHECK_EQ(gt_storage_open_ops(&args, &storage, info), GT_OK);
     return storage;
 }
 
@@ -225,7 +225,7 @@ static void test_scl08_marker_delete_failure(void)
 
     gt_storage_open_args args = { .ops = ops, .ctx = &fs, .now_us = TODAY_US,
                                   .pending_capacity = TEST_CAPACITY };
-    CHECK_EQ(gt_storage_open_ops(&args, &storage, ), );
+    CHECK_EQ(gt_storage_open_ops(&args, &storage, NULL), GT_ERR_IO);
     CHECK(storage == NULL);
     CHECK_EQ(fs.destroy_calls, 1);
     CHECK_EQ(fake_fs_open_handles(&fs), 0);

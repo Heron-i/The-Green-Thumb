@@ -347,7 +347,7 @@ static void test_ssv07_bad_args(void)
     const gt_file_ops *ops = fake_fs_ops(&fs);
     gt_storage_open_args args = { .ops = ops, .ctx = &fs, .now_us = TODAY_US,
                                   .pending_capacity = TEST_CAPACITY };
-    CHECK_EQ(gt_storage_open_ops(&args, &storage, ), );
+    CHECK_EQ(gt_storage_open_ops(&args, &storage, NULL), GT_OK);
 
     CHECK_EQ(gt_storage_serve(NULL, 3, 4, record_log, &book), GT_ERR_INVAL);
     CHECK_EQ(gt_storage_serve(storage, -1, 4, record_log, &book), GT_ERR_INVAL);

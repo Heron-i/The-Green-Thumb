@@ -30,7 +30,7 @@ static gt_storage *open_storage(void)
     gt_storage *storage = NULL;
     gt_storage_open_args args = { .ops = ops, .ctx = &fs, .now_us = TODAY_US,
                                   .pending_capacity = TEST_CAPACITY };
-    CHECK_EQ(gt_storage_open_ops(&args, &storage, ), );
+    CHECK_EQ(gt_storage_open_ops(&args, &storage, NULL), GT_OK);
     return storage;
 }
 

@@ -45,7 +45,7 @@ static gt_storage *open_with_records(uint32_t record_count)
     gt_storage *storage = NULL;
     gt_storage_open_args args = { .ops = ops, .ctx = &fs, .now_us = TODAY_US,
                                   .pending_capacity = TEST_CAPACITY };
-    CHECK_EQ(gt_storage_open_ops(&args, &storage, ), );
+    CHECK_EQ(gt_storage_open_ops(&args, &storage, NULL), GT_OK);
     /* invariant: records 1 .. seq - 1 are pending */
     for (uint32_t seq = 1; seq <= record_count; seq++) {
         uint8_t wire[GT_REC_SIZE];
