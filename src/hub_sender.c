@@ -141,6 +141,74 @@ static void await_resume(gt_hub_sender *sender, uint64_t now_ms, unsigned *event
     }
 }
 
+/* SENDING: storage sends nothing after its reply, so look once per pump
+ * for anything it did send. Nothing waiting is the normal case: returns 1.
+ * A closed connection (recv GT_ERR_IO) is caught here even when no record
+ * is queued, so an idle hub reports storage_unreachable when it happens.
+ * Any bytes at all are ipc_bad_message. Either way the connection is
+ * dropped and 0 is returned, so nothing is sent on it. */
+static int storage_stayed_quiet(gt_hub_sender *sender, uint64_t now_ms, unsigned *events)
+{
+    uint8_t unexpected[GT_RESUME_SIZE + 1];
+    size_t unexpected_len = 0;
+    gt_status result = sender->ops->recv(sender->ctx, unexpected, sizeof unexpected,
+                                         &unexpected_len);
+    if (result == GT_OK && unexpected_len == 0) {
+        return 1;
+    }
+    if (result == GT_OK) {
+        *events |= GT_HUB_SENDER_EV_BAD_REPLY;
+    }
+    drop_connection(sender, now_ms, events);
+    return 0;
+}
+
+/* SENDING: if storage stayed quiet, send queued records oldest first
+ * until the queue is empty or the socket says stop. Each send stamps a
+ * copy of the head record with next_seq and encodes it (the CRC covers
+ * seq, so it can only be computed now); the queued record itself stays
+ * unstamped. Only GT_OK uses the seq: the record leaves the queue,
+ * next_seq moves on, and the first one sent starts the sender's own
+ * counter (has_own, first_sent_seq). Anything else keeps the head and
+ * next_seq as they were:
+ *   GT_ERR_FULL (EAGAIN): storage is alive but behind; stay connected.
+ *   GT_ERR_IO (EPIPE / ECONNRESET): storage is gone; drop the connection.
+ * The encode can't fail, because push already test-encoded the record.
+ * next_seq wraps after UINT32_MAX, which at 1 Hz is 136 years away; storage
+ * would then reject the records as old (seq_rejected), not lose them
+ * silently. */
+static void drain(gt_hub_sender *sender, uint64_t now_ms, unsigned *events)
+{
+    if (!storage_stayed_quiet(sender, now_ms, events)) {
+        return;
+    }
+    /* Invariant: queue[head] is the oldest record storage hasn't taken,
+     * and every seq below stats.next_seq has been sent exactly once. */
+    while (sender->count > 0) {
+        gt_record stamped = sender->queue[sender->head];
+        stamped.seq = sender->stats.next_seq;
+        uint8_t wire[GT_REC_SIZE];
+        gt_record_encode(&stamped, wire);
+        gt_status result = sender->ops->send(sender->ctx, wire, sizeof wire);
+        if (result == GT_ERR_FULL) {
+            return;
+        }
+        if (result != GT_OK) {
+            drop_connection(sender, now_ms, events);
+            return;
+        }
+        if (!sender->stats.has_own) {
+            sender->stats.has_own = 1;
+            sender->stats.first_sent_seq = stamped.seq;
+        }
+        sender->stats.next_seq++;
+        sender->stats.sent++;
+        sender->head = (sender->head + 1) % GT_HUB_QUEUE_SLOTS;
+        sender->count--;
+        sender->stats.queued = (uint32_t)sender->count;
+    }
+}
+
 /* Set up a sender over any socket ops; no connect yet (the first pump
  * tries straight away, because next_attempt_ms starts at 0). calloc zeroes
  * the queue, the counters and the state (0 is SENDER_DISCONNECTED). Once
@@ -196,8 +264,8 @@ gt_status gt_hub_sender_push(gt_hub_sender *sender, const gt_record *unstamped,
 /* Move through the states as far as now_ms allows: connect, then (in the
  * same pump) look for the reply, since storage sends it the moment it
  * accepts. Each step runs only if the one before left the sender in the
- * right state, so a failed connect stops here until the next pump.
- * SENDING drains the queue (added in H5). */
+ * right state, so a failed connect stops here until the next pump, and a
+ * reply that just arrived lets the queue drain in the same pump. */
 gt_status gt_hub_sender_pump(gt_hub_sender *sender, uint64_t now_ms, unsigned *events_out)
 {
     if (events_out != NULL) {
@@ -212,6 +280,9 @@ gt_status gt_hub_sender_pump(gt_hub_sender *sender, uint64_t now_ms, unsigned *e
     }
     if (sender->state == SENDER_AWAITING_RESUME) {
         await_resume(sender, now_ms, &events);
+    }
+    if (sender->state == SENDER_SENDING) {
+        drain(sender, now_ms, &events);
     }
     if (events_out != NULL) {
         *events_out = events;
