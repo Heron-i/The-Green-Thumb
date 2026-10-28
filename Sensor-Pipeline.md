@@ -673,10 +673,11 @@ _Update at the end of the day, when asked: tick the step table, and add one Log 
 | — | On-Pi `light_probe` run | ☐ Not recorded |
 | S0 | Soil seesaw driver (`src/soil_sensor.c`), SSO/SSR/SSC tests, `soil_probe` | ✅ Done (2026-10-28): SSO 7/7, SSR 10/10, SSC 2/2; `make test`, `make asan`, `make memcheck` green in WSL |
 | — | On-Pi `soil_probe` run | ✅ Pass (2026-10-28): checks 1–4 PASS on the Pi; sensor alive. Raw air/wet counts and jitter numbers not yet recorded |
-| S1 | `gt_soil_reinit` (shared `init_chip`, mirrors `gt_light_reinit`) | 🟡 Written 2026-10-28: SSI 4/4 on macOS (plain + ASan/UBSan); WSL gate not yet run |
-| S2 | `src/soil_loop.c`: schedule, health, 5 s offline probe, open retry, IPC send/pump | 🟡 Written 2026-10-28: SLC 4/4, SLS 4/4, SLH 4/4, SLI 2/2 on macOS (plain + ASan/UBSan); WSL gate not yet run |
-| S3 | `src/soil_sensor_main.c` + `make soil_sensor` | 🟡 Written 2026-10-28: compiles warning-free; not yet run |
-| — | IPC ladder rung 5 on the Pi (soil → hub → storage) | ☐ Not run; needs S1–S3 green in WSL |
+| S1 | `gt_soil_reinit` (shared `init_chip`, mirrors `gt_light_reinit`) | ✅ Done (2026-10-28): SSI 4/4; `make test`, `make asan`, `make memcheck` green in WSL |
+| S2 | `src/soil_loop.c`: schedule, health, 5 s offline probe, open retry, IPC send/pump | ✅ Done (2026-10-28): SLC 4/4, SLS 4/4, SLH 4/4, SLI 2/2; `make test`, `make asan`, `make memcheck` green in WSL |
+| S3 | `src/soil_sensor_main.c` + `make soil_sensor` | ✅ Builds in WSL (2026-10-28); first real run is rung 5 |
+| — | IPC ladder rung 5 on the Pi (soil → hub → storage, with unplug/replug and `log_verify --sent`) | ⏸ Deferred (2026-10-28): hardware test, to be done later |
+| — | Soil at the real 60 s period on the Pi (about 1 h, steady counters) | ⏸ Deferred (2026-10-28): hardware test, to be done later |
 | — | Hop-2 (hub→storage) format | ✅ Decided 2026-10-23: the 24 B record (see Decisions) |
 
 ### Not done yet
