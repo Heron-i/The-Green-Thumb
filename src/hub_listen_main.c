@@ -125,6 +125,64 @@ static int serve_one(int conn_fd, counter_track *tracks)
     return 1;
 }
 
+/* Take the instance lock, then bind the listening socket at `sock_path`.
+ * On success stores the lock fd in *lock_fd_out and returns the listening
+ * fd. On failure returns -1 (after printing why) with no fd left open. */
+static int lock_then_bind(const char *sock_path, int *lock_fd_out)
+{
+    int lock_fd = take_instance_lock(sock_path);
+    if (lock_fd < 0) {
+        return -1;
+    }
+    int listen_fd = bind_listener(sock_path);
+    if (listen_fd < 0) {
+        close(lock_fd);
+        return -1;
+    }
+    *lock_fd_out = lock_fd;
+    return listen_fd;
+}
+
+/* Serve every sensor connection that poll() marked readable, closing and
+ * dropping the ones that hung up or sent a bad packet. `conns` is the
+ * poll() watch list (conns[0] is the listener, skipped here) and
+ * *conn_count its length; `size_t *` is a pointer so this can shrink the
+ * caller's count when a connection is dropped. */
+static void read_ready_sensors(struct pollfd *conns, size_t *conn_count, counter_track *tracks)
+{
+    /* Invariant: conns[1..conn_index-1] are open and served this round.
+     * A closed connection is replaced by the last entry, which is then
+     * checked in the same slot, so no entry is skipped. */
+    size_t conn_index = 1;
+    while (conn_index < *conn_count) {
+        if ((conns[conn_index].revents & (POLLIN | POLLHUP | POLLERR)) &&
+            !serve_one(conns[conn_index].fd, tracks)) {
+            close(conns[conn_index].fd);
+            conns[conn_index] = conns[*conn_count - 1];
+            (*conn_count)--;
+            continue;
+        }
+        conn_index++;
+    }
+}
+
+/* Accept one waiting sensor on `listen_fd` and add it to the watch list,
+ * or refuse it (close it) when the list is already full. */
+static void accept_new_sensor(int listen_fd, struct pollfd *conns, size_t *conn_count)
+{
+    int conn_fd = accept(listen_fd, NULL, NULL);
+    if (conn_fd >= 0 && *conn_count < 1 + MAX_SENSOR_CONNS) {
+        conns[*conn_count].fd = conn_fd;
+        conns[*conn_count].events = POLLIN;
+        conns[*conn_count].revents = 0;
+        (*conn_count)++;
+        printf("sensor connected (fd %d)\n", conn_fd);
+    } else if (conn_fd >= 0) {
+        printf("too many sensor connections; refusing fd %d\n", conn_fd);
+        close(conn_fd);
+    }
+}
+
 /* Listen, then serve every sensor from one poll() loop until killed.
  * `struct pollfd` is one entry in poll()'s watch list: `fd` is what to
  * watch, `events` what to wait for (POLLIN: something to read), and the
@@ -142,13 +200,9 @@ int main(int argc, char **argv)
         fprintf(stderr, "usage: %s /run/plantpi/hub.sock\n", argv[0]);
         return 2;
     }
-    int lock_fd = take_instance_lock(argv[1]);
-    if (lock_fd < 0) {
-        return 1;
-    }
-    int listen_fd = bind_listener(argv[1]);
+    int lock_fd = -1;
+    int listen_fd = lock_then_bind(argv[1], &lock_fd);
     if (listen_fd < 0) {
-        close(lock_fd);
         return 1;
     }
     printf("hub_listen: listening on %s\n", argv[1]);
@@ -169,34 +223,11 @@ int main(int argc, char **argv)
             break;
         }
 
-        /* Invariant: conns[1..conn_index-1] are open and served this round.
-         * A closed connection is replaced by the last entry, which is then
-         * checked in the same slot, so no entry is skipped. */
-        size_t conn_index = 1;
-        while (conn_index < conn_count) {
-            if ((conns[conn_index].revents & (POLLIN | POLLHUP | POLLERR)) &&
-                !serve_one(conns[conn_index].fd, tracks)) {
-                close(conns[conn_index].fd);
-                conns[conn_index] = conns[conn_count - 1];
-                conn_count--;
-                continue;
-            }
-            conn_index++;
-        }
+        read_ready_sensors(conns, &conn_count, tracks);
 
         /* Accept after serving, so a new entry's revents (still 0) is never read. */
         if (conns[0].revents & POLLIN) {
-            int conn_fd = accept(listen_fd, NULL, NULL);
-            if (conn_fd >= 0 && conn_count < 1 + MAX_SENSOR_CONNS) {
-                conns[conn_count].fd = conn_fd;
-                conns[conn_count].events = POLLIN;
-                conns[conn_count].revents = 0;
-                conn_count++;
-                printf("sensor connected (fd %d)\n", conn_fd);
-            } else if (conn_fd >= 0) {
-                printf("too many sensor connections; refusing fd %d\n", conn_fd);
-                close(conn_fd);
-            }
+            accept_new_sensor(listen_fd, conns, &conn_count);
         }
     }
 
