@@ -62,7 +62,9 @@ static int sent_record(const fake_sock *fake, size_t sent_index, gt_record *reco
  * Two records wait while the sender connects; storage replies 59. Both
  * go out in the same pump, oldest first, as seq 60 and 61, with valid
  * CRCs and their own value and receive time. The stats show the sender
- * now has its own counter, starting at 60. */
+ * now has its own counter, starting at 60, and that this connection
+ * resumed at 60 (what the seq_resume log line reports) even though the
+ * same pump went on to 62. */
 static void test_hss01_stamped_in_order(void)
 {
     fake_sock fake;
@@ -91,6 +93,7 @@ static void test_hss01_stamped_in_order(void)
     CHECK_EQ(stats.has_own, 1);
     CHECK_EQ(stats.first_sent_seq, 60);
     CHECK_EQ(stats.next_seq, 62);
+    CHECK_EQ(stats.resume_seq, 60);   /* where this connection resumed, not where it got to */
     gt_hub_sender_close(sender);
 }
 

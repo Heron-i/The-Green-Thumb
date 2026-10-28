@@ -136,7 +136,8 @@ static void doom_older_conns(serve_state *state, size_t keep_index)
 
 /* Log every GT_HUB_SENDER_EV_* bit in `events`, one line each, with the
  * sender's facts from its stats: seq_resume says where numbering
- * continues, hub_queue_full how many records have been refused, and a bad
+ * continued (resume_seq, not next_seq, which the same pump may already
+ * have moved past), hub_queue_full how many records have been refused, and a bad
  * reply is marked peer=storage to tell it apart from a sensor's bad frame.
  * The others carry no fields. */
 static void log_sender_events(const serve_state *state, unsigned events)
@@ -151,7 +152,7 @@ static void log_sender_events(const serve_state *state, unsigned events)
         }
         char fields[64] = "";
         if (flag == GT_HUB_SENDER_EV_RESUMED) {
-            snprintf(fields, sizeof fields, "next_seq=%lu", (unsigned long)stats.next_seq);
+            snprintf(fields, sizeof fields, "next_seq=%lu", (unsigned long)stats.resume_seq);
         } else if (flag == GT_HUB_SENDER_EV_QUEUE_FULL) {
             snprintf(fields, sizeof fields, "refused=%lu", (unsigned long)stats.refused);
         } else if (flag == GT_HUB_SENDER_EV_BAD_REPLY) {

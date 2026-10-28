@@ -55,6 +55,9 @@ typedef struct {
     uint32_t refused;         /* records refused because the queue was full */
     int      resumed;         /* 1 once a seq_resume reply has set next_seq */
     uint32_t next_seq;        /* the seq the next send will use (valid once resumed) */
+    uint32_t resume_seq;      /* the next seq the latest seq_resume reply chose: where
+                               * this connection resumed (the seq_resume log line),
+                               * even after the same pump has sent more */
     int      has_own;         /* 1 after the first successful send: the sender
                                * keeps its own counter from then on (PF-03) */
     uint32_t first_sent_seq;  /* the first seq sent (valid once has_own); with

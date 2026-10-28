@@ -139,6 +139,7 @@ static void await_resume(gt_hub_sender *sender, uint64_t now_ms, unsigned *event
         return;
     }
     sender->stats.next_seq = next_seq;
+    sender->stats.resume_seq = next_seq;
     sender->stats.resumed = 1;
     sender->state = SENDER_SENDING;
     sender->backoff_ms = GT_IPC_BACKOFF_MIN_MS;

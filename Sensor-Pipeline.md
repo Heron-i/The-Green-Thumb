@@ -19,7 +19,7 @@ Since 2026-10-26 the file also holds a second top-level part, *Mechanism D: stor
 - **IPC seam (same idea as the I2C seam):** `src/ipc_sock.c` is the only file that makes **client-side** socket system calls (`socket`, `connect`, `send`, `close`). Servers make their own (see *Decisions*, PF-16). The IPC client (`src/ipc_client.c`) talks to the socket only through `gt_sock_ops` (`connect` / `send` / `disconnect` / `destroy`), with the current time passed in as `now_ms`. Tests swap in `tests/fake_sock.h`, so the backoff, ring and GAP logic all run in WSL/CI with no hub and no real waiting.
 
 ### Code map
-How the modules work together to carry a reading from sensor → IPC → hub → storage. Legend: ✅ done · ☐ later. The IPC phase (Steps 10–24) is complete; `hub_listen` stands in for the hub until `hub.c` exists. The storage process is built (*Mechanism D: storage* at the end of this file has its own, more detailed code map).
+How the modules work together to carry a reading from sensor → IPC → hub → storage. Legend: ✅ done · ☐ later. The IPC phase (Steps 10–24) is complete, and so is the hub (H1–H9, 2026-10-28: `hub_main` replaces the `hub_listen` stand-in, which stays as an on-Pi debugging tool). The storage process is built (*Mechanism D: storage* at the end of this file has its own, more detailed code map).
 
 ```mermaid
 flowchart LR
@@ -33,11 +33,11 @@ flowchart LR
         ENC["ipc_msg.c ✅<br/>gt_msg_encode"]
         SCK["ipc_sock.c ✅<br/>socket · connect · send"]
     end
-    subgraph HUB["hub process · hub_listen_main.c ✅ stand-in now, hub_main.c ☐ later"]
+    subgraph HUB["hub process · hub_main.c ✅ · rx loop hub_server.c ✅"]
         FRM["ipc_msg.c ✅<br/>gt_ipc_frame_decode"]
         DEC["ipc_msg.c ✅<br/>gt_msg_decode"]
-        ACC["hub.c ☐<br/>gt_hub_accept: validate · stamp µs<br/>(seq + CRC at send, PF-01)"]
-        RENC["log_record.c ✅<br/>gt_record_encode + CRC"]
+        ACC["hub.c ✅<br/>gt_hub_accept: validate · stamp µs<br/>(seq + CRC at send, PF-01)"]
+        RENC["hub_sender.c ✅<br/>queue · seq_resume · gt_next_seq<br/>gt_record_encode + CRC at send"]
     end
     subgraph STO["storage process · storage_main.c ✅"]
         RDEC["storage_server.c ✅<br/>gt_storage_serve: rx loop"]
@@ -65,7 +65,8 @@ flowchart LR
 | `ipc_client.c` | `gt_sock_ops` (`ipc_sock.c`, or the fake in tests) | the frame | OK / FULL (`EAGAIN`) / IO (peer gone) |
 | sensor main loop | `gt_log_format` | the event name + `key=value` fields | the log line |
 | hub `recv()` | `gt_ipc_frame_decode` | 17 B buffer + length | `gt_msg`, or CORRUPT / IO |
-| hub | `gt_hub_accept` | `gt_msg` + `now_us` | `gt_record` with `seq` left 0 (PF-01) |
+| hub rx loop (`gt_hub_serve`) | `gt_hub_accept` | `conn_id` + `gt_msg` + both clocks (`gt_hub_clock`) | `gt_hub_result`: `gt_record` with `seq` left 0 (PF-01) + event flags |
+| hub rx loop | `gt_hub_sender_push`, then `gt_hub_sender_pump` every pass | the unstamped record; `now_ms` | OK / FULL + sender event flags |
 | hub sender | `gt_next_seq`, then `gt_record_encode` | the queued record, stamped with `next_seq` just before `send()` | 24 B → `storage.sock` |
 | `storage_main` | `gt_storage_open` (wraps `gt_storage_open_ops` with the Linux file layer) | log directory + `now_us` | `gt_storage` + open info (recovery, last `seq` and its time) |
 | storage rx loop (`gt_storage_serve`) | `gt_storage_append` | the raw 24 B as received + `now_ms` (decoded and checked inside, stored unchanged) | OK / CORRUPT / FULL + event flags |
@@ -148,7 +149,7 @@ Magic and version are written by encode and checked by decode. They are not `gt_
 Hop 2 sends the on-disk record exactly as DESIGN.md *In what format → Record* lays it out: magic `0xA7`, type, version, sensor_id, seq (u32 at 4), timestamp (u64 µs at 8), value (u32 at 16) and CRC-32 over bytes 0–19 (at 20). `gt_record` and the codec live in `include/log_record.h`. **Watch the header order:** the record goes magic, **type, version**, sensor_id, while the message goes magic, **version, type**, sensor_id. Don't copy the message encoder without swapping those two bytes. Unlike the message, a GAP record may use sensor_id 0 (all).
 
 ## Hub contract (hop 2): stamping, numbering and the sender
-Decided 2026-10-26 to settle PF-01 and PF-02 (Pipeline-Findings.md) before any hub code exists. It builds on the PF-03 numbering rule in *Decisions*. Nothing here is built yet. `include/hub.h` and `include/ipc_sock.h` change to match when the hub steps start, test first.
+Decided 2026-10-26 to settle PF-01 and PF-02 (Pipeline-Findings.md) before any hub code exists. It builds on the PF-03 numbering rule in *Decisions*. **Built 2026-10-28** in hub steps H1–H7, test first (see *Hub steps*).
 
 **Why it changes (PF-01):** a hub that has just started doesn't know its next `seq` until storage's `seq_resume` reply arrives. Storage may be down or still recovering, and Mechanism E says the hub must keep running anyway. So the hub can't finish a record (`seq` + CRC) when the sensor message arrives. It finishes it when it sends it.
 
@@ -207,7 +208,7 @@ gt_status (*recv)(void *ctx, uint8_t *buf, size_t cap, size_t *len_out);
 
 ### Follow-ups this contract creates
 - **DESIGN.md:** done 2026-10-26. The Hub → storage rows, the hub-queue budget and *At what rate* now say a record gets its `seq` + CRC when it is sent.
-- **`include/hub.h`:** rewrite the `gt_hub_accept` comment to match (with the hub steps, not now).
+- **`include/hub.h`:** done 2026-10-28 (H2): `gt_hub_accept` leaves `seq` at 0.
 
 ## Health state machine
 ```
@@ -587,6 +588,17 @@ typedef struct { uint64_t wall_us; uint64_t mono_ms; } gt_hub_clock;
 | H8 | `gt_hub_serve`, then `src/hub_main.c` and its Makefile target | `HRX` |
 | H9 | WSL end to end with `kill -9` of the hub and storage; `log_verify --sent A..B` from `hub_stop`; docs | — |
 | H10 | `src/light_sensor_main.c`, with its loop in a testable `src/light_loop.c` | `LLP` |
+
+**Changes from the plan while building H1–H9:**
+- **Event names:** `gt_hub_event_describe` (name + level) replaced the planned `gt_hub_event_name`, to mirror `gt_storage_event_describe`; `GT_HUB_EV_TIMEOUT` names the `sensor_timeout` line. The sender's flags have `gt_hub_sender_event_describe` (HEV-04).
+- **Sender API:** `push` only queues and `pump` does every socket call, so `push` takes no `now_ms`. The stats type is `gt_hub_send_stats`, because C can't give a type and a function (`gt_hub_sender_stats`) the same name.
+- **`storage_unreachable` is logged at start-up too** if storage isn't up yet (the sensor client stays quiet on its first failed connect; a hub that can't reach storage at boot is worth one line).
+- **A refused sensor GAP counts its readings** in the hub's GAP (HSQ-05), so the GAP's value stays a reading count.
+- **An idle sender polls `recv`** in SENDING, so a storage `kill -9` is reported when it happens, not at the next reading (HSS-07).
+- **`resume_seq` in the stats** (found in H9): the `seq_resume` line logs where the connection resumed, not where the same pump got to.
+- **New log events:** `sensor_connected`, `sensor_disconnected`, `sensor_refused reason=too_many` (a ninth connection), `hub_start`, `hub_stop`.
+- **Tests:** `fake_sock` keeps 1100 sent frames (was 256) so a full queue can be checked. HRX doesn't wait out a real 3 s timeout (HTO covers the logic).
+- **H9 result (WSL, 2026-10-28):** storage `-n 16`, light at 10 Hz and soil at 1 Hz for 25 s, storage `kill -9` at 4 s (down 5 s), hub `kill -9` at 14 s (down 1 s). 275 readings made: 261 stored and 14 covered by storage's `recovery_gap` (the batch the kill lost); the hub kill lost none (the sensor rings resent). `log_verify` passed, and `--sent 156..274` from `hub_stop` gave `lost=0`. With the default `-n 64`, the same kill landed before the first commit, so the log was empty on restart and the loss (46 readings) shows only as `unclean_shutdown`: the documented empty-log case.
 
 ## Files
 - **Done (Step 0):** `include/i2c_bus.h`, `src/i2c_bus.c`, `include/light_sensor.h`, `src/light_sensor.c`, `src/light_probe_main.c`, `tests/check.h`, `tests/fake_i2c.h`, `tests/test_light_{open,read,close}.c`
