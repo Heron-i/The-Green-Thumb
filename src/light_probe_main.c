@@ -149,6 +149,90 @@ static int64_t percentile(const int64_t *sorted, int n, int pct)
     return sorted[rank > 0 ? rank - 1 : 0];
 }
 
+/* Running totals for check 4, updated once per sample. Intervals are the
+ * time between one sample's wake-up and the next one's, in us. */
+typedef struct {
+    int64_t  prev_us;     /* wake-up time of the previous sample */
+    int64_t  ivl_min, ivl_max, ivl_sum;
+    uint32_t raw_min, raw_max;   /* over successful reads only */
+    double   lux_sum;
+    int      errors, good;       /* failed / successful reads */
+} sample_stats;
+
+/* Start every total at zero, and each min at its type's largest value so
+ * the first sample always replaces it. */
+static void init_sample_stats(sample_stats *stats)
+{
+    memset(stats, 0, sizeof *stats);
+    stats->ivl_min = INT64_MAX;
+    stats->raw_min = UINT32_MAX;
+}
+
+/* Sleep until `deadline_us`, then take and print one sample, folding it
+ * into `stats`. `start_us` is when sample 0 was due, used for the t_ms
+ * column. Returns how late the wake-up was, in us. */
+static int64_t read_scheduled_sample(gt_light_sensor *sensor, int sample_index, int64_t start_us,
+                                     int64_t deadline_us, sample_stats *stats)
+{
+    sleep_until_us(deadline_us);
+    int64_t now_us = mono_us();
+    int64_t dev_us = now_us - deadline_us;   /* >= 0: wake-ups are never early */
+
+    if (sample_index > 0) {
+        int64_t interval_us = now_us - stats->prev_us;
+        stats->ivl_min = interval_us < stats->ivl_min ? interval_us : stats->ivl_min;
+        stats->ivl_max = interval_us > stats->ivl_max ? interval_us : stats->ivl_max;
+        stats->ivl_sum += interval_us;
+    }
+    stats->prev_us = now_us;
+
+    uint32_t raw;
+    double t_ms = (double)(now_us - start_us) / 1000.0;
+    if (gt_light_read(sensor, &raw) != GT_OK) {
+        stats->errors++;
+        printf("      %4d %10.1f %7s %9s %8lld\n", sample_index, t_ms, "ERR", "-",
+               (long long)dev_us);
+    } else {
+        stats->good++;
+        stats->raw_min = raw < stats->raw_min ? raw : stats->raw_min;
+        stats->raw_max = raw > stats->raw_max ? raw : stats->raw_max;
+        stats->lux_sum += gt_light_raw_to_lux(raw);
+        printf("      %4d %10.1f %7u %9.1f %8lld\n", sample_index, t_ms, (unsigned)raw,
+               gt_light_raw_to_lux(raw), (long long)dev_us);
+    }
+    return dev_us;
+}
+
+/* Print the reads / lux / interval / jitter summary under check 4's
+ * PASS/FAIL line. `sorted_dev_us` is every sample's lateness, sorted
+ * ascending. `const` means this only reads `stats` and the array. */
+static void print_sampling_summary(const sample_stats *stats, const int64_t *sorted_dev_us,
+                                   int sample_count, long period_ms)
+{
+    int64_t p50 = percentile(sorted_dev_us, sample_count, 50);
+    int64_t p99 = percentile(sorted_dev_us, sample_count, 99);
+    int64_t dev_max = sorted_dev_us[sample_count - 1];
+
+    printf("      reads:    %d ok, %d failed\n", stats->good, stats->errors);
+    if (stats->good > 0) {
+        printf("      lux:      min %.1f  mean %.1f  max %.1f\n",
+               gt_light_raw_to_lux(stats->raw_min), stats->lux_sum / stats->good,
+               gt_light_raw_to_lux(stats->raw_max));
+    }
+    printf("      interval: min %.3f  mean %.3f  max %.3f ms (target %ld)\n",
+           stats->ivl_min / 1000.0, stats->ivl_sum / 1000.0 / (sample_count - 1),
+           stats->ivl_max / 1000.0, period_ms);
+    printf("      jitter:   p50 %lld  p99 %lld  max %lld us (p99 limit %d)\n",
+           (long long)p50, (long long)p99, (long long)dev_max, JITTER_P99_LIMIT_US);
+
+    /* Not a FAIL: a dark closet really is constant. But a stuck 0 or 65535
+     * often means a dead or saturated sensor, so make the user look. */
+    if (stats->good >= 2 && stats->raw_min == stats->raw_max) {
+        printf("      warning: every sample read raw=%u; vary the light and rerun\n",
+               (unsigned)stats->raw_min);
+    }
+}
+
 /* Check 4: take `n` samples, one per `period_ms`, on an absolute schedule.
  * Each sample is timestamped just before its I2C read, which is the point
  * DESIGN.md measures jitter at. Prints every sample so lux can be watched
@@ -164,68 +248,23 @@ static int check_sampling(gt_light_sensor *s, int n, long period_ms)
 
     int64_t period_us = (int64_t)period_ms * 1000;
     int64_t start = mono_us() + period_us;
-    int64_t prev = 0, ivl_min = INT64_MAX, ivl_max = 0, ivl_sum = 0;
-    uint32_t raw_min = UINT32_MAX, raw_max = 0;
-    double lux_sum = 0;
-    int errors = 0, good = 0;
+    sample_stats stats;
+    init_sample_stats(&stats);
 
     printf("      sampling %d x %ld ms (cover the sensor / shine a light to see lux follow)\n",
            n, period_ms);
     printf("      %4s %10s %7s %9s %8s\n", "i", "t_ms", "raw", "lux", "dev_us");
 
     for (int i = 0; i < n; i++) {
-        int64_t deadline = start + i * period_us;
-        sleep_until_us(deadline);
-        int64_t now = mono_us();
-        dev_us[i] = now - deadline;   /* >= 0: wake-ups are never early */
-
-        if (i > 0) {
-            int64_t ivl = now - prev;
-            ivl_min = ivl < ivl_min ? ivl : ivl_min;
-            ivl_max = ivl > ivl_max ? ivl : ivl_max;
-            ivl_sum += ivl;
-        }
-        prev = now;
-
-        uint32_t raw;
-        double t_ms = (double)(now - start) / 1000.0;
-        if (gt_light_read(s, &raw) != GT_OK) {
-            errors++;
-            printf("      %4d %10.1f %7s %9s %8lld\n", i, t_ms, "ERR", "-", (long long)dev_us[i]);
-            continue;
-        }
-        good++;
-        raw_min = raw < raw_min ? raw : raw_min;
-        raw_max = raw > raw_max ? raw : raw_max;
-        lux_sum += gt_light_raw_to_lux(raw);
-        printf("      %4d %10.1f %7u %9.1f %8lld\n", i, t_ms, (unsigned)raw,
-               gt_light_raw_to_lux(raw), (long long)dev_us[i]);
+        dev_us[i] = read_scheduled_sample(s, i, start, start + i * period_us, &stats);
     }
 
     qsort(dev_us, (size_t)n, sizeof *dev_us, cmp_i64);
-    int64_t p50 = percentile(dev_us, n, 50);
     int64_t p99 = percentile(dev_us, n, 99);
-    int64_t dmax = dev_us[n - 1];
-    free(dev_us);
-
-    int ok = errors == 0 && p99 < JITTER_P99_LIMIT_US;
+    int ok = stats.errors == 0 && p99 < JITTER_P99_LIMIT_US;
     report(4, "sampling interval", ok);
-    printf("      reads:    %d ok, %d failed\n", good, errors);
-    if (good > 0) {
-        printf("      lux:      min %.1f  mean %.1f  max %.1f\n",
-               gt_light_raw_to_lux(raw_min), lux_sum / good, gt_light_raw_to_lux(raw_max));
-    }
-    printf("      interval: min %.3f  mean %.3f  max %.3f ms (target %ld)\n",
-           ivl_min / 1000.0, ivl_sum / 1000.0 / (n - 1), ivl_max / 1000.0, period_ms);
-    printf("      jitter:   p50 %lld  p99 %lld  max %lld us (p99 limit %d)\n",
-           (long long)p50, (long long)p99, (long long)dmax, JITTER_P99_LIMIT_US);
-
-    /* Not a FAIL: a dark closet really is constant. But a stuck 0 or 65535
-     * often means a dead or saturated sensor, so make the user look. */
-    if (good >= 2 && raw_min == raw_max) {
-        printf("      warning: every sample read raw=%u; vary the light and rerun\n",
-               (unsigned)raw_min);
-    }
+    print_sampling_summary(&stats, dev_us, n, period_ms);
+    free(dev_us);
     return ok;
 }
 
